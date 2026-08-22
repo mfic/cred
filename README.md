@@ -1,6 +1,7 @@
 # cred
 
-Per-repository encrypted credentials for PowerShell 5.1 and 7.
+Per-repository encrypted credentials. One CLI, written in Python, on every
+platform.
 
 Your secrets live in an **age-encrypted file committed inside the repo**, so they
 travel with the code. The key that opens it lives in your user profile and never
@@ -9,11 +10,17 @@ in memory, on demand.
 
 Three ways to get a credential out:
 
-```powershell
+```bash
 cred get acme-api/stripe                 # one secret on stdout, for piping
-cred exec acme-api -- npm run deploy     # env vars for a child process, nothing on disk
-$c = Get-CredCredential acme-api/db      # a native PSCredential, inside PowerShell
+cred exec acme-api -- npm run deploy     # env vars, nothing on disk
 ```
+```powershell
+$c = Get-CredCredential acme-api/db      # a native PSCredential, in PowerShell
+```
+
+The first two are the `cred` CLI and run anywhere Python 3.8+ does. The third is
+the `Cred` PowerShell module, for when a PowerShell script wants a real object
+rather than text.
 
 ---
 
@@ -233,27 +240,31 @@ Full reasoning, and what a Linux port actually requires, in
 
 ---
 
-## Two implementations
+## One CLI, and a PowerShell module
 
-`cred` exists twice, as peers rather than as a tool and a wrapper:
+`cred` is a single Python program. It is the interface on Windows, Linux and
+macOS, it carries the whole command surface, and it needs Python 3.8+ and the
+`age` binary -- nothing from PyPI.
 
-| | Runtime | Use it when |
-| --- | --- | --- |
-| `bin/cred`, `bin/cred.cmd` | PowerShell 5.1 or 7 | Windows, or anywhere pwsh is installed. This one has the PowerShell API, the `gpg` provider, and the keystore commands. |
-| `bin/cred-py` | Python 3.8+ | Linux or macOS without PowerShell, or a container where Python is already there. |
+Alongside it, the `Cred` **PowerShell module** exists for the one job a CLI
+cannot do: handing a live `PSCredential` or hashtable to a PowerShell script.
 
-They read and write the same files, so you can use either on any given machine
-and the other will not notice. A test suite drives both against one store to
-keep that true -- including byte-exact round trips in both directions, matching
-exit codes, and the same default environment-variable names.
-
-The Python one implements the `age` provider only, and can *read* a
-keystore-wrapped key but not create one. Everything else is the same surface.
-
-```bash
-cred-py get acme-api/stripe          # same store, same answer
-cred-py exec acme-api -- ./deploy.sh
+```powershell
+Import-Module C:\tools\creds-helper\src\Cred\Cred.psd1
+$cred = Get-CredCredential acme-api/db
+Invoke-Sqlcmd -ServerInstance db01 -Credential $cred
 ```
+
+There is also `bin/cred-ps`: the same CLI implemented in PowerShell. It is a
+peer, not a wrapper -- same files, same formats, same exit codes -- kept for
+machines that have PowerShell but no Python. You should not normally need it.
+`tests/Interop.Tests.ps1` drives both against one store and asserts byte-exact
+round trips in each direction, so the two cannot quietly drift apart.
+
+Why Python is the default: it is the runtime most likely to already be present
+on a Linux box or in a container, it starts faster than pwsh, and it keeps the
+CLI to one implementation rather than two that have to agree. PowerShell stays
+where it is genuinely better -- native objects inside PowerShell scripts.
 
 ## Protecting the key itself
 
@@ -369,8 +380,10 @@ What it does not:
 
 ## Requirements
 
-- Windows PowerShell 5.1 or PowerShell 7+ (both are supported and both are
-  tested on every change), **or** Python 3.8+ for `bin/cred-py`
+- Python 3.8+ for the `cred` CLI (no PyPI packages)
+- Windows PowerShell 5.1 or PowerShell 7+ for the `Cred` module and for
+  `bin/cred-ps` -- both editions are supported and both are tested on every
+  change
 - [age](https://age-encrypted.org) 1.2+ — `winget install FiloSottile.age`,
   `brew install age`, `apt install age`
 - Optional: GnuPG, if you would rather use the `gpg` provider
@@ -379,9 +392,9 @@ What it does not:
 
 ```powershell
 git clone <this repo> C:\tools\creds-helper
-$env:PATH += ";C:\tools\creds-helper\bin"          # cred, cred.cmd, cred.ps1
+$env:PATH += ";C:\tools\creds-helper\bin"   # cred (Python), cred-ps (PowerShell)
 
-# To use the PowerShell API without the CLI:
+# For native PSCredential / hashtable objects inside PowerShell scripts:
 Import-Module C:\tools\creds-helper\src\Cred\Cred.psd1
 ```
 
@@ -402,5 +415,9 @@ Make the PATH change permanent:
 The suite covers pure functions, a real age round trip, all three access paths,
 every documented failure mode, multi-process concurrency, leak hygiene
 (transcripts, process arguments, error text, files on disk), the OS keystore,
-the PSCredential migration boundary, and interoperability between the
-PowerShell and Python implementations.
+the PSCredential migration boundary, the Python CLI on its own, and
+interoperability between the Python and PowerShell implementations.
+
+Note that `tests/` is Pester, so running it needs PowerShell even though the
+CLI under test is Python. That is deliberate: the same harness drives both
+implementations, which is what keeps them honest about each other.

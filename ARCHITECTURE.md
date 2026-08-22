@@ -3,37 +3,29 @@
 ## The shape of the thing
 
 ```
-   cred (CLI)                Import-Module Cred          cred-py (CLI)
-   bin/cred.ps1              src/Cred/Public/*.ps1       python/cred.py
-        |                            |                          |
-        +--------------+-------------+                          |
-                       |                            python/cred_store.py
-        +--------------v-------------+                          |
-        |  Config.ps1   Store.ps1    |   projects, values,      |
-        |  Secrets.ps1  Errors.ps1   |   locking, atomic writes |
-        +--------------+-------------+                          |
-        +--------------v-------------+                          |
-        |      Providers.ps1         |   the crypto seam        |
-        +--------------+-------------+                          |
-        +--------------v-------------+                          |
-        |  Process.ps1  Platform.ps1 |   the only OS-aware code |
-        +----------------------------+                          |
-                       |                                        |
-                       +------- the files are the contract -----+
+   cred (the CLI)            cred-ps (peer CLI)      Import-Module Cred
+   bin/cred -> cred.py       bin/cred-ps             src/Cred/Public/*.ps1
+        |                          |                        |
+        |                          +-----------+------------+
+        |                                      |
+  python/cred_store.py            src/Cred/Private/*.ps1
+        |                                      |
+        |   providers, store, locking, atomic writes, OS-aware code
+        |                                      |
+        +--------- the files are the contract -+
 ```
 
 Four rules hold the design together:
 
-1. **The CLI contains no behaviour.** `bin/cred.ps1` parses argv, calls exactly
-   one exported function, prints, and picks an exit code. The PowerShell API and
-   the CLI therefore cannot drift.
+1. **A CLI contains no behaviour.** `python/cred.py` and `bin/cred.ps1` both
+   parse argv, call one function, print, and pick an exit code. Nothing else.
 2. **All crypto is behind the provider contract.** Nothing above
    `Providers.ps1` knows what encryption is. Swapping backends is one file.
 3. **All OS knowledge lives in `Platform.ps1` and `Process.ps1`.** Nothing else
    asks what operating system it is on.
-4. **The formats are the contract, not the code.** The Python implementation
-   shares no code with the PowerShell one; they agree because they agree about
-   the files. See "Two implementations, one format".
+4. **The formats are the contract, not the code.** The Python and PowerShell
+   implementations share no code; they agree because they agree about the
+   files. See "One CLI, two implementations".
 
 ## Why age
 
@@ -112,6 +104,9 @@ Register your own with `Register-CredProvider`. The contract is exercised by a
 test that registers a toy backend and drives the whole stack through it, so a
 change that quietly breaks the seam fails the suite.
 
+`python/cred_store.py` mirrors this exactly, as a dict of the same members in
+`PROVIDERS`, reached through `get_provider(name)`. Both ship `age` and `gpg`.
+
 ## Data model
 
 Two files per repository, both committed:
@@ -187,11 +182,13 @@ the third.
 
 - Interactive entry uses `Read-Host -AsSecureString`. Nothing echoes and nothing
   reaches shell history.
-- `cred get` writes to `[Console]::Out`, the raw handle, not the PowerShell
+- `cred get` writes raw bytes to the real stdout handle -- `sys.stdout.buffer`
+  in Python, `[Console]::Out` in PowerShell -- never through the PowerShell
   pipeline. `Start-Transcript` captures the pipeline; it does not capture this.
   Piping and redirection still behave normally. There is a test that starts a
   transcript, gets a secret, and asserts the canary is in stdout but not in the
-  transcript.
+  transcript. Writing bytes rather than text is also what makes a non-ASCII
+  password survive a console whose code page cannot represent it.
 - Error messages name projects and keys — both already plaintext in the repo —
   and never values. Tests assert that a canary value cannot be provoked into
   stderr or into `--verbose` output.
@@ -203,49 +200,55 @@ cannot be reliably scrubbed from memory. Values stay `SecureString` where the
 API permits and byte buffers are zeroed after use, but that is a ceiling. A
 PowerShell-hosted tool claiming more would be lying.
 
-## Two implementations, one format
+## One CLI, two implementations
 
-There are two `cred` front ends and they are peers, not a tool and a wrapper:
+`cred` is the Python program. It is the default interface everywhere and carries
+the whole command surface:
 
-    bin/cred, bin/cred.cmd   ->  src/Cred/          PowerShell 5.1 / 7
-    bin/cred-py              ->  python/cred.py     Python 3.8+
+    bin/cred, bin/cred.cmd      ->  python/cred.py      Python 3.8+     [default]
+    bin/cred-ps, cred-ps.cmd    ->  bin/cred.ps1        PowerShell 5.1 / 7
+    Import-Module Cred          ->  src/Cred/           PowerShell library
 
-Neither shells out to the other. They interoperate because the *files* are the
-contract, and nothing else is:
+Python is the default for three reasons, in order of weight: it keeps the CLI to
+*one* implementation people have to reason about; it is the runtime most likely
+to already exist on a Linux host or in a container, where pwsh would be a
+~100 MB install; and it starts faster.
 
-- `.creds/config.json` — plain JSON
-- `.creds/store.age` — a standard age file whose plaintext is the small object
+PowerShell keeps the job it is actually better at. `Get-CredCredential`,
+`Get-CredEnvironment` and `Get-Cred -AsSecureString` hand *live objects* to a
+PowerShell script. A CLI cannot do that without serialising the secret to text
+and re-parsing it, which would add a leak surface for no gain. That is why the
+module is not a wrapper around the CLI and never shells out to it.
+
+`bin/cred-ps` is the same CLI implemented in PowerShell, kept for machines with
+pwsh but no Python. It is not a fallback that degrades: it is a full peer, and
+it is the one that ships `gpg` support in the same seam.
+
+Neither implementation calls the other. They interoperate because the *files*
+are the contract, and nothing else is:
+
+- `.creds/config.json` -- plain JSON
+- `.creds/store.age` -- a standard age file whose plaintext is the small object
   documented above
-- `<CRED_HOME>/projects.json` — plain JSON
-- `.creds/.lock` — an exclusive lock, taken the same way by both
+- `<CRED_HOME>/identity.txt` or `identity.wrapped.json` -- the key, plain or
+  keystore-wrapped, in a self-describing format both sides read
+- `<CRED_HOME>/projects.json` -- plain JSON
+- `.creds/.lock` -- an exclusive lock, taken the same way by both
 
 `tests/Interop.Tests.ps1` drives both against a single store and asserts
 byte-exact round trips in each direction, identical exit codes, identical
 default environment-variable names, and that neither loses the other's writes.
-That test is what stops the two drifting.
+`tests/PythonCli.Tests.ps1` covers the Python CLI on its own. Those two files
+are what stop the implementations drifting.
 
-Deliberate asymmetries, because pretending they are identical would be worse
-than saying so:
+The only remaining asymmetry is deliberate: `gpg` is implemented in both, but
+`cred-ps` is the one with the PowerShell-native object API, because that is not
+a CLI concern.
 
-| | PowerShell | Python |
-| --- | --- | --- |
-| Providers | `age`, `gpg` | `age` only — it refuses a `gpg` project by name, with the reason |
-| Keystore | wraps and unwraps | reads a wrapped key, does not create one |
-| PSCredential | native objects, import and export | not applicable |
-
-Which to use is a question about the machine, not the project. Windows always
-has PowerShell; most Linux images already have Python and would need a ~100 MB
-pwsh install otherwise. Either way the repository is unchanged.
-
-This also settles what used to be "the Linux port". PowerShell 7 runs natively
-on Linux and macOS, so `bin/cred` plus the module already works there — but it
-needs pwsh installed. `bin/cred-py` removes that requirement. A third
-implementation in `sh` would need nothing new from this codebase either: `jq`
+A third implementation in `sh` would need nothing new from this codebase: `jq`
 over `config.json`, `age -d -i` over the store, `flock` on `.creds/.lock`, and
-`mv` within the same filesystem for the atomic replace.
-
-What any further implementation must not skip, because this is where
-correctness lives and not where it looks like it lives:
+`mv` within the same filesystem for the atomic replace. What it must not skip,
+because this is where correctness lives and not where it looks like it lives:
 
 - the exclusive lock around read-modify-write, and **not** deleting the lock
   file on release;
@@ -278,8 +281,9 @@ portable:
   not merely that a byte array in memory was.
 
 Wrapping is detected by file content, not by filename, so renaming a key cannot
-misrepresent it. The Python implementation unwraps DPAPI blobs through `ctypes`,
-so a wrapped key is not a lock-in.
+misrepresent it. Both implementations wrap and unwrap -- Python through `ctypes`
+against `CryptProtectData`/`CryptUnprotectData` -- so a wrapped key never ties
+you to one of them.
 
 The trade is stated at the point of use and again here: a DPAPI-wrapped key does
 not survive a new machine, a reinstall, or a changed account. `cred key protect`
@@ -303,13 +307,23 @@ avoids `Get-Acl`: `Microsoft.PowerShell.Security` does not autoload on every 5.1
 host, and a migration tool that fails on the one machine holding the credentials
 is worthless.
 
+The Python CLI implements the same boundary without PowerShell at all.
+`Export-Clixml` turns out to be plain XML in which a SecureString is a DPAPI
+blob in hex -- exactly what `ConvertFrom-SecureString` emits -- so
+`read_clixml_credential` and `write_clixml_credential` handle both directions
+with `xml.etree` plus `ctypes`. That is what let the CLI become one program
+instead of one program that shells out to another for part of its job. There is
+a test asserting PowerShell reads back what Python writes, byte for byte.
+
 ## Directory map
 
 ```
 bin/
-  cred.ps1        CLI: argv parsing, output, exit codes. No behaviour.
-  cred.cmd        Windows launcher (prefers pwsh, falls back to 5.1)
-  cred            POSIX sh launcher
+  cred            the CLI (POSIX sh launcher -> python/cred.py)
+  cred.cmd        the CLI (Windows launcher -> python/cred.py)
+  cred-ps         PowerShell implementation, POSIX sh launcher
+  cred-ps.cmd     PowerShell implementation, Windows launcher
+  cred.ps1        PowerShell CLI: argv parsing, output, exit codes
 src/Cred/
   Cred.psd1       manifest; explicit exports, both editions
   Cred.psm1       loader; private files in dependency order, then public
@@ -324,8 +338,9 @@ src/Cred/
     Store.ps1     locking, decrypt/encrypt of the value set
   Public/         one file per area; every function has help and examples
 python/
-  cred.py         Python CLI: argv, output, exit codes. No behaviour.
-  cred_store.py   the store as a library: formats, locking, age, DPAPI unwrap
+  cred.py         the CLI: argv, output, exit codes. No behaviour.
+  cred_store.py   the store as a library: providers, formats, locking, DPAPI,
+                  Clixml
 tests/
   Unit.Tests.ps1         pure functions, file plumbing, provider contract
   Integration.Tests.ps1  real age, three access paths, encoding
@@ -334,6 +349,7 @@ tests/
   Cli.Tests.ps1          the CLI as a process: argv, exit codes, leak hygiene
   Keystore.Tests.ps1     wrapping the key, and that it leaves no key on disk
   Migration.Tests.ps1    the PSCredential import/export boundary
+  PythonCli.Tests.ps1    the default CLI on its own
   Interop.Tests.ps1      PowerShell and Python against one store
   Invoke-Tests.ps1       runs everything under both editions
 ```

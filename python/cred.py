@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cred_store as cs   # noqa: E402
 
 USAGE = """\
-cred - per-repository encrypted credentials (Python implementation)
+cred - per-repository encrypted credentials
 
 USAGE
   cred <command> [args] [options]
@@ -37,6 +37,7 @@ GETTING STARTED
 
 COMMANDS
   init [name]                      Create a store here
+      --provider <age|gpg>         Encryption backend (default: age)
       --recipient <key>            Recipient(s) instead of your own key
       --force                      Overwrite an existing store
 
@@ -67,9 +68,30 @@ COMMANDS
   recipients rm <key>...           Revoke access and re-encrypt
 
   keygen                           Create this machine's key (--show, --force)
+
   key                              Show where your key is and how it is held
+  key protect                      Wrap it with the OS keystore (DPAPI)
+      --backup <file>              Save the unwrapped key first (do this)
+  key unprotect                    Unwrap it, before moving machine or account
+
+  import <path>                    Import PSCredential files into a store
+      --name <key>                 Name for a single file
+      --desc <text>                Description for what is imported
+      --force                      Overwrite credentials that already exist
+      --dry-run                    Show what would happen, change nothing
+
+  export <folder>                  Write credentials out as PSCredential files
+      --only <a,b>                 Just these
+      --yes                        Skip the confirmation
+
   project list                     Registered projects on this machine
+  project rm <name>                Forget a project mapping
+  providers                        Encryption backends and their status
   doctor [project]                 Check the setup and say how to fix it
+
+  claude [project]                 Markdown brief for a Claude Code session
+      --write                      Write it into the repo's CLAUDE.md
+
   version | help
 
 ENVIRONMENT
@@ -198,17 +220,28 @@ def cmd_init(rest: List[str]) -> int:
                             "Start over:        cred init --force"],
                            cs.EXIT_USAGE)
 
+    provider_name = str(opts.get("provider") or "age")
+    prov = cs.get_provider(provider_name)
+    available, detail = prov["test"]()
+    if not available:
+        raise cs.CredError(
+            f"Encryption backend '{provider_name}' is not available: {detail}",
+            [prov["install_hint"], "Then re-run 'cred doctor'."],
+            cs.EXIT_BACKEND)
+
     recipients = ([r.strip() for r in str(opts["recipient"]).split(",")]
                   if opts.get("recipient") else None)
     if not recipients:
-        ident = cs.identity_path(None)
-        if not ident.is_file():
-            cs.age_new_identity(ident)
-        recipients = [cs.age_recipient(None)]
+        if provider_name == "age":
+            ident = cs.identity_path(None)
+            if not ident.is_file():
+                cs.age_new_identity(ident)
+        recipients = [prov["recipient"](None)]
 
     (root / cs.CREDS_DIR).mkdir(parents=True, exist_ok=True)
-    config = {"version": cs.CONFIG_VERSION, "project": name, "provider": "age",
-              "store": "store.age", "recipients": recipients, "credentials": {}}
+    config = {"version": cs.CONFIG_VERSION, "project": name,
+              "provider": provider_name, "store": prov["store_file"],
+              "recipients": recipients, "credentials": {}}
     cs.write_text_atomic(config_path, cs.dump_json(config))
 
     project = cs.Project(root)
@@ -223,7 +256,7 @@ def cmd_init(rest: List[str]) -> int:
 
     out(f"Created {name} in {root}")
     out(f"  store      {project.store_path}")
-    out("  provider   age")
+    out(f"  provider   {provider_name}")
     out(f"  recipient  {', '.join(recipients)}")
     out("")
     out(f"Commit .creds/ -- it is encrypted. Then: cred add {name}/<key>")
@@ -534,22 +567,93 @@ def cmd_keygen(rest: List[str]) -> int:
 
 def cmd_key(rest: List[str]) -> int:
     sub = rest[0].lower() if rest else ""
+    opts, _ = read_options(rest[1:] if rest else [], switches=("force",))
     path = cs.identity_path(None)
-    if sub in ("protect", "unprotect", "unwrap"):
-        raise cs.CredError(
-            "Wrapping and unwrapping the key is done by the PowerShell cred.",
-            ["Run: cred key " + sub + "   (from bin/cred.ps1 or bin/cred)",
-             "The Python cred can read a wrapped key, but does not create one."],
-            cs.EXIT_USAGE)
 
+    if sub == "protect":
+        return _key_protect(path, opts)
+    if sub in ("unprotect", "unwrap"):
+        return _key_unprotect(path)
+
+    wrapped = cs.identity_is_wrapped(path)
     out(f"path        {path}")
     out(f"exists      {path.is_file()}")
-    out(f"protection  {'dpapi-currentuser' if cs.identity_is_wrapped(path) else 'file-permissions'}")
+    out(f"protection  {cs.keystore_name() if wrapped else 'file-permissions'}")
+    out(f"keystore    {'available' if cs.keystore_available() else 'not available on this platform'}")
     if path.is_file():
         try:
             out(f"public key  {cs.age_recipient(None)}")
         except cs.CredError:
             pass
+    return cs.EXIT_OK
+
+
+def _key_protect(path, opts) -> int:
+    """Wrap the key with the OS keystore.
+
+    Only the key is bound to this account. The store stays plain age, so it
+    still travels with the code and still opens on Linux.
+    """
+    if not cs.keystore_available():
+        raise cs.CredError(
+            "No OS keystore is available on this platform.",
+            ["On Windows this uses DPAPI and needs nothing installed.",
+             "Elsewhere, protect the key file itself: age -p identity.txt"],
+            cs.EXIT_BACKEND)
+    if not path.is_file():
+        raise cs.CredError(f"No key at '{path}' to wrap.",
+                           ["Create one first: cred keygen"], cs.EXIT_KEY)
+    if cs.identity_is_wrapped(path):
+        out(f"Key was already wrapped ({cs.keystore_name()}).")
+        return cs.EXIT_OK
+
+    text = cs.read_text(path)
+
+    backup = opts.get("backup")
+    if backup and backup is not True:
+        backup_path = Path(str(backup))
+        if backup_path.exists() and not opts.get("force"):
+            raise cs.CredError(f"'{backup_path}' already exists.",
+                               ["Choose another path, or pass --force."],
+                               cs.EXIT_USAGE)
+        cs.write_text_atomic(backup_path, text)
+        cs.restrict_path(backup_path)
+        out(f"Unwrapped key copied to '{backup_path}'. That file is the key -- "
+            "store it somewhere safe and offline.")
+    else:
+        out("No --backup given. If this account or machine is lost, a wrapped "
+            "key cannot be recovered.")
+
+    target = path.parent / cs.WRAPPED_IDENTITY_NAME
+    cs.write_text_atomic(target, cs.wrap_identity(text))
+    cs.restrict_path(target)
+
+    # Prove the wrapped copy opens before removing the original.
+    if cs.identity_text(target).strip() != text.strip():
+        target.unlink(missing_ok=True)
+        raise cs.CredError(
+            "The wrapped key did not read back identically, so nothing was changed.",
+            [f"Your original key at '{path}' is untouched. Please report this."],
+            cs.EXIT_KEY)
+
+    if path != target:
+        path.unlink()
+    out(f"Key wrapped with {cs.keystore_name()} at {target}")
+    return cs.EXIT_OK
+
+
+def _key_unprotect(path) -> int:
+    if not cs.identity_is_wrapped(path):
+        out("Key was not wrapped.")
+        return cs.EXIT_OK
+
+    text = cs.identity_text(path)
+    target = path.parent / "identity.txt"
+    cs.write_text_atomic(target, text)
+    cs.restrict_path(target)
+    path.unlink()
+    out(f"Key unwrapped to {target}")
+    out(f"'{target}' is now a plaintext key, protected only by file permissions.")
     return cs.EXIT_OK
 
 
@@ -590,13 +694,10 @@ def cmd_doctor(rest: List[str]) -> int:
 
     row("python", "Ok", f"{sys.version.split()[0]} ({sys.platform})")
 
-    age = cs.find_executable("age", "CRED_AGE_PATH")
-    keygen = cs.find_executable("age-keygen", "CRED_AGE_KEYGEN_PATH")
-    if age and keygen:
-        row("provider:age", "Ok", "age and age-keygen found.")
-    else:
-        row("provider:age", "Fail", "age or age-keygen was not found.",
-            "Install age: winget install FiloSottile.age (or brew/apt install age)")
+    for name in sorted(cs.PROVIDERS):
+        available, detail = cs.PROVIDERS[name]["test"]()
+        row(f"provider:{name}", "Ok" if available else "Warn", detail,
+            cs.PROVIDERS[name]["install_hint"])
 
     home = cs.cred_home()
     row("cred home", "Ok" if home.is_dir() else "Warn", str(home), "Run: cred init")
@@ -647,6 +748,260 @@ def cmd_doctor(rest: List[str]) -> int:
     return cs.EXIT_GENERAL if any(r["Status"] == "Fail" for r in rows) else cs.EXIT_OK
 
 
+def cmd_providers(rest: List[str]) -> int:
+    rows = []
+    for name in sorted(cs.PROVIDERS):
+        prov = cs.PROVIDERS[name]
+        available, detail = prov["test"]()
+        rows.append({"Name": name, "Available": str(available),
+                     "StoreFile": prov["store_file"], "Detail": detail})
+    table(rows, ["Name", "Available", "StoreFile", "Detail"])
+    return cs.EXIT_OK
+
+
+def cmd_claude(rest: List[str]) -> int:
+    opts, pos = read_options(rest, switches=("write",))
+    project = cs.resolve_project(pos[0] if pos else opts.get("project"),
+                                 opts.get("path"))
+    brief = build_agent_brief(project)
+
+    if not opts.get("write"):
+        sys.stdout.write(brief)
+        return cs.EXIT_OK
+
+    target = Path(opts["file"]) if opts.get("file") else project.root / "CLAUDE.md"
+    block = f"{BRIEF_BEGIN}\n{brief}{BRIEF_END}\n"
+    existing = cs.read_text(target) if target.is_file() else ""
+
+    import re
+    pattern = re.compile(re.escape(BRIEF_BEGIN) + ".*?" + re.escape(BRIEF_END) + r"\r?\n?",
+                         re.DOTALL)
+    if pattern.search(existing):
+        updated = pattern.sub(lambda _m: block, existing)
+    elif existing:
+        updated = existing.rstrip() + "\n\n" + block
+    else:
+        updated = block
+
+    cs.write_text_atomic(target, updated)
+    n = len(project.config.get("credentials") or {})
+    out(f"Wrote the cred block for {project.name} into {target} "
+        f"({n} credential(s)).")
+    return cs.EXIT_OK
+
+
+BRIEF_BEGIN = "<!-- cred:begin -->"
+BRIEF_END = "<!-- cred:end -->"
+
+
+def build_agent_brief(project) -> str:
+    """Markdown describing what exists, never a value.
+
+    The advice is deliberate: prefer `cred exec`, which hands the secret to a
+    child process the agent cannot read, over `cred get`, which puts it in the
+    agent's transcript.
+    """
+    defs = project.config.get("credentials") or {}
+    lines = [
+        "## Credentials",
+        "",
+        "This repository's secrets live encrypted in `.creds/` and are handed "
+        "out by the `cred` CLI. Never write a secret into a file, a commit, or "
+        "your reply.",
+        "",
+    ]
+    if not defs:
+        lines.append(f"_No credentials are defined yet. Add one with_ "
+                     f"`cred add {project.name}/<key>`.")
+    else:
+        lines.append("| Credential | Type | Environment variables | What it is |")
+        lines.append("| --- | --- | --- | --- |")
+        for key in sorted(defs):
+            d = defs[key]
+            env = ", ".join(str(v) for v in (d.get("env") or {}).values())
+            lines.append(f"| `{project.name}/{key}` | {d.get('type', 'secret')} "
+                         f"| `{env}` | {d.get('description', '')} |")
+    lines += [
+        "",
+        "**Preferred — run a command with the secrets injected.** The value "
+        "never enters this conversation:",
+        "",
+        "```",
+        f"cred exec {project.name} -- <command> [args]",
+        "```",
+        "",
+        "**Only when a value must actually be read** (and then treat the output "
+        "as poison — do not echo it back):",
+        "",
+        "```",
+        f"cred get {project.name}/<key>",
+        "```",
+        "",
+        "**To see what exists without decrypting anything:**",
+        "",
+        "```",
+        f"cred list {project.name}",
+        "```",
+        "",
+        "If `cred` reports that it cannot decrypt, stop and tell the user: their "
+        "key is missing or is not a recipient. Do not attempt to work around it.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_import(rest: List[str]) -> int:
+    opts, pos = read_options(rest, switches=("force", "dry-run"))
+    if not pos:
+        raise cs.CredError("cred import <file-or-folder> [--name <key>]",
+                           ["Run 'cred help' for the full surface."], cs.EXIT_USAGE)
+
+    src = Path(pos[0])
+    if not src.exists():
+        raise cs.CredError(f"'{src}' does not exist.",
+                           ["Point at a credential file or a folder of them."],
+                           cs.EXIT_NOT_FOUND)
+
+    project = cs.resolve_project(opts.get("project"), opts.get("path"))
+    dry = bool(opts.get("dry-run"))
+
+    if src.is_dir():
+        files = sorted(f for f in src.iterdir()
+                       if f.is_file() and f.suffix.lower() in
+                       (".xml", ".clixml", ".txt", ".cred"))
+    else:
+        files = [src]
+
+    if not files:
+        out(f"No credential files found in '{src}' "
+            "(looking for *.xml, *.clixml, *.txt, *.cred).")
+        return cs.EXIT_OK
+
+    rows = []
+    for f in files:
+        try:
+            parsed = _read_legacy_credential(f)
+        except cs.CredError as exc:
+            out(f"Skipping '{f.name}': {exc.message}")
+            continue
+        if not parsed:
+            out(f"Skipping '{f.name}': not a recognised credential file.")
+            continue
+        user, secret = parsed
+
+        raw = (opts["name"] if opts.get("name") and len(files) == 1
+               else f.name[:-len(f.suffix)])
+        if raw.endswith(".cred"):
+            raw = raw[:-5]
+        key = _sanitise_key(raw, f.name)
+
+        if key in (project.config.get("credentials") or {}) and not opts.get("force"):
+            out(f"Skipping '{key}': it already exists. Pass --force to overwrite.")
+            rows.append({"Key": key, "Action": "skipped", "Source": f.name})
+            continue
+
+        if dry:
+            rows.append({"Key": key, "Action": "would import", "Source": f.name})
+            continue
+
+        existed = key in (project.config.get("credentials") or {})
+
+        def mutate(values, proj, _k=key, _u=user, _s=secret):
+            kind = "userpass" if _u else "secret"
+            entry = {}
+            if kind == "userpass":
+                entry["user"] = _u
+            entry["secret"] = _s
+            values[_k] = entry
+            defs = proj.config.setdefault("credentials", {})
+            d = defs.setdefault(_k, {})
+            d["type"] = kind
+            d.setdefault("env", cs.default_env_names(_k, kind))
+            if kind == "userpass" and "user" not in d["env"]:
+                d["env"]["user"] = cs.default_env_names(_k, kind)["user"]
+            if opts.get("desc"):
+                d["description"] = str(opts["desc"])
+
+        cs.update_store(project, mutate)
+        rows.append({"Key": key, "Source": f.name,
+                     "Action": "replaced" if existed else "imported"})
+
+    if not rows:
+        out("Nothing to import.")
+    else:
+        table(rows, ["Key", "Action", "Source"])
+    return cs.EXIT_OK
+
+
+def _sanitise_key(raw: str, source: str) -> str:
+    import re
+    if cs.valid_key_name(raw):
+        return raw
+    clean = re.sub(r"[^A-Za-z0-9._-]", "-", raw)
+    clean = re.sub(r"^[^A-Za-z0-9]+", "", clean)
+    if not cs.valid_key_name(clean):
+        raise cs.CredError(
+            f"Cannot derive a usable credential name from '{source}'.",
+            [f"Import it on its own and name it: "
+             f"cred import '{source}' --name <key>"],
+            cs.EXIT_USAGE)
+    return clean
+
+
+def _read_legacy_credential(path: Path):
+    """(user, secret) from an Export-Clixml file or ConvertFrom-SecureString hex."""
+    if path.suffix.lower() in (".xml", ".clixml"):
+        return cs.read_clixml_credential(path)
+
+    text = cs.read_text(path).strip()
+    import re
+    if not re.fullmatch(r"[0-9a-fA-F]+", text or "x") or len(text) < 32:
+        return None
+    return None, cs.dpapi_hex_to_text(text)
+
+
+def cmd_export(rest: List[str]) -> int:
+    opts, pos = read_options(rest, switches=("yes", "force"))
+    if not pos:
+        raise cs.CredError("cred export <folder> [--only <a,b>]", [], cs.EXIT_USAGE)
+
+    if not cs.is_windows() and not opts.get("force"):
+        raise cs.CredError(
+            "Off Windows there is no DPAPI, so these files would hold the "
+            "secret in plain text.",
+            ["Use cred exec or the PowerShell module instead, or",
+             "pass --force if you genuinely want plaintext files on disk."],
+            cs.EXIT_USAGE)
+
+    project = cs.resolve_project(opts.get("project"), opts.get("path"))
+    only = [s.strip() for s in str(opts["only"]).split(",")] if opts.get("only") else None
+    dest = Path(pos[0])
+    dest.mkdir(parents=True, exist_ok=True)
+    cs.restrict_path(dest)
+
+    if not opts.get("yes") and sys.stdin.isatty():
+        answer = input(f"Write credential files into '{dest}'? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            out("Cancelled.")
+            return cs.EXIT_OK
+
+    values = cs.read_values(project)
+    rows = []
+    for key in sorted(values):
+        if only and key not in only:
+            continue
+        entry = values[key]
+        user = entry.get("user") or key
+        target = dest / f"{key}.cred.xml"
+        cs.write_clixml_credential(target, user, str(entry["secret"]))
+        rows.append({"Key": key, "UserName": user, "File": str(target)})
+
+    table(rows, ["Key", "UserName", "File"])
+    if rows:
+        out(f"{len(rows)} credential file(s) written to '{dest}'. "
+            "Delete them once the migration is done.")
+    return cs.EXIT_OK
+
 # --------------------------------------------------------------- dispatch ---
 
 def dispatch(argv: List[str]) -> int:
@@ -659,7 +1014,7 @@ def dispatch(argv: List[str]) -> int:
     rest = head[1:]
 
     if verb in ("version", "--version", "-v"):
-        out(f"cred 1.0.0  (Python {sys.version.split()[0]})")
+        out(f"cred 1.1.0  (Python {sys.version.split()[0]} on {sys.platform})")
         return cs.EXIT_OK
 
     handlers = {
@@ -667,7 +1022,9 @@ def dispatch(argv: List[str]) -> int:
         "list": cmd_list, "rm": cmd_rm, "remove": cmd_rm, "delete": cmd_rm,
         "env": cmd_env, "recipients": cmd_recipients, "keygen": cmd_keygen,
         "key": cmd_key, "project": cmd_project, "doctor": cmd_doctor,
-        "check": cmd_doctor,
+        "check": cmd_doctor, "providers": cmd_providers, "provider": cmd_providers,
+        "claude": cmd_claude, "agent": cmd_claude, "brief": cmd_claude,
+        "import": cmd_import, "export": cmd_export,
     }
     if verb == "exec":
         return cmd_exec(rest, tail)

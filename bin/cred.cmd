@@ -1,14 +1,20 @@
 @echo off
-REM cred -- launcher for cmd.exe and for anything that resolves commands via PATHEXT.
-REM Prefers PowerShell 7; falls back to Windows PowerShell 5.1.
+REM cred -- per-repository encrypted credentials (Python implementation).
+REM The PowerShell one is cred-ps.cmd; both read and write the same stores.
 setlocal
-set "CRED_SCRIPT=%~dp0cred.ps1"
-where pwsh.exe >nul 2>&1
+where python >nul 2>&1
 if %ERRORLEVEL%==0 (
-    pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%CRED_SCRIPT%" %*
-) else if exist "%ProgramFiles%\PowerShell\7\pwsh.exe" (
-    "%ProgramFiles%\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%CRED_SCRIPT%" %*
+    python "%~dp0..\python\cred.py" %*
 ) else (
-    powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%CRED_SCRIPT%" %*
+    where py >nul 2>&1
+    if %ERRORLEVEL%==0 (
+        py -3 "%~dp0..\python\cred.py" %*
+    ) else (
+        echo cred: Python 3.8+ was not found. 1>&2
+        echo. 1>&2
+        echo Next: 1>&2
+        echo   Install Python 3, or use the PowerShell implementation: cred-ps 1>&2
+        exit /b 5
+    )
 )
 exit /b %ERRORLEVEL%

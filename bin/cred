@@ -1,25 +1,22 @@
 #!/usr/bin/env sh
-# cred -- launcher for bash/zsh/fish (Linux, macOS, and Git Bash on Windows).
+# cred -- per-repository encrypted credentials.
 #
-# The Linux port path starts here: PowerShell 7 runs natively on Linux, so this
-# shim plus the module is already a working `cred` on any POSIX shell. See
-# ARCHITECTURE.md for what a dependency-free shell reimplementation would need.
+# This is the Python implementation and the default interface on every
+# platform. The PowerShell one is bin/cred-ps; both read and write the same
+# stores, so which you use is a question about the machine, not the project.
 set -e
-
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-if command -v pwsh >/dev/null 2>&1; then
-    pwsh_bin=pwsh
-elif [ -x "/c/Program Files/PowerShell/7/pwsh.exe" ]; then
-    pwsh_bin="/c/Program Files/PowerShell/7/pwsh.exe"
-elif [ -x "/mnt/c/Program Files/PowerShell/7/pwsh.exe" ]; then
-    pwsh_bin="/mnt/c/Program Files/PowerShell/7/pwsh.exe"
+if command -v python3 >/dev/null 2>&1; then
+    py=python3
+elif command -v python >/dev/null 2>&1; then
+    py=python
 else
-    echo "cred: PowerShell 7 (pwsh) was not found." >&2
+    echo "cred: Python 3.8+ was not found." >&2
     echo "" >&2
     echo "Next:" >&2
-    echo "  Install it: https://aka.ms/powershell   (apt/dnf/brew all package it as 'powershell')" >&2
+    echo "  Install Python 3, or use the PowerShell implementation: cred-ps" >&2
     exit 5
 fi
 
-exec "$pwsh_bin" -NoLogo -NoProfile -File "$script_dir/cred.ps1" "$@"
+exec "$py" "$script_dir/../python/cred.py" "$@"

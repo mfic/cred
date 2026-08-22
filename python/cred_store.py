@@ -410,6 +410,279 @@ def age_new_identity(path: Path) -> Tuple[Path, str]:
     return path, pub
 
 
+# --------------------------------------------------------------- providers ---
+# The same seam as src/Cred/Private/Providers.ps1, in the same shape. Nothing
+# above this layer knows what encryption is, so adding a backend is one entry.
+#
+#   test         () -> (available: bool, detail: str)
+#   new_identity (path) -> (path, recipient)
+#   recipient    (config) -> str
+#   encrypt      (plain: bytes, recipients: list, config) -> bytes
+#   decrypt      (cipher: bytes, cipher_path, config) -> bytes
+#
+# A provider must not write plaintext to disk and must not put secret material
+# on a command line.
+
+def _age_test():
+    if not find_executable("age", "CRED_AGE_PATH"):
+        return False, "'age' was not found on PATH."
+    if not find_executable("age-keygen", "CRED_AGE_KEYGEN_PATH"):
+        return False, "'age' found but 'age-keygen' was not."
+    return True, "age and age-keygen found."
+
+
+def _gpg_test():
+    if not find_executable("gpg", "CRED_GPG_PATH"):
+        return False, "'gpg' was not found on PATH."
+    return True, "gpg found."
+
+
+def _require_gpg() -> str:
+    gpg = find_executable("gpg", "CRED_GPG_PATH")
+    if not gpg:
+        raise CredError("The 'gpg' encryption backend was not found.",
+                        ["Install GnuPG:  winget install GnuPG.GnuPG   "
+                         "(or: apt install gnupg)"],
+                        EXIT_BACKEND)
+    return gpg
+
+
+def _gpg_encrypt(plain: bytes, recipients: List[str],
+                 config: Optional[Dict[str, Any]] = None) -> bytes:
+    if not recipients:
+        raise CredError(
+            "This project has no recipients, so nothing could decrypt the store.",
+            ["Add one with: cred recipients add <fingerprint>"])
+    gpg = _require_gpg()
+    argv = [gpg, "--batch", "--yes", "--armor", "--trust-model", "always",
+            "--encrypt"]
+    for r in recipients:
+        argv += ["-r", str(r)]
+    rc, out, err = _run(argv, plain)
+    if rc != 0:
+        raise CredError(f"gpg could not encrypt the store: {err}",
+                        ["Check every recipient is in your keyring: gpg --list-keys",
+                         "List configured recipients with: cred recipients"])
+    return out
+
+
+def _gpg_decrypt(cipher: bytes, cipher_path=None,
+                 config: Optional[Dict[str, Any]] = None) -> bytes:
+    gpg = _require_gpg()
+    rc, out, err = _run([gpg, "--batch", "--yes", "--quiet", "--decrypt"], cipher)
+    if rc != 0:
+        raise CredError(
+            f"gpg could not decrypt the store: {err}",
+            ["Confirm you hold a secret key for one of the recipients: "
+             "gpg --list-secret-keys",
+             "If the passphrase prompt was skipped, run gpg once interactively "
+             "to unlock the agent."],
+            EXIT_KEY)
+    return out
+
+
+def _gpg_recipient(config: Optional[Dict[str, Any]] = None) -> str:
+    gpg = _require_gpg()
+    rc, out, _ = _run([gpg, "--list-secret-keys", "--with-colons"])
+    for line in out.decode("utf-8", "replace").splitlines():
+        if line.startswith("fpr:"):
+            return line.split(":")[9]
+    raise CredError("No GnuPG secret key was found in your keyring.",
+                    ["Create one with: gpg --full-generate-key"], EXIT_KEY)
+
+
+def _gpg_new_identity(path):
+    raise CredError(
+        "The gpg provider uses your existing GnuPG keyring; it does not "
+        "create keys.",
+        ["Create a key with: gpg --full-generate-key",
+         "Then: cred recipients add <your-fingerprint-or-email>"],
+        EXIT_USAGE)
+
+
+def _age_encrypt_adapter(plain: bytes, recipients: List[str],
+                         config: Optional[Dict[str, Any]] = None) -> bytes:
+    return age_encrypt(plain, recipients)
+
+
+PROVIDERS: Dict[str, Dict[str, Any]] = {
+    "age": {
+        "name": "age",
+        "summary": "age (X25519, authenticated ChaCha20-Poly1305)",
+        "store_file": "store.age",
+        "install_hint": "Install age:  winget install FiloSottile.age   "
+                        "(or: brew install age / apt install age)",
+        "test": _age_test,
+        "new_identity": age_new_identity,
+        "recipient": age_recipient,
+        "encrypt": _age_encrypt_adapter,
+        "decrypt": age_decrypt,
+    },
+    "gpg": {
+        "name": "gpg",
+        "summary": "GnuPG public-key encryption against your existing keyring",
+        "store_file": "store.asc",
+        "install_hint": "Install GnuPG:  winget install GnuPG.GnuPG   "
+                        "(or: apt install gnupg)",
+        "test": _gpg_test,
+        "new_identity": _gpg_new_identity,
+        "recipient": _gpg_recipient,
+        "encrypt": _gpg_encrypt,
+        "decrypt": _gpg_decrypt,
+    },
+}
+
+
+def get_provider(name: str) -> Dict[str, Any]:
+    prov = PROVIDERS.get(name)
+    if prov is None:
+        known = ", ".join(sorted(PROVIDERS))
+        raise CredError(f"Unknown encryption provider '{name}'.",
+                        [f"Known providers: {known}",
+                         "Fix the 'provider' field in .creds/config.json."],
+                        EXIT_BACKEND)
+    return prov
+
+
+# ------------------------------------------------------------ DPAPI wrap ----
+
+def dpapi_protect(data: bytes) -> bytes:
+    """Wrap bytes with DPAPI, bound to the current Windows account."""
+    if not is_windows():
+        raise CredError(
+            "No OS keystore is available on this platform.",
+            ["On Windows this uses DPAPI and needs nothing installed.",
+             "Elsewhere, protect the key file itself: age -p identity.txt"],
+            EXIT_BACKEND)
+
+    import ctypes
+    from ctypes import wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD),
+                    ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    buf = ctypes.create_string_buffer(data, len(data))
+    src = DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    out = DATA_BLOB()
+
+    ok = crypt32.CryptProtectData(ctypes.byref(src), None, None, None, None,
+                                  0, ctypes.byref(out))
+    if not ok:
+        raise CredError("Windows refused to wrap the key.",
+                        ["Run 'cred doctor' and try again."], EXIT_KEY)
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        kernel32.LocalFree(out.pbData)
+
+
+def keystore_available() -> bool:
+    if not is_windows():
+        return False
+    try:
+        return dpapi_protect(b"probe") is not None
+    except Exception:
+        return False
+
+
+def keystore_name() -> str:
+    return "dpapi-currentuser" if is_windows() else "none"
+
+
+def wrap_identity(text: str) -> str:
+    """The wrapped-identity file, byte-identical in shape to the PowerShell one."""
+    return dump_json({
+        "format": IDENTITY_FORMAT,
+        "version": 1,
+        "protection": keystore_name(),
+        "note": "Wrapped by the OS keystore. Only the account that wrapped it "
+                "can open it. Keep a separate backup of the unwrapped key.",
+        "data": base64.b64encode(dpapi_protect(text.encode("utf-8"))).decode("ascii"),
+    })
+
+
+# ------------------------------------------------------- PSCredential XML ---
+# Export-Clixml is plain XML in which a SecureString is a DPAPI blob in hex --
+# exactly what ConvertFrom-SecureString emits. That makes the PowerShell
+# migration formats readable and writable from here, so the CLI does not have to
+# hand part of its job to another runtime.
+
+_CLIXML_NS = "http://schemas.microsoft.com/powershell/2004/04"
+
+
+def dpapi_hex_to_text(hex_text: str) -> str:
+    blob = bytes.fromhex(hex_text.strip())
+    return _dpapi_unprotect(blob).decode("utf-16-le")
+
+
+def text_to_dpapi_hex(text: str) -> str:
+    return dpapi_protect(text.encode("utf-16-le")).hex()
+
+
+def read_clixml_credential(path: Path):
+    """Return (username, secret) from an Export-Clixml file, or None.
+
+    Handles the two shapes people actually have: a PSCredential, and a bare
+    SecureString (which has no username).
+    """
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.parse(str(path)).getroot()
+    except ET.ParseError:
+        return None
+
+    def tag(el):
+        return el.tag.split("}")[-1]
+
+    # A bare SecureString: <Objs><SS>hex</SS></Objs>
+    for child in root:
+        if tag(child) == "SS" and child.text:
+            return None, dpapi_hex_to_text(child.text)
+
+    # A PSCredential: <Obj><Props><S N="UserName"/><SS N="Password"/></Props></Obj>
+    for obj in root.iter():
+        if tag(obj) != "Props":
+            continue
+        user = None
+        secret = None
+        for prop in obj:
+            name = prop.attrib.get("N")
+            if tag(prop) == "S" and name == "UserName":
+                user = prop.text or ""
+            elif tag(prop) == "SS" and name == "Password" and prop.text:
+                secret = dpapi_hex_to_text(prop.text)
+        if secret is not None:
+            return user, secret
+    return None
+
+
+def write_clixml_credential(path: Path, user: str, secret: str) -> None:
+    """Write a PSCredential that Import-Clixml reads back natively."""
+    from xml.sax.saxutils import escape
+
+    xml = (
+        '<Objs Version="1.1.0.1" xmlns="{ns}">\r\n'
+        '  <Obj RefId="0">\r\n'
+        '    <TN RefId="0">\r\n'
+        '      <T>System.Management.Automation.PSCredential</T>\r\n'
+        '      <T>System.Object</T>\r\n'
+        '    </TN>\r\n'
+        '    <ToString>System.Management.Automation.PSCredential</ToString>\r\n'
+        '    <Props>\r\n'
+        '      <S N="UserName">{user}</S>\r\n'
+        '      <SS N="Password">{pw}</SS>\r\n'
+        '    </Props>\r\n'
+        '  </Obj>\r\n'
+        '</Objs>'
+    ).format(ns=_CLIXML_NS, user=escape(user), pw=text_to_dpapi_hex(secret))
+    write_text_atomic(path, xml)
+    restrict_path(path)
+
 # ------------------------------------------------------------------ config ---
 
 def find_project_root(start: Optional[Path] = None) -> Optional[Path]:
@@ -497,13 +770,7 @@ def read_config(path: Path) -> Dict[str, Any]:
             f"(config version {cfg['version']}).",
             ["Update cred, then try again."], EXIT_CORRUPT)
 
-    provider = cfg.setdefault("provider", "age")
-    if provider != "age":
-        raise CredError(
-            f"The Python cred only implements the 'age' provider, "
-            f"but this project uses '{provider}'.",
-            ["Use the PowerShell cred for this project, which also ships gpg.",
-             "Or re-encrypt it with age."], EXIT_BACKEND)
+    get_provider(cfg.setdefault("provider", "age"))   # fail fast on a typo
 
     cfg.setdefault("version", CONFIG_VERSION)
     cfg.setdefault("project", path.parent.parent.name)
@@ -638,7 +905,8 @@ def read_values(project: Project) -> Dict[str, Dict[str, str]]:
     cipher = project.store_path.read_bytes()
     if not cipher:
         return {}
-    plain = age_decrypt(cipher, project.store_path, project.config)
+    prov  = get_provider(project.config["provider"])
+    plain = prov["decrypt"](cipher, project.store_path, project.config)
     try:
         data = json.loads(plain.decode("utf-8"))
     except Exception as exc:
@@ -654,12 +922,14 @@ def write_values(project: Project, values: Dict[str, Any]) -> None:
     payload = json.dumps({"version": STORE_VERSION, "values": values},
                          separators=(",", ":"), ensure_ascii=False)
     plain = payload.encode("utf-8")
-    cipher = age_encrypt(plain, list(project.config.get("recipients") or []))
+    prov = get_provider(project.config["provider"])
+    cipher = prov["encrypt"](plain, list(project.config.get("recipients") or []),
+                             project.config)
 
     staged = stage_bytes(project.store_path, cipher)
     try:
         try:
-            verify = age_decrypt(cipher, staged, project.config)
+            verify = prov["decrypt"](cipher, staged, project.config)
         except CredError:
             verify = b""
         if verify != plain:

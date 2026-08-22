@@ -1,0 +1,25 @@
+#!/usr/bin/env sh
+# cred-ps -- the PowerShell implementation, for bash/zsh/fish.
+#
+# The default `cred` is Python. Reach for this one when you want the gpg
+# provider, or when a machine has PowerShell but not Python.
+set -e
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if command -v pwsh >/dev/null 2>&1; then
+    pwsh_bin=pwsh
+elif [ -x "/c/Program Files/PowerShell/7/pwsh.exe" ]; then
+    pwsh_bin="/c/Program Files/PowerShell/7/pwsh.exe"
+elif [ -x "/mnt/c/Program Files/PowerShell/7/pwsh.exe" ]; then
+    pwsh_bin="/mnt/c/Program Files/PowerShell/7/pwsh.exe"
+else
+    echo "cred-ps: PowerShell 7 (pwsh) was not found." >&2
+    echo "" >&2
+    echo "Next:" >&2
+    echo "  Install it: https://aka.ms/powershell   (apt/dnf/brew package it as 'powershell')" >&2
+    echo "  Or use the default Python implementation: cred" >&2
+    exit 5
+fi
+
+exec "$pwsh_bin" -NoLogo -NoProfile -File "$script_dir/cred.ps1" "$@"

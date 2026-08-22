@@ -136,8 +136,8 @@ If you would rather the whole session have the environment set — for a long
 task, or for tooling that reads env vars at startup — launch Claude Code
 through `cred exec`:
 
-```powershell
-cd C:\work\acme-api
+```bash
+cd /work/acme-api      # or C:\work\acme-api
 cred exec acme-api -- claude
 ```
 
@@ -154,7 +154,7 @@ cred exec acme-api --only db,gh -- claude
 
 They clone the repo and run:
 
-```powershell
+```bash
 cred keygen              # prints their public key
 cred list                # works immediately: they can see what they need
 ```
@@ -177,17 +177,17 @@ channel — you exchanged a public key.
 each problem it finds:
 
 ```
-Check                Status Detail                                    Fix
------                ------ ------                                    ---
-powershell           Ok     Core 7.6.5
-provider:age         Ok     age and age-keygen found.
-identity             Ok     C:\Users\you\AppData\Roaming\cred\identity.txt
-identity permissions Ok     Readable only by you.
-project              Ok     acme-api at C:\work\acme-api
-store                Ok     C:\work\acme-api\.creds\store.age
-decrypt              Ok     3 credential(s) readable.
-recipients           Ok     2 recipient(s); you are one.
-git                  Ok     .creds is committable.
+Check                Status  Detail                                   Fix
+-------------------  ------  ---------------------------------------  ---
+python               Ok      3.14.0 (win32)
+provider:age         Ok      age and age-keygen found.
+provider:gpg         Ok      gpg found.
+identity             Ok      ...cred\identity.txt
+identity protection  Ok      file-permissions
+project              Ok      acme-api at C:\work\acme-api
+store                Ok      ...acme-api\.creds\store.age
+decrypt              Ok      3 credential(s) readable.
+recipients           Ok      2 recipient(s); you are one.
 ```
 
 If a session reports it cannot decrypt, that is the agent correctly refusing to
