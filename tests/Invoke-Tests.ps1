@@ -37,7 +37,10 @@ Invoke-Pester -Configuration `$cfg
     $file = Join-Path ([System.IO.Path]::GetTempPath()) "credrun-$([guid]::NewGuid().ToString('N')).ps1"
     Set-Content -LiteralPath $file -Value $runner -Encoding UTF8
     try {
-        & $Exe -NoProfile -ExecutionPolicy Bypass -File $file
+        # Out-Host, not a bare call: the child's output must reach the console
+        # rather than becoming this function's return value alongside the exit
+        # code we actually want.
+        & $Exe -NoProfile -ExecutionPolicy Bypass -File $file | Out-Host
         return $LASTEXITCODE
     }
     finally { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
