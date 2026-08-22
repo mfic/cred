@@ -23,12 +23,18 @@ function Set-Cred {
 
         .EXAMPLE
         Get-Content token.txt | Set-Cred acme-api/gh -FromStdin
+
+        .EXAMPLE
+        Set-Cred acme-api/db -Credential (Import-Clixml old-db.xml)
+        Take the username and the password together from an existing
+        PSCredential -- the usual shape of a migration.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory, Position = 0)][string]$Name,
         [Parameter(Position = 1)][object]$Secret,
+        [System.Management.Automation.PSCredential]$Credential,
         [string]$User,
         [string]$Description,
         [hashtable]$Env,
@@ -51,6 +57,13 @@ function Set-Cred {
         throw (New-CredErrorRecord -Code 'Usage' -Category InvalidArgument -Target $key `
             -Message "'$key' is not a usable credential name." `
             -Next "Use letters, digits, dot, dash or underscore, e.g. 'db' or 'stripe.live'.")
+    }
+
+    # A PSCredential carries both halves, so it fills in -User as well. That is
+    # the whole point: importing one should not need two parameters.
+    if ($Credential) {
+        if (-not $User) { $User = $Credential.UserName }
+        if ($null -eq $Secret) { $Secret = $Credential.GetNetworkCredential().Password }
     }
 
     $ctx = Resolve-CredProject -Name $Project -Path $Path

@@ -202,7 +202,23 @@ COMMANDS
 
   keygen                           Create this machine's key
       --show                       Print the public key instead
+      --protect                    Wrap it with the OS keystore (DPAPI)
       --force                      Replace the existing key (backs it up)
+
+  key                              Show where your key is and how it is held
+  key protect                      Wrap it with the OS keystore (DPAPI)
+      --backup <file>              Save the unwrapped key first (do this)
+  key unprotect                    Unwrap it, before moving machine or account
+
+  import <path>                    Import PSCredential files into a store
+      --name <key>                 Name for a single file
+      --desc <text>                Description for what is imported
+      --force                      Overwrite credentials that already exist
+      --dry-run                    Show what would happen, change nothing
+
+  export <folder>                  Write credentials out as PSCredential files
+      --only <a,b>                 Just these
+      --yes                        Skip the confirmation
 
   project list                     Registered projects on this machine
   project rm <name>                Forget a project mapping
@@ -422,8 +438,8 @@ function Invoke-CredCli {
             return 0
         }
 
-        { $_ -in 'keygen', 'key' } {
-            $p = Read-Options -Argv $rest -Switches @('show', 'force') -Short @{}
+        { $_ -in 'keygen', 'newkey' } {
+            $p = Read-Options -Argv $rest -Switches @('show', 'force', 'protect') -Short @{}
             $o = $p.Options
             $call = @{}
             if (Get-Opt $o 'show')  { $call.Show = $true }
@@ -431,6 +447,11 @@ function Invoke-CredCli {
             if (Get-Opt $o 'path')  { $call.Path = Get-Opt $o 'path' }
 
             $r = New-CredIdentity @call
+            if ((Get-Opt $o 'protect') -and -not (Get-Opt $o 'show')) {
+                $p2 = Protect-CredIdentity -Confirm:$false -Force
+                $r = New-CredIdentity -Show
+                Write-Line "Key wrapped with $($p2.Protection) at $($p2.Path)"
+            }
             if (Get-Opt $o 'show') {
                 Write-Line $r.Recipient
             }
@@ -492,6 +513,74 @@ function Invoke-CredCli {
             else {
                 Write-Line (Get-CredAgentBrief @call)
             }
+            return 0
+        }
+
+        'key' {
+            $sub = if ($rest.Count -gt 0) { ([string]$rest[0]).ToLowerInvariant() } else { '' }
+            $subArgv = @(if ($rest.Count -gt 1) { $rest[1..($rest.Count - 1)] } else { @() })
+            $p = Read-Options -Argv $subArgv -Switches @('force') -Short @{}
+
+            switch ($sub) {
+                'protect' {
+                    $call = @{ Confirm = $false }
+                    if (Get-Opt $p.Options 'backup') { $call.Backup = Get-Opt $p.Options 'backup' }
+                    if (Get-Opt $p.Options 'force')  { $call.Force = $true }
+                    $r = Protect-CredIdentity @call
+                    if ($r.Changed) { Write-Line "Key wrapped with $($r.Protection) at $($r.Path)" }
+                    else            { Write-Line "Key was already wrapped ($($r.Protection))." }
+                    return 0
+                }
+                { $_ -in 'unprotect', 'unwrap' } {
+                    $r = Unprotect-CredIdentity -Confirm:$false
+                    if ($r.Changed) { Write-Line "Key unwrapped to $($r.Path)" }
+                    else            { Write-Line 'Key was not wrapped.' }
+                    return 0
+                }
+                default {
+                    $i = Get-CredIdentityInfo
+                    Write-Line "path        $($i.Path)"
+                    Write-Line "exists      $($i.Exists)"
+                    Write-Line "protection  $($i.Protection)"
+                    Write-Line "private     $($i.Private)"
+                    Write-Line "keystore    $(if ($i.KeystoreAvailable) { 'available' } else { 'not available on this platform' })"
+                    if ($i.Recipient) { Write-Line "public key  $($i.Recipient)" }
+                    return 0
+                }
+            }
+        }
+
+        'import' {
+            $p = Read-Options -Argv $rest -Switches @('force', 'dry-run') -Short @{}
+            $o = $p.Options
+            if ($p.Positional.Count -lt 1) { throw (UsageError 'cred import <file-or-folder> [--name <key>]') }
+
+            $call = @{ Path = $p.Positional[0] }
+            if (Get-Opt $o 'name')    { $call.Name = Get-Opt $o 'name' }
+            if (Get-Opt $o 'desc')    { $call.Description = Get-Opt $o 'desc' }
+            if (Get-Opt $o 'project') { $call.Project = Get-Opt $o 'project' }
+            if (Get-Opt $o 'path')    { $call.ProjectPath = Get-Opt $o 'path' }
+            if (Get-Opt $o 'force')   { $call.Force = $true }
+            if (Get-Opt $o 'dry-run') { $call.WhatIf = $true }
+
+            $rows = @(Import-Cred @call)
+            if ($rows.Count -eq 0) { Write-Line 'Nothing to import.' }
+            else { Write-Table -Rows $rows -Property @('Key', 'Action', 'Source') }
+            return 0
+        }
+
+        'export' {
+            $p = Read-Options -Argv $rest -Switches @('yes', 'force') -Short @{ 'y' = 'yes' }
+            $o = $p.Options
+            if ($p.Positional.Count -lt 1) { throw (UsageError 'cred export <folder> [--only <a,b>]') }
+
+            $call = @{ Path = $p.Positional[0]; Confirm = -not [bool](Get-Opt $o 'yes') }
+            if (Get-Opt $o 'project') { $call.Project = Get-Opt $o 'project' }
+            if (Get-Opt $o 'only')    { $call.Only = (Get-Opt $o 'only') -split ',' }
+            if (Get-Opt $o 'force')   { $call.Force = $true }
+
+            $rows = @(Export-Cred @call)
+            Write-Table -Rows $rows -Property @('Key', 'UserName', 'File')
             return 0
         }
 

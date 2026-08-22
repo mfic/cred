@@ -159,22 +159,33 @@ function Write-CredStoreValues {
         $plain  = $script:CredUtf8NoBom.GetBytes((ConvertTo-CredJson $payload -Compress))
         $cipher = & $provider.Encrypt $plain $Project.Config
 
-        # Round-trip check before we overwrite anything. If we cannot read back
-        # what we just wrote, the old store is still on disk and still good.
-        $verify = $null
-        try { $verify = & $provider.Decrypt $cipher $Project.StorePath $Project.Config }
-        catch { $verify = $null }
+        # Stage the ciphertext beside the store, then prove we can decrypt that
+        # exact file before it becomes the store. Until the move, the old store
+        # is untouched and still good. Staging first also gives a keystore-
+        # wrapped identity a real path to point age at, since in that mode stdin
+        # is carrying the key.
+        $staged = New-CredStagedFile -Path $Project.StorePath -Bytes $cipher
+        try {
+            $verify = $null
+            try { $verify = & $provider.Decrypt $cipher $staged $Project.Config }
+            catch { $verify = $null }
 
-        if (-not $verify -or $verify.Length -ne $plain.Length) {
-            throw (New-CredErrorRecord -Code 'DecryptFailed' `
-                -Message 'The new store encrypted, but you could not decrypt it again, so it was not saved.' `
-                -Next @("You are probably not one of this project's recipients.",
-                        "Check with: cred recipients",
-                        "Add yourself: cred recipients add (cred keygen --show)"))
+            if (-not $verify -or $verify.Length -ne $plain.Length) {
+                throw (New-CredErrorRecord -Code 'DecryptFailed' `
+                    -Message 'The new store encrypted, but you could not decrypt it again, so it was not saved.' `
+                    -Next @("You are probably not one of this project's recipients.",
+                            "Check with: cred recipients",
+                            "Add yourself: cred recipients add (cred keygen --show)"))
+            }
+            [array]::Clear($verify, 0, $verify.Length)
+
+            Move-CredTempIntoPlace -Temp $staged -Destination $Project.StorePath
         }
-        [array]::Clear($verify, 0, $verify.Length)
-
-        Set-CredFileBytes -Path $Project.StorePath -Bytes $cipher
+        finally {
+            if (Test-Path -LiteralPath $staged -PathType Leaf) {
+                Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
     finally {
         if ($plain) { [array]::Clear($plain, 0, $plain.Length) }

@@ -13,3 +13,7 @@ bin/cred text eol=lf
 # An age store is armored ASCII, but never let git rewrite a ciphertext file.
 *.age   -text
 *.asc   -text
+
+# The Python peer implementation.
+*.py     text eol=lf
+bin/cred-py text eol=lf

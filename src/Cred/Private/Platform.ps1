@@ -65,6 +65,95 @@ function New-CredDirectory {
     return $Path
 }
 
+function Test-CredKeystoreAvailable {
+    <#
+        .SYNOPSIS
+        Can this machine wrap the identity key with an OS keystore?
+
+        Windows: DPAPI, bound to the current user account.
+        Elsewhere: not yet (Keychain and libsecret are the obvious next two),
+        so the key stays a permission-restricted file.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    if (-not (Test-CredIsWindows)) { return $false }
+    try {
+        $null = [System.Security.Cryptography.ProtectedData]
+        return $true
+    }
+    catch {
+        try {
+            Add-Type -AssemblyName System.Security -ErrorAction Stop
+            $null = [System.Security.Cryptography.ProtectedData]
+            return $true
+        }
+        catch {
+            Write-Verbose "DPAPI unavailable: $($_.Exception.Message)"
+            return $false
+        }
+    }
+}
+
+function Get-CredKeystoreName {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+    if (Test-CredIsWindows) { return 'dpapi-currentuser' }
+    return 'none'
+}
+
+function Protect-CredSecretBytes {
+    <#
+        .SYNOPSIS
+        Wrap bytes with the OS keystore. The result is useless to any other
+        user account, and on Windows to any other machine.
+    #>
+    [CmdletBinding()]
+    [OutputType([byte[]])]
+    param(
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [byte[]]$Entropy
+    )
+
+    if (-not (Test-CredKeystoreAvailable)) {
+        throw (New-CredErrorRecord -Code 'ProviderMissing' `
+            -Message 'No OS keystore is available on this platform.' `
+            -Next @("Leave the key as a permission-restricted file, or",
+                    "protect the key file itself with age: age -p identity.txt"))
+    }
+    return [System.Security.Cryptography.ProtectedData]::Protect(
+        $Bytes, $Entropy, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+}
+
+function Unprotect-CredSecretBytes {
+    [CmdletBinding()]
+    [OutputType([byte[]])]
+    param(
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [byte[]]$Entropy
+    )
+
+    if (-not (Test-CredKeystoreAvailable)) {
+        throw (New-CredErrorRecord -Code 'NoIdentity' `
+            -Message 'This key is wrapped with an OS keystore that is not available here.' `
+            -Next "Unwrap it on the machine and account that wrapped it: cred key unprotect")
+    }
+    try {
+        return [System.Security.Cryptography.ProtectedData]::Unprotect(
+            $Bytes, $Entropy, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    }
+    catch {
+        throw (New-CredErrorRecord -Code 'NoIdentity' `
+            -Message 'The OS keystore refused to unwrap your key.' `
+            -Next @("A DPAPI-wrapped key only opens for the Windows account that wrapped it, on that machine.",
+                    "If you have moved machine or account, restore the key from your backup and re-wrap it:",
+                    "  cred keygen --protect") `
+            -InnerException $_.Exception)
+    }
+}
+
 function Get-CredAcl {
     <#
         .SYNOPSIS

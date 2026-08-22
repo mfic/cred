@@ -91,6 +91,38 @@ function Set-CredFileText {
     }
 }
 
+function New-CredStagedFile {
+    <#
+        .SYNOPSIS
+        Write bytes to a temp file beside Path and return the temp path.
+
+        Split out from Set-CredFileBytes so a caller can inspect what it is
+        about to publish -- Write-CredStoreValues decrypts the staged file to
+        prove it is readable before that file becomes the store.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][byte[]]$Bytes
+    )
+
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        $null = New-Item -ItemType Directory -Path $dir -Force
+    }
+    $tmp = "$Path.tmp$PID-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+    $fs = [System.IO.FileStream]::new($tmp, [System.IO.FileMode]::CreateNew,
+                                      [System.IO.FileAccess]::Write,
+                                      [System.IO.FileShare]::None)
+    try {
+        $fs.Write($Bytes, 0, $Bytes.Length)
+        $fs.Flush($true)
+    }
+    finally { $fs.Dispose() }
+    return $tmp
+}
+
 function Set-CredFileBytes {
     <#
         .SYNOPSIS
@@ -105,23 +137,8 @@ function Set-CredFileBytes {
 
     if (-not $PSCmdlet.ShouldProcess($Path, 'Write file')) { return }
 
-    $dir = Split-Path -Parent $Path
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
-        $null = New-Item -ItemType Directory -Path $dir -Force
-    }
-    $tmp = "$Path.tmp$PID-$([guid]::NewGuid().ToString('N').Substring(0,8))"
-    try {
-        $fs = [System.IO.FileStream]::new($tmp, [System.IO.FileMode]::CreateNew,
-                                          [System.IO.FileAccess]::Write,
-                                          [System.IO.FileShare]::None)
-        try {
-            $fs.Write($Bytes, 0, $Bytes.Length)
-            $fs.Flush($true)
-        }
-        finally { $fs.Dispose() }
-
-        Move-CredTempIntoPlace -Temp $tmp -Destination $Path
-    }
+    $tmp = New-CredStagedFile -Path $Path -Bytes $Bytes
+    try   { Move-CredTempIntoPlace -Temp $tmp -Destination $Path }
     finally {
         if (Test-Path -LiteralPath $tmp -PathType Leaf) {
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue

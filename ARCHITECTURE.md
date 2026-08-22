@@ -3,24 +3,26 @@
 ## The shape of the thing
 
 ```
-   cred (CLI)                    Import-Module Cred
-   bin/cred.ps1                  src/Cred/Public/*.ps1
-        │                                │
-        └────────────┬───────────────────┘
-                     │   one set of behaviour, two front ends
-        ┌────────────▼───────────────┐
-        │  Config.ps1   Store.ps1    │   projects, definitions, values,
-        │  Secrets.ps1  Errors.ps1   │   locking, atomic writes
-        └────────────┬───────────────┘
-        ┌────────────▼───────────────┐
-        │      Providers.ps1         │   the crypto seam
-        └────────────┬───────────────┘
-        ┌────────────▼───────────────┐
-        │  Process.ps1  Platform.ps1 │   the only OS-aware code
-        └────────────────────────────┘
+   cred (CLI)                Import-Module Cred          cred-py (CLI)
+   bin/cred.ps1              src/Cred/Public/*.ps1       python/cred.py
+        |                            |                          |
+        +--------------+-------------+                          |
+                       |                            python/cred_store.py
+        +--------------v-------------+                          |
+        |  Config.ps1   Store.ps1    |   projects, values,      |
+        |  Secrets.ps1  Errors.ps1   |   locking, atomic writes |
+        +--------------+-------------+                          |
+        +--------------v-------------+                          |
+        |      Providers.ps1         |   the crypto seam        |
+        +--------------+-------------+                          |
+        +--------------v-------------+                          |
+        |  Process.ps1  Platform.ps1 |   the only OS-aware code |
+        +----------------------------+                          |
+                       |                                        |
+                       +------- the files are the contract -----+
 ```
 
-Three rules hold the design together:
+Four rules hold the design together:
 
 1. **The CLI contains no behaviour.** `bin/cred.ps1` parses argv, calls exactly
    one exported function, prints, and picks an exit code. The PowerShell API and
@@ -28,7 +30,10 @@ Three rules hold the design together:
 2. **All crypto is behind the provider contract.** Nothing above
    `Providers.ps1` knows what encryption is. Swapping backends is one file.
 3. **All OS knowledge lives in `Platform.ps1` and `Process.ps1`.** Nothing else
-   asks what operating system it is on. This is what makes the port cheap.
+   asks what operating system it is on.
+4. **The formats are the contract, not the code.** The Python implementation
+   shares no code with the PowerShell one; they agree because they agree about
+   the files. See "Two implementations, one format".
 
 ## Why age
 
@@ -138,10 +143,11 @@ and a timeout that produces an actionable error rather than a hang). Reads take
 no lock at all, because every write is an atomic replace: a reader either sees
 the old store or the new one, never a partial one.
 
-The write path is: encrypt in memory → **decrypt it again and check** → write to
-a temp file in the same directory → flush to physical disk → `File.Replace`.
-The read-back check matters: if you have somehow produced a store you cannot
-open, the old one is still on disk and still good, and you get told why.
+The write path is: encrypt in memory → write the ciphertext to a temp file in
+the same directory → flush to physical disk → **decrypt that file and check** →
+`File.Replace`. Verifying the staged file rather than the in-memory bytes proves
+that what is about to become the store is readable. Until the replace the old
+store is untouched, so a failure here costs nothing and tells you why.
 
 Two subtleties that cost real debugging and are worth not rediscovering:
 
@@ -197,49 +203,105 @@ cannot be reliably scrubbed from memory. Values stay `SecureString` where the
 API permits and byte buffers are zeroed after use, but that is a ceiling. A
 PowerShell-hosted tool claiming more would be lying.
 
-## The Linux port
+## Two implementations, one format
 
-Most of it is already done: PowerShell 7 runs natively on Linux and macOS, so
-`bin/cred` (a POSIX `sh` shim) plus the module *is* a working `cred` on any
-Unix today. `Platform.ps1` already resolves `$XDG_CONFIG_HOME/cred` and applies
-`chmod 600`; `age` is the same binary everywhere.
+There are two `cred` front ends and they are peers, not a tool and a wrapper:
 
-The remaining question is whether you want a `cred` that does not require
-PowerShell at all. That is a small job rather than a rewrite, because the
-formats are the contract:
+    bin/cred, bin/cred.cmd   ->  src/Cred/          PowerShell 5.1 / 7
+    bin/cred-py              ->  python/cred.py     Python 3.8+
 
-- `.creds/config.json` is plain JSON — `jq` reads it.
-- `.creds/store.age` is a standard age file — `age -d -i ~/.config/cred/identity.txt`
-  decrypts it. The plaintext is the small JSON object documented above.
-- The project registry is plain JSON.
-- Nothing is Windows-specific in any file that gets committed.
+Neither shells out to the other. They interoperate because the *files* are the
+contract, and nothing else is:
 
-So a POSIX `cred` is roughly:
+- `.creds/config.json` — plain JSON
+- `.creds/store.age` — a standard age file whose plaintext is the small object
+  documented above
+- `<CRED_HOME>/projects.json` — plain JSON
+- `.creds/.lock` — an exclusive lock, taken the same way by both
 
-```sh
-cred_get() {                       # cred get <project>/<key>
-  root=$(cred_project_root "${1%%/*}")
-  age -d -i "${CRED_IDENTITY_FILE:-$HOME/.config/cred/identity.txt}" \
-      "$root/.creds/store.age" | jq -r --arg k "${1#*/}" '.values[$k].secret'
-}
-```
+`tests/Interop.Tests.ps1` drives both against a single store and asserts
+byte-exact round trips in each direction, identical exit codes, identical
+default environment-variable names, and that neither loses the other's writes.
+That test is what stops the two drifting.
 
-...plus `exec` (`env $(...) "$@"`), `list` (`jq` over `config.json`), and `add`
-(`jq` to build the new plaintext, pipe through `age -a -R`, write via a temp file
-and `mv`). Call it 200 lines of `sh`, with `jq` and `age` as the only
-dependencies. Completions for bash/zsh/fish are then ordinary shell work.
+Deliberate asymmetries, because pretending they are identical would be worse
+than saying so:
 
-What such a port must not skip, because these are where correctness lives and
-not where it looks like it lives:
+| | PowerShell | Python |
+| --- | --- | --- |
+| Providers | `age`, `gpg` | `age` only — it refuses a `gpg` project by name, with the reason |
+| Keystore | wraps and unwraps | reads a wrapped key, does not create one |
+| PSCredential | native objects, import and export | not applicable |
 
-- the exclusive lock around read-modify-write (`flock` on `.creds/.lock`);
-- the atomic replace (`mv` within the same filesystem, after `sync`);
-- the decrypt-before-replace read-back check;
-- keeping values off argv (`age` reads stdin; `jq --arg` reads argv, so build
-  the plaintext with `jq --rawfile` or a here-doc on stdin instead).
+Which to use is a question about the machine, not the project. Windows always
+has PowerShell; most Linux images already have Python and would need a ~100 MB
+pwsh install otherwise. Either way the repository is unchanged.
 
-If you want to keep exactly one implementation, don't port: install PowerShell 7
-and use the `sh` shim. The module already runs there unmodified.
+This also settles what used to be "the Linux port". PowerShell 7 runs natively
+on Linux and macOS, so `bin/cred` plus the module already works there — but it
+needs pwsh installed. `bin/cred-py` removes that requirement. A third
+implementation in `sh` would need nothing new from this codebase either: `jq`
+over `config.json`, `age -d -i` over the store, `flock` on `.creds/.lock`, and
+`mv` within the same filesystem for the atomic replace.
+
+What any further implementation must not skip, because this is where
+correctness lives and not where it looks like it lives:
+
+- the exclusive lock around read-modify-write, and **not** deleting the lock
+  file on release;
+- the atomic replace, after an fsync;
+- staging the ciphertext and decrypting *that file* before it becomes the store;
+- keeping values off argv entirely.
+
+## The OS keystore
+
+By default the age key is a file, protected by its ACL (or mode 600). That is
+the floor, not the ceiling: anything running as you can read it, and so can
+anyone who takes the disk.
+
+`cred key protect` wraps it with DPAPI, bound to the current Windows account.
+The mechanism is worth understanding because it is the reason the store stays
+portable:
+
+- Only the **key** is OS-bound. The **store** is untouched and stays plain age,
+  so it still travels with the code and still opens on Linux. Encrypting the
+  store with DPAPI would destroy the entire premise, which is why that was
+  rejected as a provider in the first place.
+- The unwrapped key never becomes a file. It is unwrapped into memory and piped
+  to age on stdin (`-i -`), which forces the *ciphertext* to be the file
+  argument instead. That is free, because ciphertext on disk is exactly what the
+  store already is.
+- That constraint is also why `Write-CredStoreValues` stages the new ciphertext
+  beside the store and verifies by decrypting the staged file. It gives the
+  wrapped path a real path to point at, and it happens to be the stronger check
+  anyway: it proves the bytes that are about to become the store are readable,
+  not merely that a byte array in memory was.
+
+Wrapping is detected by file content, not by filename, so renaming a key cannot
+misrepresent it. The Python implementation unwraps DPAPI blobs through `ctypes`,
+so a wrapped key is not a lock-in.
+
+The trade is stated at the point of use and again here: a DPAPI-wrapped key does
+not survive a new machine, a reinstall, or a changed account. `cred key protect`
+takes `--backup` and warns when you do not use it.
+
+## The PSCredential boundary
+
+`Import-Cred` and `Export-Cred` exist for migration and for tools that still
+want the old shape. They are not part of everyday use and are documented as
+such.
+
+The subtlety worth recording: both `Export-Clixml` and `ConvertFrom-SecureString`
+are DPAPI-protected on Windows and open **only** for the account that wrote
+them. Any bulk import therefore has to run as that user, on that machine, before
+anything moves. `Export-Cred` refuses to run off Windows without `-Force`,
+because there `Export-Clixml` silently writes the secret in plain text.
+
+`Import-Cred` decodes `ConvertFrom-SecureString` hex through `ProtectedData`
+directly rather than `ConvertTo-SecureString`, for the same reason `Get-CredAcl`
+avoids `Get-Acl`: `Microsoft.PowerShell.Security` does not autoload on every 5.1
+host, and a migration tool that fails on the one machine holding the credentials
+is worthless.
 
 ## Directory map
 
@@ -261,11 +323,17 @@ src/Cred/
     Config.ps1    project discovery, registry, config read/write
     Store.ps1     locking, decrypt/encrypt of the value set
   Public/         one file per area; every function has help and examples
+python/
+  cred.py         Python CLI: argv, output, exit codes. No behaviour.
+  cred_store.py   the store as a library: formats, locking, age, DPAPI unwrap
 tests/
   Unit.Tests.ps1         pure functions, file plumbing, provider contract
   Integration.Tests.ps1  real age, three access paths, encoding
   Failure.Tests.ps1      every documented failure mode and its advice
   Concurrency.Tests.ps1  multi-process races against the real lock
   Cli.Tests.ps1          the CLI as a process: argv, exit codes, leak hygiene
+  Keystore.Tests.ps1     wrapping the key, and that it leaves no key on disk
+  Migration.Tests.ps1    the PSCredential import/export boundary
+  Interop.Tests.ps1      PowerShell and Python against one store
   Invoke-Tests.ps1       runs everything under both editions
 ```

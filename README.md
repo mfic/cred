@@ -166,6 +166,11 @@ $key  = Get-Cred acme-api/stripe -AsSecureString
 | `cred recipients add <key>` | Grant access and re-encrypt |
 | `cred recipients rm <key>` | Revoke access and re-encrypt |
 | `cred keygen` | Create your key; `--show` prints the public half |
+| `cred key` | Where your key is and how it is protected |
+| `cred key protect` | Wrap the key with the OS keystore (DPAPI) |
+| `cred key unprotect` | Unwrap it, before moving machine or account |
+| `cred import <path>` | Bring existing PSCredential files into a store |
+| `cred export <folder>` | Write credentials back out as PSCredential files |
 | `cred project list` | Registered projects on this machine |
 | `cred providers` | Encryption backends and their status |
 | `cred doctor` | Check everything and say how to fix what is broken |
@@ -227,6 +232,72 @@ Full reasoning, and what a Linux port actually requires, in
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
+
+## Two implementations
+
+`cred` exists twice, as peers rather than as a tool and a wrapper:
+
+| | Runtime | Use it when |
+| --- | --- | --- |
+| `bin/cred`, `bin/cred.cmd` | PowerShell 5.1 or 7 | Windows, or anywhere pwsh is installed. This one has the PowerShell API, the `gpg` provider, and the keystore commands. |
+| `bin/cred-py` | Python 3.8+ | Linux or macOS without PowerShell, or a container where Python is already there. |
+
+They read and write the same files, so you can use either on any given machine
+and the other will not notice. A test suite drives both against one store to
+keep that true -- including byte-exact round trips in both directions, matching
+exit codes, and the same default environment-variable names.
+
+The Python one implements the `age` provider only, and can *read* a
+keystore-wrapped key but not create one. Everything else is the same surface.
+
+```bash
+cred-py get acme-api/stripe          # same store, same answer
+cred-py exec acme-api -- ./deploy.sh
+```
+
+## Protecting the key itself
+
+By default your age key is a file whose only protection is its permissions.
+On Windows you can wrap it with DPAPI, which binds it to your account on that
+machine:
+
+```powershell
+cred key protect --backup D:\safege-key.txt
+```
+
+After that the file on disk contains no key material — cred unwraps it in
+memory and pipes it to age, so the plaintext key is never a file again. Back it
+up first: a wrapped key does not survive a new machine, a reinstall, or a
+changed account. Before you move, run `cred key unprotect`.
+
+This deliberately does **not** touch the store. The store stays OS-independent,
+so it still travels with the code and still opens on Linux.
+
+## Migrating from PSCredential files
+
+If your credentials currently live as `Export-Clixml` files:
+
+```powershell
+cred import D:\old\creds --dry-run     # see what it would do
+cred import D:\old\creds --desc "migrated"
+```
+
+Filenames become credential names (`db.cred.xml` → `db`). A `PSCredential`
+brings its username along; a bare `SecureString` lands as a plain secret.
+
+Do this on the Windows account that created those files — `Export-Clixml` is
+DPAPI-protected and will not open anywhere else.
+
+In PowerShell, one object is enough in either direction:
+
+```powershell
+Set-Cred acme-api/db -Credential (Import-Clixml old-db.xml)   # in
+$cred = Get-CredCredential acme-api/db                         # out
+```
+
+`cred export <folder>` writes the files back out if something still needs them.
+It warns you, because that puts secrets on disk — it is a migration tool, not a
+way to work.
 
 ## Using it with Claude Code
 
@@ -299,7 +370,7 @@ What it does not:
 ## Requirements
 
 - Windows PowerShell 5.1 or PowerShell 7+ (both are supported and both are
-  tested on every change)
+  tested on every change), **or** Python 3.8+ for `bin/cred-py`
 - [age](https://age-encrypted.org) 1.2+ — `winget install FiloSottile.age`,
   `brew install age`, `apt install age`
 - Optional: GnuPG, if you would rather use the `gpg` provider
@@ -329,5 +400,7 @@ Make the PATH change permanent:
 ```
 
 The suite covers pure functions, a real age round trip, all three access paths,
-every documented failure mode, multi-process concurrency, and leak hygiene
-(transcripts, process arguments, error text, files on disk).
+every documented failure mode, multi-process concurrency, leak hygiene
+(transcripts, process arguments, error text, files on disk), the OS keystore,
+the PSCredential migration boundary, and interoperability between the
+PowerShell and Python implementations.

@@ -1,0 +1,21 @@
+#!/usr/bin/env sh
+# cred-py -- the Python implementation of cred.
+#
+# A peer of bin/cred, not a wrapper: it reads and writes the same age-encrypted
+# stores. Use whichever runtime a given machine already has.
+set -e
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if command -v python3 >/dev/null 2>&1; then
+    py=python3
+elif command -v python >/dev/null 2>&1; then
+    py=python
+else
+    echo "cred: Python 3.8+ was not found." >&2
+    echo "" >&2
+    echo "Next:" >&2
+    echo "  Install Python, or use the PowerShell implementation: cred" >&2
+    exit 5
+fi
+
+exec "$py" "$script_dir/../python/cred.py" "$@"

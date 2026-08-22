@@ -75,7 +75,136 @@ function Get-CredAgeIdentityPath {
         if ([System.IO.Path]::IsPathRooted($p)) { return $p }
         return (Join-Path (Get-CredHomeDirectory) $p)
     }
-    return (Join-Path (Get-CredHomeDirectory) 'identity.txt')
+    # A keystore-wrapped key wins over a plaintext one, so that `cred key
+    # protect` takes effect without anyone having to reconfigure anything.
+    $credHome = Get-CredHomeDirectory
+    $wrapped  = Join-Path $credHome $script:CredWrappedIdentityName
+    if (Test-Path -LiteralPath $wrapped -PathType Leaf) { return $wrapped }
+    return (Join-Path $credHome 'identity.txt')
+}
+
+$script:CredWrappedIdentityName = 'identity.wrapped.json'
+$script:CredIdentityFormat      = 'cred-identity'
+
+function Test-CredIdentityIsWrapped {
+    <#
+        .SYNOPSIS
+        Is this identity file wrapped by an OS keystore rather than plaintext?
+        Detected by content, not by filename, so renaming a key cannot lie.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        $head = (Get-CredFileText -Path $Path).TrimStart()
+        if (-not $head.StartsWith('{')) { return $false }
+        $o = ConvertFrom-CredJson $head
+        return ($o -and $o.format -eq $script:CredIdentityFormat)
+    }
+    catch { return $false }
+}
+
+function Get-CredIdentityText {
+    <#
+        .SYNOPSIS
+        The age identity as text, unwrapping the OS keystore if needed.
+
+        The plaintext form exists only as a return value in memory. Callers hand
+        it to age over stdin and never write it anywhere.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-CredIdentityIsWrapped -Path $Path)) {
+        return (Get-CredFileText -Path $Path)
+    }
+
+    $meta = ConvertFrom-CredJson (Get-CredFileText -Path $Path)
+    if ($meta.protection -ne (Get-CredKeystoreName)) {
+        throw (New-CredErrorRecord -Code 'NoIdentity' -Target $Path `
+            -Message "'$Path' is wrapped with '$($meta.protection)', which this machine cannot open." `
+            -Next @("Open it on the machine and account that wrapped it, then: cred key unprotect",
+                    "Or restore an unwrapped backup of the key."))
+    }
+    $blob  = [Convert]::FromBase64String([string]$meta.data)
+    $plain = Unprotect-CredSecretBytes -Bytes $blob
+    try   { return [System.Text.Encoding]::UTF8.GetString($plain) }
+    finally { [array]::Clear($plain, 0, $plain.Length) }
+}
+
+function New-CredWrappedIdentityJson {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][string]$IdentityText)
+
+    $bytes = $null
+    try {
+        $bytes   = [System.Text.Encoding]::UTF8.GetBytes($IdentityText)
+        $wrapped = Protect-CredSecretBytes -Bytes $bytes
+        return (ConvertTo-CredJson ([ordered]@{
+            format     = $script:CredIdentityFormat
+            version    = 1
+            protection = (Get-CredKeystoreName)
+            note       = 'Wrapped by the OS keystore. Only the account that wrapped it can open it. Keep a separate backup of the unwrapped key.'
+            data       = [Convert]::ToBase64String($wrapped)
+        }))
+    }
+    finally { if ($bytes) { [array]::Clear($bytes, 0, $bytes.Length) } }
+}
+
+function Invoke-CredAge {
+    <#
+        .SYNOPSIS
+        Run age with an identity, choosing how to hand the key over.
+
+        A plaintext key file is passed by path. A keystore-wrapped key is
+        unwrapped in memory and piped to age's stdin (-i -), which forces the
+        ciphertext to be named as a file argument -- fine, because ciphertext on
+        disk is exactly what the store already is. Either way the unwrapped key
+        never exists as a file.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$IdentityPath,
+        [Parameter(Mandatory)][string[]]$BaseArguments,
+        [byte[]]$CipherBytes,
+        [string]$CipherPath
+    )
+
+    $age = Resolve-CredExecutable -Name 'age' -OverridePath $env:CRED_AGE_PATH
+
+    if (-not (Test-CredIdentityIsWrapped -Path $IdentityPath)) {
+        return Invoke-CredProcess -FilePath $age `
+                                  -ArgumentList ($BaseArguments + @('-i', $IdentityPath)) `
+                                  -InputBytes $CipherBytes
+    }
+
+    $identityText  = Get-CredIdentityText -Path $IdentityPath
+    $identityBytes = $null
+    $staged        = $null
+    try {
+        $identityBytes = [System.Text.Encoding]::UTF8.GetBytes($identityText)
+
+        # stdin now carries the key, so the ciphertext has to be a path.
+        $path = $CipherPath
+        if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            $staged = Join-Path ([System.IO.Path]::GetTempPath()) "cred-ct-$([guid]::NewGuid().ToString('N')).age"
+            [System.IO.File]::WriteAllBytes($staged, $CipherBytes)   # ciphertext only
+            $path = $staged
+        }
+        return Invoke-CredProcess -FilePath $age `
+                                  -ArgumentList ($BaseArguments + @('-i', '-', $path)) `
+                                  -InputBytes $identityBytes
+    }
+    finally {
+        if ($identityBytes) { [array]::Clear($identityBytes, 0, $identityBytes.Length) }
+        if ($staged -and (Test-Path -LiteralPath $staged)) {
+            Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 $script:CredAgeProvider = [pscustomobject]@{
@@ -137,7 +266,16 @@ $script:CredAgeProvider = [pscustomobject]@{
                         "Or point at an existing key: `$env:CRED_IDENTITY_FILE = 'C:\path\to\key.txt'"))
         }
         $keygen = Resolve-CredExecutable -Name 'age-keygen' -OverridePath $env:CRED_AGE_KEYGEN_PATH
-        $r = Invoke-CredProcess -FilePath $keygen -ArgumentList @('-y', $identity)
+        $r = if (Test-CredIdentityIsWrapped -Path $identity) {
+            # age-keygen -y reads the identity from stdin when given no INPUT.
+            $text  = Get-CredIdentityText -Path $identity
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+            try   { Invoke-CredProcess -FilePath $keygen -ArgumentList @('-y') -InputBytes $bytes }
+            finally { [array]::Clear($bytes, 0, $bytes.Length) }
+        }
+        else {
+            Invoke-CredProcess -FilePath $keygen -ArgumentList @('-y', $identity)
+        }
         if ($r.ExitCode -ne 0) {
             throw (New-CredErrorRecord -Code 'NoIdentity' `
                 -Message "Could not read the age identity at '$identity': $($r.StdErr)" `
@@ -173,7 +311,6 @@ $script:CredAgeProvider = [pscustomobject]@{
     Decrypt = {
         param([byte[]]$CipherBytes, [string]$CipherPath, [object]$Config)
 
-        $age      = Resolve-CredExecutable -Name 'age' -OverridePath $env:CRED_AGE_PATH
         $identity = Get-CredAgeIdentityPath -Config $Config
 
         if (-not (Test-Path -LiteralPath $identity -PathType Leaf)) {
@@ -184,9 +321,8 @@ $script:CredAgeProvider = [pscustomobject]@{
                         "To use a key from elsewhere: `$env:CRED_IDENTITY_FILE = '<path>'"))
         }
 
-        $res = Invoke-CredProcess -FilePath $age `
-                                  -ArgumentList @('--decrypt', '-i', $identity) `
-                                  -InputBytes $CipherBytes
+        $res = Invoke-CredAge -IdentityPath $identity -BaseArguments @('--decrypt') `
+                              -CipherBytes $CipherBytes -CipherPath $CipherPath
         if ($res.ExitCode -ne 0) {
             $detail = $res.StdErr
             $next = if ($detail -match 'no identity matched|incorrect|no identities') {
