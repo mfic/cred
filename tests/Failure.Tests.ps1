@@ -68,7 +68,7 @@ Describe 'Missing things' -Skip:(-not $script:HasAge) {
     }
 
     It 'an unknown project lists the known ones' {
-        $p = New-TestProject
+        $null = New-TestProject   # so the registry is not empty
         $msg = Get-Failure { Get-Cred -Name 'no-such-project/key' }
         $msg | Should -Match "No project named 'no-such-project'"
         $msg | Should -Match 'cred project list'

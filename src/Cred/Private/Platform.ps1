@@ -65,6 +65,42 @@ function New-CredDirectory {
     return $Path
 }
 
+function Get-CredAcl {
+    <#
+        .SYNOPSIS
+        Read a path's security descriptor without depending on Get-Acl.
+
+        Get-Acl lives in Microsoft.PowerShell.Security, which is not guaranteed
+        to autoload -- on a locked-down or sandboxed 5.1 host it simply is not
+        there. FileInfo.GetAccessControl() is the .NET Framework equivalent;
+        FileSystemAclExtensions is the .NET 5+ one. Try the cmdlet, then fall
+        back, so file permissions work on every host we support.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (Get-Command -Name Get-Acl -ErrorAction SilentlyContinue) {
+        return Get-Acl -LiteralPath $Path -ErrorAction Stop
+    }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    return $item.GetAccessControl()
+}
+
+function Set-CredAcl {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object]$Acl
+    )
+
+    if (Get-Command -Name Set-Acl -ErrorAction SilentlyContinue) {
+        Set-Acl -LiteralPath $Path -AclObject $Acl -ErrorAction Stop
+        return
+    }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    $item.SetAccessControl($Acl)
+}
+
 function Protect-CredPath {
     <#
         .SYNOPSIS
@@ -111,7 +147,7 @@ function Protect-CredPath {
                 [System.Security.AccessControl.PropagationFlags]::None,
                 [System.Security.AccessControl.AccessControlType]::Allow))
 
-            Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+            Set-CredAcl -Path $Path -Acl $acl
         }
         else {
             $mode = if ((Get-Item -LiteralPath $Path -Force).PSIsContainer) { '700' } else { '600' }
@@ -136,7 +172,12 @@ function Test-CredPathIsPrivate {
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
     try {
         if (Test-CredIsWindows) {
-            $acl = (Get-Item -LiteralPath $Path -Force).GetAccessControl()
+            # Via Get-CredAcl, which works whether or not Get-Acl exists.
+            # FileInfo.GetAccessControl() alone was removed in .NET 5+, so on
+            # PowerShell 7 it threw and -- before this was noticed -- the catch
+            # below turned that into a permanent, wrong "other principals can
+            # read your key" warning.
+            $acl = Get-CredAcl -Path $Path
             $me  = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
             foreach ($rule in $acl.Access) {
                 $sid = try { $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
@@ -150,9 +191,14 @@ function Test-CredPathIsPrivate {
             return $true
         }
         $mode = (& /bin/sh -c "ls -ld '$Path' | cut -c1-10") 2>$null
-        return ($mode -match '^.rwx?-{6}$' -or $mode -match '^.rw-------$' -or $mode -match '^drwx------$')
+        return ($mode -match '^.rw-------$' -or $mode -match '^drwx------$')
     }
-    catch { return $false }
+    catch {
+        # Report the reason rather than swallowing it: a check that quietly
+        # fails closed produces a warning the user cannot act on.
+        Write-Verbose "Could not read permissions for '$Path': $($_.Exception.Message)"
+        return $false
+    }
 }
 
 function ConvertTo-CredWindowsArgumentString {

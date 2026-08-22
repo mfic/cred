@@ -120,10 +120,16 @@ function Invoke-CredProcess {
         [void]$outTask.Wait(10000)
         [void]$errTask.Wait(10000)
 
+        # age appends a "report unexpected or unhelpful errors at ..." line to
+        # every failure. It is noise inside our own message, which already ends
+        # with concrete next steps.
+        $stderr = ([System.Text.Encoding]::UTF8.GetString($errBuf.ToArray()) -split "`r?`n" |
+                   Where-Object { $_ -notmatch 'report unexpected or unhelpful errors' }) -join ' '
+
         return [pscustomobject]@{
             ExitCode = $proc.ExitCode
             StdOut   = $outBuf.ToArray()
-            StdErr   = [System.Text.Encoding]::UTF8.GetString($errBuf.ToArray()).Trim()
+            StdErr   = $stderr.Trim()
         }
     }
     finally {

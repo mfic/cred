@@ -135,6 +135,26 @@ Describe 'Lifecycle' -Skip:(-not $script:HasAge) {
     }
 }
 
+Describe 'Key file permissions' -Skip:(-not $script:HasAge) {
+
+    It 'creates the identity readable only by its owner, and says so' {
+        # Regression test: this check used FileInfo.GetAccessControl(), which
+        # does not exist on .NET 5+, so on PowerShell 7 it threw, was caught,
+        # and reported a permanently wrong warning.
+        $m = Get-Module Cred
+        $private = & $m { param($p) Test-CredPathIsPrivate -Path $p } $script:Identity.Path
+        $private | Should -BeTrue
+
+        $rows = Test-CredHealth
+        ($rows | Where-Object Check -eq 'identity permissions').Status | Should -Be 'Ok'
+    }
+
+    It 'reports a Fail if the key ever ends up inside a repository' {
+        $rows = Test-CredHealth
+        ($rows | Where-Object Check -eq 'identity location') | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'Console encoding' -Skip:(-not $script:HasAge) {
 
     It 'works with a UTF-8 console, where .NET would otherwise inject a BOM into stdin' {
