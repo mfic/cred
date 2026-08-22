@@ -1,0 +1,15 @@
+* text=auto
+
+# PowerShell is happy with either, but keep Windows-native line endings for the
+# files people will actually edit on this platform.
+*.ps1   text eol=crlf
+*.psd1  text eol=crlf
+*.psm1  text eol=crlf
+*.cmd   text eol=crlf
+
+# The POSIX shim must not gain carriage returns, or /usr/bin/env breaks.
+bin/cred text eol=lf
+
+# An age store is armored ASCII, but never let git rewrite a ciphertext file.
+*.age   -text
+*.asc   -text
