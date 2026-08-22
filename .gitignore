@@ -1,0 +1,8 @@
+# Pester output
+tests/results-*.xml
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+*.swp

@@ -1,0 +1,25 @@
+#!/usr/bin/env sh
+# cred -- launcher for bash/zsh/fish (Linux, macOS, and Git Bash on Windows).
+#
+# The Linux port path starts here: PowerShell 7 runs natively on Linux, so this
+# shim plus the module is already a working `cred` on any POSIX shell. See
+# ARCHITECTURE.md for what a dependency-free shell reimplementation would need.
+set -e
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if command -v pwsh >/dev/null 2>&1; then
+    pwsh_bin=pwsh
+elif [ -x "/c/Program Files/PowerShell/7/pwsh.exe" ]; then
+    pwsh_bin="/c/Program Files/PowerShell/7/pwsh.exe"
+elif [ -x "/mnt/c/Program Files/PowerShell/7/pwsh.exe" ]; then
+    pwsh_bin="/mnt/c/Program Files/PowerShell/7/pwsh.exe"
+else
+    echo "cred: PowerShell 7 (pwsh) was not found." >&2
+    echo "" >&2
+    echo "Next:" >&2
+    echo "  Install it: https://aka.ms/powershell   (apt/dnf/brew all package it as 'powershell')" >&2
+    exit 5
+fi
+
+exec "$pwsh_bin" -NoLogo -NoProfile -File "$script_dir/cred.ps1" "$@"
