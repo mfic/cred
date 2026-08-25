@@ -2,7 +2,7 @@
 """
 cred -- command-line front end, in Python.
 
-A peer of bin/cred.ps1, not a wrapper around it. Both read and write the same
+A peer of bin/cred-ps.ps1, not a wrapper around it. Both read and write the same
 age-encrypted stores, so you can use whichever is convenient on a given machine
 and they will not notice each other. See ARCHITECTURE.md.
 

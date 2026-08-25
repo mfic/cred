@@ -2,7 +2,7 @@
 REM cred-ps -- the PowerShell implementation. The default `cred` is Python.
 REM Prefers PowerShell 7; falls back to Windows PowerShell 5.1.
 setlocal
-set "CRED_SCRIPT=%~dp0cred.ps1"
+set "CRED_SCRIPT=%~dp0cred-ps.ps1"
 where pwsh.exe >nul 2>&1
 if %ERRORLEVEL%==0 (
     pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%CRED_SCRIPT%" %*

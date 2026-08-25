@@ -58,7 +58,7 @@ function New-CredDirectory {
 
     if (-not (Test-Path -LiteralPath $Path)) {
         if ($PSCmdlet.ShouldProcess($Path, 'Create directory')) {
-            $null = New-Item -ItemType Directory -Path $Path -Force
+            $null = New-Item -ItemType Directory -Path $Path -Force -Confirm:$false
         }
     }
     Protect-CredPath -Path $Path

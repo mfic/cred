@@ -30,6 +30,15 @@ function Remove-Cred {
 
     if (-not $PSCmdlet.ShouldProcess("$($ctx.Name)/$key", 'Remove credential')) { return }
 
+    # The user has answered the only question worth asking. Passing -Confirm to
+    # a cmdlet also sets $ConfirmPreference = 'Low' for everything it calls, and
+    # preference variables are inherited all the way down -- so without this
+    # line, one confirmed `Remove-Cred` goes on to ask separately about writing
+    # config.json, about deleting its own backup file, and about scrubbing a
+    # local variable. Reset it once our own gate has been passed. Every public
+    # function here does the same.
+    $ConfirmPreference = 'None'
+
     $state = @{ Removed = $false }
     Update-CredStoreValues -Project $ctx -Mutate {
         param($values, $project)

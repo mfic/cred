@@ -149,6 +149,44 @@ function Write-Table {
     [Console]::Out.Write($out.TrimEnd() + [Environment]::NewLine)
 }
 
+function Confirm-CredCliAction {
+    <#
+        Asks the one question a destructive command needs, and returns $true to
+        proceed.
+
+        Why the CLI prompts instead of letting the module's -Confirm do it:
+        passing -Confirm to a cmdlet sets $ConfirmPreference = 'Low' for the
+        whole call stack underneath it, so every SupportsShouldProcess cmdlet
+        the module touches on the way -- writing config.json, deleting its own
+        backup and temp files, scrubbing a variable -- stops and asks too. One
+        `cred rm` became five prompts. The module functions are therefore always
+        called with -Confirm:$false and the decision is made here.
+
+        $RequireTty makes a non-interactive run an error rather than a silent
+        yes, matching python/cred.py.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Question,
+        [switch]$Yes,
+        [switch]$RequireTty
+    )
+
+    if ($Yes) { return $true }
+
+    if ([Console]::IsInputRedirected) {
+        if ($RequireTty) {
+            throw (UsageError 'Refusing to act without confirmation.' 'Pass --yes to run non-interactively.')
+        }
+        return $true
+    }
+
+    [Console]::Out.Write("$Question [y/N] ")
+    [Console]::Out.Flush()
+    $answer = [Console]::In.ReadLine()
+    if ($null -eq $answer) { return $false }
+    return ($answer.Trim().ToLowerInvariant() -in @('y', 'yes'))
+}
+
 $script:CredCliVersion = (Get-Module Cred).Version.ToString()
 
 $script:Usage = @'
@@ -375,9 +413,13 @@ function Invoke-CredCli {
             $o = $p.Options
             if ($p.Positional.Count -lt 1) { throw (UsageError 'cred rm <project>/<key>') }
 
-            $call = @{ Name = $p.Positional[0]; Confirm = -not [bool](Get-Opt $o 'yes') }
+            $call = @{ Name = $p.Positional[0]; Confirm = $false }
             if (Get-Opt $o 'path')            { $call.Path = Get-Opt $o 'path' }
             if (Get-Opt $o 'keep-definition') { $call.KeepDefinition = $true }
+
+            $ok = Confirm-CredCliAction -Question "Remove $($p.Positional[0])?" `
+                                        -Yes:([bool](Get-Opt $o 'yes')) -RequireTty
+            if (-not $ok) { Write-Line 'Cancelled.'; return 0 }
 
             $r = Remove-Cred @call
             if ($r) { Write-Line "Removed $($r.Project)/$($r.Key)" }
@@ -423,7 +465,11 @@ function Invoke-CredCli {
                     Write-Line "Added $($r.Added.Count) recipient(s) to $($r.Project); store re-encrypted for $($r.Recipients.Count)."
                 }
                 else {
-                    $call.Confirm = -not [bool](Get-Opt $p.Options 'yes')
+                    $call.Confirm = $false
+                    $ok = Confirm-CredCliAction -Question "Revoke $($keys.Count) recipient(s) and re-encrypt the store?" `
+                                                -Yes:([bool](Get-Opt $p.Options 'yes')) -RequireTty
+                    if (-not $ok) { Write-Line 'Cancelled.'; return 0 }
+
                     $r = Remove-CredRecipient @call
                     if ($r) { Write-Line "Removed $($r.Removed.Count) recipient(s) from $($r.Project)." }
                 }
@@ -574,10 +620,16 @@ function Invoke-CredCli {
             $o = $p.Options
             if ($p.Positional.Count -lt 1) { throw (UsageError 'cred export <folder> [--only <a,b>]') }
 
-            $call = @{ Path = $p.Positional[0]; Confirm = -not [bool](Get-Opt $o 'yes') }
+            $call = @{ Path = $p.Positional[0]; Confirm = $false }
             if (Get-Opt $o 'project') { $call.Project = Get-Opt $o 'project' }
             if (Get-Opt $o 'only')    { $call.Only = (Get-Opt $o 'only') -split ',' }
             if (Get-Opt $o 'force')   { $call.Force = $true }
+
+            # Export is not destructive to the store, so a redirected stdin is
+            # a yes here -- python/cred.py makes the same call.
+            $ok = Confirm-CredCliAction -Question "Write credential files into '$($p.Positional[0])'?" `
+                                        -Yes:([bool](Get-Opt $o 'yes'))
+            if (-not $ok) { Write-Line 'Cancelled.'; return 0 }
 
             $rows = @(Export-Cred @call)
             Write-Table -Rows $rows -Property @('Key', 'UserName', 'File')

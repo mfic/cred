@@ -68,6 +68,7 @@ function Protect-CredIdentity {
 
     $target = Join-Path (Split-Path -Parent $Path) $script:CredWrappedIdentityName
     if (-not $PSCmdlet.ShouldProcess($Path, "Wrap with $(Get-CredKeystoreName)")) { return }
+    $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
 
     Set-CredFileText -Path $target -Text (New-CredWrappedIdentityJson -IdentityText $text)
     Protect-CredPath -Path $target
@@ -75,13 +76,13 @@ function Protect-CredIdentity {
     # Prove the wrapped copy opens before removing the original.
     $check = Get-CredIdentityText -Path $target
     if ($check.Trim() -ne $text.Trim()) {
-        Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $target -Force -Confirm:$false -ErrorAction SilentlyContinue
         throw (New-CredErrorRecord -Code 'NoIdentity' `
             -Message 'The wrapped key did not read back identically, so nothing was changed.' `
             -Next "Your original key at '$Path' is untouched. Please report this.")
     }
 
-    if ($Path -ne $target) { Remove-Item -LiteralPath $Path -Force }
+    if ($Path -ne $target) { Remove-Item -LiteralPath $Path -Force -Confirm:$false }
 
     return [pscustomobject]@{
         Path       = $target
@@ -114,13 +115,14 @@ function Unprotect-CredIdentity {
         return [pscustomobject]@{ Path = $Path; Protection = 'none'; Changed = $false }
     }
     if (-not $PSCmdlet.ShouldProcess($Path, 'Unwrap to a plaintext key file')) { return }
+    $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
 
     $text   = Get-CredIdentityText -Path $Path
     $target = Join-Path (Split-Path -Parent $Path) 'identity.txt'
 
     Set-CredFileText -Path $target -Text $text
     Protect-CredPath -Path $target
-    Remove-Item -LiteralPath $Path -Force
+    Remove-Item -LiteralPath $Path -Force -Confirm:$false
 
     Write-Warning "'$target' is now a plaintext key, protected only by file permissions."
     return [pscustomobject]@{ Path = $target; Protection = 'none'; Changed = $true }

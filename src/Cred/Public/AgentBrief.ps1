@@ -120,6 +120,7 @@ function Update-CredAgentBrief {
     }
 
     if ($PSCmdlet.ShouldProcess($File, 'Update cred block')) {
+        $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
         Set-CredFileText -Path $File -Text $updated
     }
     return [pscustomobject]@{ Project = $ctx.Name; File = $File; Credentials = @(Get-CredList -Project $ctx.Name -Path $ctx.Root).Count }

@@ -70,6 +70,7 @@ function Import-Cred {
             }
 
             if ($PSCmdlet.ShouldProcess("$($ctx.Name)/$Key", "Import from $Source")) {
+                $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
                 $splat = @{ Name = $Key; Secret = $Secret; Path = $ctx.Root; Confirm = $false }
                 if ($User)        { $splat.User = $User }
                 if ($Description) { $splat.Description = $Description }
@@ -222,6 +223,7 @@ function Export-Cred {
         $file  = Join-Path $Path "$key.cred.xml"
 
         if ($PSCmdlet.ShouldProcess($file, "Export $($ctx.Name)/$key")) {
+            $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
             $cred = [System.Management.Automation.PSCredential]::new(
                         $user, (ConvertTo-CredSecureString -PlainText ([string]$entry['secret'])))
             $cred | Export-Clixml -LiteralPath $file

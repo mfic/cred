@@ -17,7 +17,7 @@
 
 Four rules hold the design together:
 
-1. **A CLI contains no behaviour.** `python/cred.py` and `bin/cred.ps1` both
+1. **A CLI contains no behaviour.** `python/cred.py` and `bin/cred-ps.ps1` both
    parse argv, call one function, print, and pick an exit code. Nothing else.
 2. **All crypto is behind the provider contract.** Nothing above
    `Providers.ps1` knows what encryption is. Swapping backends is one file.
@@ -206,8 +206,15 @@ PowerShell-hosted tool claiming more would be lying.
 the whole command surface:
 
     bin/cred, bin/cred.cmd      ->  python/cred.py      Python 3.8+     [default]
-    bin/cred-ps, cred-ps.cmd    ->  bin/cred.ps1        PowerShell 5.1 / 7
+    bin/cred-ps, cred-ps.cmd    ->  bin/cred-ps.ps1     PowerShell 5.1 / 7
     Import-Module Cred          ->  src/Cred/           PowerShell library
+
+The PowerShell CLI script is called `cred-ps.ps1` and not `cred.ps1` for a
+reason worth writing down: when PowerShell resolves a bare `cred` on PATH it
+prefers a `.ps1` in that directory over the `.cmd`. A file named `bin/cred.ps1`
+therefore quietly made `cred` mean *the PowerShell edition* in every PowerShell
+session, which is the opposite of what the launcher table says. With the `-ps`
+suffix, `cred` is Python in every shell and `cred-ps` is the opt-in.
 
 Python is the default for three reasons, in order of weight: it keeps the CLI to
 *one* implementation people have to reason about; it is the runtime most likely
@@ -255,6 +262,31 @@ because this is where correctness lives and not where it looks like it lives:
 - the atomic replace, after an fsync;
 - staging the ciphertext and decrypting *that file* before it becomes the store;
 - keeping values off argv entirely.
+
+## Confirmation belongs to one question
+
+Destructive commands ask once, about the thing the user named. Getting that
+right in PowerShell takes two deliberate rules, because `-Confirm` is not a
+per-cmdlet flag the way it reads:
+
+1. **The CLI never passes `-Confirm:$true`.** Passing `-Confirm` to a cmdlet
+   sets `$ConfirmPreference = 'Low'` for its entire call stack, and preference
+   variables are inherited downward. Every `SupportsShouldProcess` cmdlet the
+   module touches on the way then stops and asks too, so a single `cred rm`
+   became five prompts -- about the credential, about writing `config.json`,
+   about deleting the module's own backup files, about scrubbing a variable.
+   Answering `[A]` Yes-to-All does not help, because that state is per cmdlet
+   invocation. So `bin/cred-ps.ps1` prompts for itself in
+   `Confirm-CredCliAction` and always calls the module with `-Confirm:$false`,
+   which also makes its wording and its non-interactive behaviour match
+   `python/cred.py`.
+2. **Every public function resets `$ConfirmPreference = 'None'` once its own
+   `ShouldProcess` gate has been passed.** That keeps the same thing from
+   happening to someone typing `Remove-Cred foo -Confirm` at a prompt, and it
+   holds for code added later. The private helpers additionally pass
+   `-Confirm:$false` on the `Remove-Item` and `Remove-Variable` calls that clean
+   up temp files, backups and plaintext -- housekeeping in a `finally` block is
+   never a question for a user.
 
 ## The OS keystore
 
@@ -323,7 +355,7 @@ bin/
   cred.cmd        the CLI (Windows launcher -> python/cred.py)
   cred-ps         PowerShell implementation, POSIX sh launcher
   cred-ps.cmd     PowerShell implementation, Windows launcher
-  cred.ps1        PowerShell CLI: argv parsing, output, exit codes
+  cred-ps.ps1     PowerShell CLI: argv parsing, output, exit codes
 src/Cred/
   Cred.psd1       manifest; explicit exports, both editions
   Cred.psm1       loader; private files in dependency order, then public

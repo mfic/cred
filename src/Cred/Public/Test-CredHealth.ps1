@@ -129,6 +129,7 @@ function Repair-CredHealth {
 
     $credHome = Get-CredHomeDirectory
     if ($PSCmdlet.ShouldProcess($credHome, 'Restrict permissions')) {
+        $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
         $null = New-CredDirectory -Path $credHome
         foreach ($f in @(Get-ChildItem -LiteralPath $credHome -File -ErrorAction SilentlyContinue)) {
             Protect-CredPath -Path $f.FullName

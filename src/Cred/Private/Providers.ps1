@@ -202,7 +202,7 @@ function Invoke-CredAge {
     finally {
         if ($identityBytes) { [array]::Clear($identityBytes, 0, $identityBytes.Length) }
         if ($staged -and (Test-Path -LiteralPath $staged)) {
-            Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $staged -Force -Confirm:$false -ErrorAction SilentlyContinue
         }
     }
 }

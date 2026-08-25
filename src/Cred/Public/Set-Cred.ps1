@@ -72,6 +72,7 @@ function Set-Cred {
     $plain  = Resolve-CredSecretInput -Value $Secret -Prompt $prompt -FromStdin:$FromStdin -AllowEmpty:$AllowEmpty
 
     if (-not $PSCmdlet.ShouldProcess("$($ctx.Name)/$key", 'Set credential')) { return }
+    $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
 
     # Scriptblocks run in a child scope; a hashtable is the simplest way to
     # get a value back out of one.
