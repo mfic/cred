@@ -62,6 +62,7 @@ function Add-CredRecipient {
     }
 
     if (-not $PSCmdlet.ShouldProcess($ctx.Name, "Add recipient(s) and re-encrypt")) { return }
+    $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
 
     $state = @{ Added = @() }
     Update-CredStoreValues -Project $ctx -Mutate {
@@ -103,6 +104,7 @@ function Remove-CredRecipient {
 
     $ctx = Resolve-CredProject -Name $Project -Path $Path
     if (-not $PSCmdlet.ShouldProcess($ctx.Name, "Remove recipient(s) and re-encrypt")) { return }
+    $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
 
     $state = @{ Removed = @() }
     Update-CredStoreValues -Project $ctx -Mutate {

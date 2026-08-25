@@ -38,7 +38,7 @@ function Move-CredTempIntoPlace {
     }
     finally {
         if (Test-Path -LiteralPath $backup -PathType Leaf) {
-            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $backup -Force -Confirm:$false -ErrorAction SilentlyContinue
         }
     }
 }
@@ -68,7 +68,7 @@ function Set-CredFileText {
 
     $dir = Split-Path -Parent $Path
     if ($dir -and -not (Test-Path -LiteralPath $dir)) {
-        $null = New-Item -ItemType Directory -Path $dir -Force
+        $null = New-Item -ItemType Directory -Path $dir -Force -Confirm:$false
     }
     $tmp = "$Path.tmp$PID-$([guid]::NewGuid().ToString('N').Substring(0,8))"
     try {
@@ -86,7 +86,7 @@ function Set-CredFileText {
     }
     finally {
         if (Test-Path -LiteralPath $tmp -PathType Leaf) {
-            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $tmp -Force -Confirm:$false -ErrorAction SilentlyContinue
         }
     }
 }
@@ -109,7 +109,7 @@ function New-CredStagedFile {
 
     $dir = Split-Path -Parent $Path
     if ($dir -and -not (Test-Path -LiteralPath $dir)) {
-        $null = New-Item -ItemType Directory -Path $dir -Force
+        $null = New-Item -ItemType Directory -Path $dir -Force -Confirm:$false
     }
     $tmp = "$Path.tmp$PID-$([guid]::NewGuid().ToString('N').Substring(0,8))"
     $fs = [System.IO.FileStream]::new($tmp, [System.IO.FileMode]::CreateNew,
@@ -141,7 +141,7 @@ function Set-CredFileBytes {
     try   { Move-CredTempIntoPlace -Temp $tmp -Destination $Path }
     finally {
         if (Test-Path -LiteralPath $tmp -PathType Leaf) {
-            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $tmp -Force -Confirm:$false -ErrorAction SilentlyContinue
         }
     }
 }

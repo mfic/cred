@@ -243,3 +243,44 @@ Describe 'Provider contract' {
         (Get-CredProvider -Name 'test-xor').Available | Should -BeTrue
     }
 }
+
+Describe 'Confirmation does not leak downstream' {
+    # The bug this guards against: passing -Confirm to a cmdlet sets
+    # $ConfirmPreference = 'Low' for its whole call stack, so one confirmed
+    # `cred rm` went on to ask separately about writing config.json, deleting
+    # its own backup file and scrubbing a variable. Every public function that
+    # gates on ShouldProcess must reset the preference once its own question
+    # has been answered. See ARCHITECTURE.md, 'Confirmation belongs to one
+    # question'.
+    It 'resets $ConfirmPreference in every function that supports ShouldProcess' {
+        $offenders = @()
+        foreach ($file in Get-ChildItem (Join-Path $script:RepoRoot 'src\Cred\Public') -Filter '*.ps1') {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            $functions = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+            foreach ($fn in $functions) {
+                $body = $fn.Extent.Text
+                if ($body -notmatch 'SupportsShouldProcess') { continue }
+                if ($body -notmatch '\$ConfirmPreference\s*=') { $offenders += $fn.Name }
+            }
+        }
+        $offenders | Should -BeNullOrEmpty
+    }
+
+    It 'leaves no backup or temp file for a prompt to have blocked on' {
+        # The prompts the user saw were about .bak and .tmp files the atomic
+        # write creates and then deletes. If one survives a write, the cleanup
+        # did not run -- which is exactly what a swallowed prompt looks like.
+        $path = Join-Path ([System.IO.Path]::GetTempPath()) "credconf-$([guid]::NewGuid().ToString('N')).json"
+        try {
+            InModule { param($p) Set-CredFileText -Path $p -Text 'first' -Confirm:$false } -Argument @($path)
+            InModule { param($p) Set-CredFileText -Path $p -Text 'second' -Confirm:$false } -Argument @($path)
+            Get-Content -LiteralPath $path -Raw | Should -BeExactly 'second'
+            # Nothing beside it. -Filter is not used here: on Windows a
+            # trailing '.*' pattern also matches the bare name.
+            $leaf = Split-Path -Leaf $path
+            @(Get-ChildItem -Path (Split-Path -Parent $path) -File |
+                Where-Object { $_.Name -like "$leaf.*" }) | Should -BeNullOrEmpty
+        }
+        finally { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+    }
+}

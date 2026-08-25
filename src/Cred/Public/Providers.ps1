@@ -64,6 +64,7 @@ function Register-CredProvider {
             -Next "See the help for Register-CredProvider for the full contract.")
     }
     if ($PSCmdlet.ShouldProcess($Provider.Name, 'Register credential provider')) {
+        $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
         Register-CredProviderInternal -Provider $Provider
     }
 }

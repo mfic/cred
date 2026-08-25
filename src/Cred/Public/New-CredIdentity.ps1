@@ -60,13 +60,15 @@ function New-CredIdentity {
     if ($exists -and $Force) {
         $backup = "$Path.$([datetime]::UtcNow.ToString('yyyyMMddHHmmss')).bak"
         if ($PSCmdlet.ShouldProcess($Path, "Back up to '$backup' and replace")) {
-            Move-Item -LiteralPath $Path -Destination $backup -Force
+            $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
+            Move-Item -LiteralPath $Path -Destination $backup -Force -Confirm:$false
             Protect-CredPath -Path $backup
             Write-Warning "Existing key moved to '$backup'. Stores encrypted only to the old key can no longer be read with the new one."
         }
     }
 
     if (-not $PSCmdlet.ShouldProcess($Path, 'Create key')) { return }
+    $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
 
     $result = & $providerObj.NewIdentity $Path
     return [pscustomobject]@{

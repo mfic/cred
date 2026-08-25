@@ -30,7 +30,7 @@ function Lock-CredStore {
     )
 
     if (-not (Test-Path -LiteralPath $CredsDir)) {
-        $null = New-Item -ItemType Directory -Path $CredsDir -Force
+        $null = New-Item -ItemType Directory -Path $CredsDir -Force -Confirm:$false
     }
     $lockPath = Join-Path $CredsDir $script:CredLockFileName
     $deadline = [datetime]::UtcNow.AddMilliseconds($TimeoutMs)
@@ -102,7 +102,7 @@ function Read-CredStoreValues {
     finally {
         if ($plain) { [array]::Clear($plain, 0, $plain.Length) }
         if (Get-Variable -Name json -Scope 0 -ErrorAction SilentlyContinue) {
-            Remove-Variable -Name json -Scope 0 -ErrorAction SilentlyContinue
+            Remove-Variable -Name json -Scope 0 -Confirm:$false -ErrorAction SilentlyContinue
         }
     }
 }
@@ -183,7 +183,7 @@ function Write-CredStoreValues {
         }
         finally {
             if (Test-Path -LiteralPath $staged -PathType Leaf) {
-                Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $staged -Force -Confirm:$false -ErrorAction SilentlyContinue
             }
         }
     }

@@ -96,6 +96,7 @@ function Unregister-CredProject {
             -Next "See what is: cred project list")
     }
     if ($PSCmdlet.ShouldProcess($Name, 'Unregister project')) {
+        $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
         $reg.projects.Remove($Name)
         Write-CredRegistry -Registry $reg
     }

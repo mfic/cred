@@ -22,4 +22,4 @@ else
     exit 5
 fi
 
-exec "$pwsh_bin" -NoLogo -NoProfile -File "$script_dir/cred.ps1" "$@"
+exec "$pwsh_bin" -NoLogo -NoProfile -File "$script_dir/cred-ps.ps1" "$@"

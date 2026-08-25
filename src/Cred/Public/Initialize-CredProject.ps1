@@ -57,6 +57,7 @@ function Initialize-CredProject {
     }
 
     if (-not $PSCmdlet.ShouldProcess($root, 'Initialize credential store')) { return }
+    $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
 
     # Recipients: whoever was named, else this machine's own public key.
     $recipients = @($Recipient)
@@ -71,7 +72,7 @@ function Initialize-CredProject {
         $recipients = @(& $providerObj.GetRecipient $null)
     }
 
-    $null = New-Item -ItemType Directory -Path $credsDir -Force
+    $null = New-Item -ItemType Directory -Path $credsDir -Force -Confirm:$false
 
     $config = [ordered]@{
         version     = $script:CredConfigVersion

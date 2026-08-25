@@ -12,7 +12,7 @@ BeforeDiscovery {
 
 BeforeAll {
     $script:RepoRoot = Split-Path -Parent $PSScriptRoot
-    $script:Cli      = Join-Path $script:RepoRoot 'bin\cred.ps1'
+    $script:Cli      = Join-Path $script:RepoRoot 'bin\cred-ps.ps1'
     $script:Pwsh     = (Get-Process -Id $PID).Path
 
     $script:Sandbox = Join-Path ([System.IO.Path]::GetTempPath()) "credcli-$([guid]::NewGuid().ToString('N'))"
@@ -163,6 +163,17 @@ Describe 'CLI round trip' -Skip:(-not $script:HasAge) {
         $r = Invoke-Cred -CliArgs @('rm', 'cliproj/temp', '--yes')
         $r.ExitCode | Should -Be 0
         (Invoke-Cred -CliArgs @('get', 'cliproj/temp')).ExitCode | Should -Be 3
+    }
+
+    It 'refuses to remove without --yes when stdin is not a terminal' {
+        # The CLI asks its own question rather than handing -Confirm to the
+        # module, so a piped or scripted run has to be an explicit --yes and
+        # never a prompt nobody can answer.
+        $null = Invoke-Cred -CliArgs @('add', 'cliproj/keepme', '--stdin') -StdIn 'x'
+        $r = Invoke-Cred -CliArgs @('rm', 'cliproj/keepme')
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match 'confirmation'
+        (Invoke-Cred -CliArgs @('get', 'cliproj/keepme')).StdOut.Trim() | Should -BeExactly 'x'
     }
 
     It 'reports the health of the setup' {

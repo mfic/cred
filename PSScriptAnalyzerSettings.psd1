@@ -9,7 +9,7 @@
 
         # cred writes secrets to [Console]::Out deliberately: the PowerShell
         # pipeline is captured by Start-Transcript and a secret must not be.
-        # See Write-CredSecret in bin/cred.ps1 and Secrets.ps1.
+        # See Write-CredSecret in bin/cred-ps.ps1 and Secrets.ps1.
         'PSAvoidUsingWriteHost'
 
         # Systematically wrong for this codebase. Most "unused" parameters are
