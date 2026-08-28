@@ -106,10 +106,9 @@ Describe 'Python CLI basics' -Skip:(-not $script:HasPython) {
 }
 
 Describe 'Python CLI providers' -Skip:(-not ($script:HasAge -and $script:HasPython)) {
-    It 'knows about both backends, not just age' {
+    It 'lists the registered backends' {
         $r = Invoke-Cred -CliArgs @('providers')
         $r.StdOut | Should -Match 'age'
-        $r.StdOut | Should -Match 'gpg'
     }
 
     It 'reports an unknown provider by name and lists the real ones' {
@@ -280,5 +279,17 @@ Describe 'Python CLI leak hygiene' -Skip:(-not ($script:HasAge -and $script:HasP
         $r = Invoke-Cred -CliArgs @('get', 'pyproj/absent')
         $r.StdOut | Should -BeNullOrEmpty
         $r.StdErr | Should -Match 'no credential named'
+    }
+}
+
+
+Describe 'Python units' -Skip:(-not $script:HasPython) {
+    # cred.py is the default implementation everywhere, so its pure functions
+    # are checked directly rather than only through the process. tests/pyunit.py
+    # holds the cases; this runs them under the one runner.
+    It 'passes tests/pyunit.py' {
+        $harness = Join-Path $PSScriptRoot 'pyunit.py'
+        $out = & $script:PyExe $harness 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($out -join [Environment]::NewLine)
     }
 }

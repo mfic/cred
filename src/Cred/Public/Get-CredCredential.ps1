@@ -31,18 +31,23 @@ function Get-CredCredential {
         [string]$Path
     )
 
-    $ref = Split-CredReference -Reference $Name
-    if ($ref.Project -and -not $Project) { $Project = $ref.Project }
-    $key = $ref.Key
+    $entry = Get-CredEntryView -Name $Name -Project $Project -Path $Path
+    $key   = $entry.Key
+    $ctx   = $entry.Context
+    $view  = $entry.View
 
-    $ctx    = Resolve-CredProject -Name $Project -Path $Path
-    $values = Read-CredStoreValues -Project $ctx
-    $entry  = Get-CredEntryOrThrow -Project $ctx -Key $key -Values $values
+    # This used to ignore the kind entirely, so asking for a PSCredential over
+    # a binary file credential handed back a base64 blob as the password and
+    # looked like it had worked. Same rule as Get-Cred: text is returnable,
+    # binary is not a string.
+    if ($view.IsBinary) {
+        throw (New-CredBinaryContentError -ProjectName $ctx.Name -Key $key -Noun 'a password')
+    }
 
     if (-not $UserName) {
-        $UserName = if ($entry.Contains('user') -and $entry['user']) { [string]$entry['user'] } else { $key }
+        $UserName = if ($view.Fields.Contains('user') -and $view.Fields['user']) { [string]$view.Fields['user'] } else { $key }
     }
-    $secure = ConvertTo-CredSecureString -PlainText ([string]$entry['secret'])
+    $secure = ConvertTo-CredSecureString -PlainText ([string]$view.Fields['secret'])
 
     return [System.Management.Automation.PSCredential]::new($UserName, $secure)
 }

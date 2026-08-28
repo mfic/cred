@@ -53,7 +53,48 @@ function New-CredErrorRecord {
     return $record
 }
 
+function New-CredBinaryContentError {
+    <#
+        .SYNOPSIS
+        The refusal every text-shaped read path gives for a binary credential.
+
+        .DESCRIPTION
+        Three callers ask the same question -- Get-Cred, Get-CredCredential and
+        the CLI's 'get' -- and the answer has to name the same two escape
+        hatches every time, or the user learns one of them and not the other.
+        Noun is what the caller was about to pretend the bytes were.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Management.Automation.ErrorRecord])]
+    param(
+        [Parameter(Mandatory)][string]$ProjectName,
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)][string]$Noun
+    )
+
+    return (New-CredErrorRecord -Code 'Usage' -Category InvalidArgument -Target $Key `
+        -Message "'$ProjectName/$Key' holds binary content, which is not $Noun." `
+        -Next @("Write it to a file: Export-CredFile $ProjectName/$Key -OutFile <path>",
+                "Or from the CLI:    cred get $ProjectName/$Key --out <path>"))
+}
+
 function Get-CredExitCode {
+    <#
+        .SYNOPSIS
+        The process exit code for an error this module threw.
+
+        .DESCRIPTION
+        Exported because the CLI needs it. It used to be private, so
+        bin/cred-ps.ps1 carried its own copy of the table and the module's
+        version had no caller outside the tests. One table, one place to
+        change it.
+
+        Anything unrecognised is 1, so a new code cannot silently become a
+        success.
+
+        .EXAMPLE
+        try { Get-Cred acme-api/db } catch { exit (Get-CredExitCode -ErrorRecord $_) }
+    #>
     [CmdletBinding()]
     [OutputType([int])]
     param([object]$ErrorRecord)

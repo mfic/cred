@@ -169,6 +169,10 @@ def commit_staged(tmp: Path, dest: Path) -> None:
 
 
 def write_text_atomic(path: Path, text: str) -> None:
+    """Not for secrets: the staged file is world-readable until it is committed.
+
+    Anything that is itself a secret goes through write_private_text.
+    """
     write_bytes_atomic(path, text.encode("utf-8"))
 
 
@@ -298,7 +302,14 @@ def _run(argv: List[str], stdin_bytes: Optional[bytes] = None,
     return proc.returncode, out, text
 
 
-def age_encrypt(plain: bytes, recipients: List[str]) -> bytes:
+def age_encrypt(plain: bytes, recipients: List[str],
+                config: Optional[Dict[str, Any]] = None) -> bytes:
+    """Encrypt to `recipients`. Takes the seam's signature directly.
+
+    There used to be a one-line _age_encrypt_adapter here purely because this
+    function's shape did not match the contract's, which is the tell: the
+    mismatch belonged at the seam, not beside it.
+    """
     if not recipients:
         raise CredError(
             "This project has no recipients, so nothing could decrypt the store.",
@@ -399,8 +410,7 @@ def age_new_identity(path: Path) -> Tuple[Path, str]:
     text = out.decode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
     restrict_path(path.parent)
-    write_text_atomic(path, text)
-    restrict_path(path)
+    write_private_text(path, text)
     pub = next((l.strip() for l in text.splitlines() if l.startswith("age1")), "")
     if not pub:
         for line in text.splitlines():
@@ -431,80 +441,6 @@ def _age_test():
     return True, "age and age-keygen found."
 
 
-def _gpg_test():
-    if not find_executable("gpg", "CRED_GPG_PATH"):
-        return False, "'gpg' was not found on PATH."
-    return True, "gpg found."
-
-
-def _require_gpg() -> str:
-    gpg = find_executable("gpg", "CRED_GPG_PATH")
-    if not gpg:
-        raise CredError("The 'gpg' encryption backend was not found.",
-                        ["Install GnuPG:  winget install GnuPG.GnuPG   "
-                         "(or: apt install gnupg)"],
-                        EXIT_BACKEND)
-    return gpg
-
-
-def _gpg_encrypt(plain: bytes, recipients: List[str],
-                 config: Optional[Dict[str, Any]] = None) -> bytes:
-    if not recipients:
-        raise CredError(
-            "This project has no recipients, so nothing could decrypt the store.",
-            ["Add one with: cred recipients add <fingerprint>"])
-    gpg = _require_gpg()
-    argv = [gpg, "--batch", "--yes", "--armor", "--trust-model", "always",
-            "--encrypt"]
-    for r in recipients:
-        argv += ["-r", str(r)]
-    rc, out, err = _run(argv, plain)
-    if rc != 0:
-        raise CredError(f"gpg could not encrypt the store: {err}",
-                        ["Check every recipient is in your keyring: gpg --list-keys",
-                         "List configured recipients with: cred recipients"])
-    return out
-
-
-def _gpg_decrypt(cipher: bytes, cipher_path=None,
-                 config: Optional[Dict[str, Any]] = None) -> bytes:
-    gpg = _require_gpg()
-    rc, out, err = _run([gpg, "--batch", "--yes", "--quiet", "--decrypt"], cipher)
-    if rc != 0:
-        raise CredError(
-            f"gpg could not decrypt the store: {err}",
-            ["Confirm you hold a secret key for one of the recipients: "
-             "gpg --list-secret-keys",
-             "If the passphrase prompt was skipped, run gpg once interactively "
-             "to unlock the agent."],
-            EXIT_KEY)
-    return out
-
-
-def _gpg_recipient(config: Optional[Dict[str, Any]] = None) -> str:
-    gpg = _require_gpg()
-    rc, out, _ = _run([gpg, "--list-secret-keys", "--with-colons"])
-    for line in out.decode("utf-8", "replace").splitlines():
-        if line.startswith("fpr:"):
-            return line.split(":")[9]
-    raise CredError("No GnuPG secret key was found in your keyring.",
-                    ["Create one with: gpg --full-generate-key"], EXIT_KEY)
-
-
-def _gpg_new_identity(path):
-    raise CredError(
-        "The gpg provider uses your existing GnuPG keyring; it does not "
-        "create keys.",
-        ["Create a key with: gpg --full-generate-key",
-         "Then: cred recipients add <your-fingerprint-or-email>"],
-        EXIT_USAGE)
-
-
-def _age_encrypt_adapter(plain: bytes, recipients: List[str],
-                         config: Optional[Dict[str, Any]] = None) -> bytes:
-    return age_encrypt(plain, recipients)
-
-
 PROVIDERS: Dict[str, Dict[str, Any]] = {
     "age": {
         "name": "age",
@@ -515,22 +451,54 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
         "test": _age_test,
         "new_identity": age_new_identity,
         "recipient": age_recipient,
-        "encrypt": _age_encrypt_adapter,
+        # cred owns this key file, so it is cred's to locate and to wrap.
+        "identity_path": identity_path,
+        "supports_keystore": True,
+        "encrypt": age_encrypt,
         "decrypt": age_decrypt,
     },
-    "gpg": {
-        "name": "gpg",
-        "summary": "GnuPG public-key encryption against your existing keyring",
-        "store_file": "store.asc",
-        "install_hint": "Install GnuPG:  winget install GnuPG.GnuPG   "
-                        "(or: apt install gnupg)",
-        "test": _gpg_test,
-        "new_identity": _gpg_new_identity,
-        "recipient": _gpg_recipient,
-        "encrypt": _gpg_encrypt,
-        "decrypt": _gpg_decrypt,
-    },
 }
+
+
+def provider_for(config: Optional[Dict[str, Any]] = None,
+                 name: Optional[str] = None) -> Dict[str, Any]:
+    """The provider a project uses, defaulting to age outside a project."""
+    return get_provider(name or (config or {}).get("provider") or "age")
+
+
+def provider_identity_path(config: Optional[Dict[str, Any]] = None,
+                           name: Optional[str] = None) -> Path:
+    """Where this project's key lives, according to its provider.
+
+    The peer of Get-CredIdentityPath. Commands used to call identity_path()
+    directly, which is age's answer regardless of what the project actually
+    uses.
+    """
+    prov = provider_for(config, name)
+    path = prov["identity_path"](config)
+    if path is None:
+        raise CredError(
+            f"The '{prov['name']}' provider does not keep its key in a file "
+            "cred manages.",
+            ["Its keys live somewhere cred does not own; manage them where "
+             "they live.",
+             "Only providers with a cred-managed key file support 'cred key'."],
+            EXIT_KEY)
+    return path
+
+
+def assert_keystore_supported(config: Optional[Dict[str, Any]] = None,
+                              name: Optional[str] = None) -> Dict[str, Any]:
+    """Refuse a keystore operation the provider cannot honour."""
+    prov = provider_for(config, name)
+    if not prov.get("supports_keystore"):
+        raise CredError(
+            f"The '{prov['name']}' provider has no key for cred to wrap.",
+            ["It holds your private key somewhere with its own protection.",
+             "'cred key protect' applies to providers whose key is a file "
+             "cred manages, such as age."],
+            EXIT_USAGE)
+    return prov
 
 
 def get_provider(name: str) -> Dict[str, Any]:
@@ -680,8 +648,7 @@ def write_clixml_credential(path: Path, user: str, secret: str) -> None:
         '  </Obj>\r\n'
         '</Objs>'
     ).format(ns=_CLIXML_NS, user=escape(user), pw=text_to_dpapi_hex(secret))
-    write_text_atomic(path, xml)
-    restrict_path(path)
+    write_private_text(path, xml)
 
 # ------------------------------------------------------------------ config ---
 
@@ -770,11 +737,14 @@ def read_config(path: Path) -> Dict[str, Any]:
             f"(config version {cfg['version']}).",
             ["Update cred, then try again."], EXIT_CORRUPT)
 
-    get_provider(cfg.setdefault("provider", "age"))   # fail fast on a typo
+    prov = get_provider(cfg.setdefault("provider", "age"))   # fail fast on a typo
 
     cfg.setdefault("version", CONFIG_VERSION)
     cfg.setdefault("project", path.parent.parent.name)
-    cfg.setdefault("store", "store.age")
+    # From the provider, not hardcoded: a project with no 'store' key used to
+    # resolve to one filename here and another in PowerShell, so the two
+    # implementations opened different files for the same repository.
+    cfg.setdefault("store", prov["store_file"])
     cfg.setdefault("recipients", [])
     cfg.setdefault("credentials", {})
     return cfg
@@ -963,32 +933,287 @@ def update_store(project: Project, mutate) -> None:
         write_config(project)
 
 
-def default_env_names(key: str, kind: str) -> Dict[str, str]:
+def env_names(key: str, kind: str = "secret",
+              env: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    """The environment variable names a credential maps to.
+
+    The single home of the naming convention. It used to be written out five
+    times here and three times in the PowerShell peer, and the copies
+    disagreed: a userpass entry whose definition carried no `env` map became
+    KEY_PASSWORD here and a bare KEY there, so `cred exec` injected a
+    different variable name depending on which implementation you ran.
+
+    A file credential maps to nothing, by design.
+    """
+    if kind == "file":
+        return {}
     import re
     slug = re.sub(r"[^A-Za-z0-9]", "_", key).upper()
     if kind == "userpass":
-        return {"user": f"{slug}_USER", "secret": f"{slug}_PASSWORD"}
-    return {"secret": slug}
+        names = {"user": f"{slug}_USER", "secret": f"{slug}_PASSWORD"}
+    else:
+        names = {"secret": slug}
+    # An explicit mapping in config.json wins over the convention.
+    for field, value in (env or {}).items():
+        if field in ("user", "secret") and value:
+            names[field] = str(value)
+    return names
 
 
-def build_environment(project: Project, only=None, exclude=None,
-                      prefix: str = "") -> Dict[str, str]:
+
+def entry_kind(entry: Dict[str, Any], definition: Optional[Dict[str, Any]]) -> str:
+    """The type of a credential, trusting the store over the config.
+
+    `encoding` is only ever set by the file importer, so a store that has
+    outlived its config.json still reports the right kind.
+
+    The store only wins where it has something to say. `cred list` runs
+    without decrypting and therefore without an entry at all, so a declared
+    credential must still report its own type rather than defaulting to
+    'secret'.
+    """
+    if "encoding" in entry:
+        return "file"
+    if "user" in entry:
+        return "userpass"
+    declared = (definition or {}).get("type")
+    if declared in ("secret", "userpass", "file"):
+        return str(declared)
+    return "secret"
+
+
+def resolve_entry(key: str, entry: Dict[str, Any],
+                  definition: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Everything a caller needs to know about one credential, decided once.
+
+    The peer of Resolve-CredEntry in src/Cred/Private/Entry.ps1. Callers must
+    not re-derive any of this; a new credential type should be one edit here
+    rather than one at every command that touches a store.
+    """
+    kind = entry_kind(entry, definition)
+    # Only the value-bearing fields. Bookkeeping like `encoding` must never
+    # become a field, and must never become an environment variable.
+    fields = {f: str(entry[f]) for f in ("user", "secret") if f in entry}
+
+    is_binary = entry.get("encoding") == "base64"
+    filename = ""
+    if kind == "file":
+        filename = str((definition or {}).get("filename") or "")
+
+    names = env_names(key, kind, (definition or {}).get("env"))
+    env_vars = {names[f]: v for f, v in fields.items() if f in names}
+
+    # A file credential has no env mapping, so that column would be empty
+    # where the interesting fact -- which file it was -- fits neatly.
+    display = (f"file: {filename}" if kind == "file" and filename
+               else ", ".join(names.values()))
+
+    return {"key": key, "kind": kind, "entry": entry, "fields": fields,
+            "is_binary": is_binary, "filename": filename,
+            "env_names": names, "env_vars": env_vars, "display": display}
+
+
+def entry_bytes(view: Dict[str, Any], field: str = "secret",
+                project_name: Optional[str] = None) -> bytes:
+    """The exact bytes of a credential, whatever kind it is.
+
+    A file credential comes back as the bytes that were imported. Anything
+    else is the requested field as UTF-8, with no trailing newline.
+    """
+    if view["kind"] == "file":
+        return decode_file_content(view["entry"])
+    if field not in view["fields"]:
+        label = f"{project_name}/{view['key']}" if project_name else view["key"]
+        raise CredError(f"'{label}' has no '{field}' field.",
+                        [f"It has: {', '.join(view['fields'])}"], EXIT_NOT_FOUND)
+    return str(view["fields"][field]).encode("utf-8")
+
+
+# Every write re-encrypts the whole store, so a large file is not just its own
+# cost -- it is paid again on every unrelated `cred add`. Certificates and keys
+# are kilobytes; anything past this is a sign the store is the wrong home.
+MAX_FILE_BYTES = 1024 * 1024
+
+
+def encode_file_content(data: bytes) -> Tuple[str, Optional[str]]:
+    """(text-for-the-store, encoding) for a file's exact bytes.
+
+    Text stays text so the value is still greppable once decrypted and diffs
+    sensibly; anything that is not clean UTF-8 goes to base64. NUL forces
+    base64 too -- it decodes fine but is not text by any useful definition.
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = None
+    if text is None or "\x00" in text:
+        import base64
+        return base64.b64encode(data).decode("ascii"), "base64"
+    return text, None
+
+
+def decode_file_content(entry: Dict[str, Any]) -> bytes:
+    """The exact bytes that were imported. Inverse of encode_file_content."""
+    value = str(entry.get("secret", ""))
+    if entry.get("encoding") == "base64":
+        import base64
+        import binascii
+        try:
+            return base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise CredError(
+                "This credential's stored content is not valid base64.",
+                ["The store decrypted, so this is corruption inside it.",
+                 "Restore it from git: git checkout HEAD -- .creds/"],
+                EXIT_CORRUPT) from exc
+    return value.encode("utf-8")
+
+
+def write_private_file(path: Path, data: bytes) -> None:
+    """Write bytes to a new file only this user can read.
+
+    Permissions are applied to the staged file before it is put in place, so
+    there is no window in which the content exists world-readable.
+    """
+    tmp = stage_bytes(path, data)
+    try:
+        restrict_path(tmp)
+        commit_staged(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    # restrict_path is best effort by design. If it quietly failed on the staged
+    # file, this is the published file's second chance.
+    restrict_path(path)
+
+
+def write_private_text(path: Path, text: str) -> None:
+    """write_private_file for text. Peer of Write-CredPrivateFileText."""
+    write_private_file(path, text.encode("utf-8"))
+
+
+def entry_view(name: str, project_name: Optional[str] = None,
+               path: Optional[str] = None) -> Dict[str, Any]:
+    """A reference such as 'acme-api/db' resolved all the way to one entry.
+
+    Split the name, open the store, prove the credential exists, say what it
+    is. Every single-credential path wants exactly this, and the order matters:
+    entry_or_raise before resolve_entry, so a missing key gets the message with
+    the near-miss hint. Peer of Get-CredEntryView in Private/Store.ps1.
+
+    The decrypted values come back too, for a caller with more to ask.
+    """
+    proj_ref, key = split_reference(name)
+    project = resolve_project(project_name or proj_ref, path)
+    values = read_values(project)
+    entry = entry_or_raise(project, key, values)
+    defs = project.config.get("credentials") or {}
+    return {"key": key, "project": project, "values": values,
+            "view": resolve_entry(key, entry, defs.get(key))}
+
+
+def read_value(name: str, project_name: Optional[str] = None,
+               path: Optional[str] = None,
+               field: str = "secret") -> Dict[str, Any]:
+    """One credential's bytes, together with what it is.
+
+    For a caller that has to decide how to write a value out: a `file`
+    credential is written raw, everything else as text, and binary content must
+    not go to a terminal at all. One call, one decryption, so the CLI does not
+    have to resolve stores itself. Peer of Read-CredValue.
+    """
+    resolved = entry_view(name, project_name, path)
+    view = resolved["view"]
+    return {"project": resolved["project"].name,
+            "key": resolved["key"],
+            "kind": view["kind"],
+            "is_binary": bool(view["is_binary"]),
+            "bytes": entry_bytes(view, field, resolved["project"].name)}
+
+
+def read_import_file(spec: str, force: bool = False) -> bytes:
+    """The exact bytes of a file being imported as a credential.
+
+    Peer of Read-CredImportFile in Private/Entry.ps1. It lives here rather than
+    in the CLI because the size limit is a rule about the store, not about how
+    the CLI was invoked.
+    """
+    path = Path(spec).expanduser()
+    if not path.is_file():
+        raise CredError(
+            f"There is no file at '{path}'.",
+            ["Check the path. --file takes the file to import, not its content."],
+            EXIT_NOT_FOUND)
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise CredError(f"Could not read '{path}': {exc}",
+                        ["Check that you have permission to read it."],
+                        EXIT_GENERAL)
+    if len(data) > MAX_FILE_BYTES and not force:
+        raise CredError(
+            f"'{path.name}' is {len(data) // 1024} KiB; the limit is "
+            f"{MAX_FILE_BYTES // 1024} KiB.",
+            ["The whole store is re-encrypted on every write, so a large file "
+             "is paid for again on every unrelated 'cred add'.",
+             "Keys and certificates are kilobytes. If this really belongs "
+             "here: cred add ... --file <path> --force"],
+            EXIT_USAGE)
+    return data
+
+
+def export_credential_file(project, view: Dict[str, Any], spec: str,
+                           force: bool = False,
+                           field: str = "secret") -> Dict[str, Any]:
+    """`cred get --out` -- the only path that deliberately writes plaintext.
+
+    It exists because a private key is useless to openssl or nginx as a string
+    on stdout. Everything else in cred keeps plaintext off disk; the caller
+    says so out loud rather than doing it quietly, which is why this returns
+    what happened instead of printing it. Peer of Export-CredFile.
+    """
+    key = view["key"]
+    target = Path(spec).expanduser()
+    if target.is_dir():
+        target = target / (view["filename"] or key)
+    if target.exists() and not force:
+        raise CredError(
+            f"'{target}' already exists.",
+            ["Overwriting a key file is not something to do by accident.",
+             "Pass --force if that is what you mean."],
+            EXIT_USAGE)
+
+    data = entry_bytes(view, field, project.name)
+    write_private_file(target, data)
+    return {"file": target, "byte_count": len(data)}
+
+
+def environment_and_skipped(project: Project, only=None, exclude=None,
+                            prefix: str = "") -> Tuple[Dict[str, str], List[str]]:
+    """Variables to inject, and the file credentials deliberately left out.
+
+    Both come from one decryption; callers that want to tell the user what was
+    skipped should not pay for a second pass over the store.
+    """
     values = read_values(project)
     defs = project.config.get("credentials") or {}
     out: Dict[str, str] = {}
+    skipped: List[str] = []
     for key, entry in values.items():
         if only and key not in only:
             continue
         if exclude and key in exclude:
             continue
-        d = defs.get(key) or {}
-        env = d.get("env") or default_env_names(
-            key, "userpass" if "user" in entry else "secret")
-        for field, value in entry.items():
-            name = prefix + str(env.get(field) or
-                                default_env_names(key, "userpass")[field])
-            out[name] = str(value)
-    return out
+        view = resolve_entry(key, entry, defs.get(key))
+        # File credentials are deliberately not injected: the content is a PEM
+        # or a certificate, and `export KEY=-----BEGIN...` breaks the shell it
+        # is pasted into. `cred get --out` is the way to get one of these.
+        if view["kind"] == "file":
+            skipped.append(key)
+            continue
+        for name, value in view["env_vars"].items():
+            out[prefix + name] = str(value)
+    return out, sorted(skipped)
 
 
 def entry_or_raise(project: Project, key: Optional[str],

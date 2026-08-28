@@ -19,63 +19,90 @@ function Get-Cred {
         Invoke-RestMethod $url -Headers @{ Authorization = "Bearer $(Get-Cred acme-api/gh)" }
     #>
     [CmdletBinding()]
-    [OutputType([string], [System.Security.SecureString])]
+    [OutputType([string], [System.Security.SecureString], [byte[]])]
     param(
         [Parameter(Mandatory, Position = 0)][string]$Name,
         [ValidateSet('secret', 'user')][string]$Field = 'secret',
         [switch]$AsSecureString,
+        # Exact bytes rather than a [string]. This is how a file credential is
+        # read without a lossy trip through text, and it is what the CLI uses.
+        [switch]$AsBytes,
         [string]$Project,
         [string]$Path
     )
 
-    $ref = Split-CredReference -Reference $Name
-    $key = $ref.Key
-    if ($ref.Project -and -not $Project) { $Project = $ref.Project }
+    # One decryption, already resolved. A caller who needs the kind as well as
+    # the value calls Open-CredStore rather than passing a [ref] in here.
+    $entry = Get-CredEntryView -Name $Name -Project $Project -Path $Path
+    $key   = $entry.Key
+    $ctx   = $entry.Context
+    $view  = $entry.View
 
-    $ctx    = Resolve-CredProject -Name $Project -Path $Path
-    $values = Read-CredStoreValues -Project $ctx
-    $entry  = Get-CredEntryOrThrow -Project $ctx -Key $key -Values $values
+    # Exact bytes are the same question for every kind, so they are one call.
+    if ($AsBytes) { return (Get-CredEntryBytes -Projection $view -Field $Field -ProjectName $ctx.Name) }
 
-    if (-not $entry.Contains($Field)) {
-        $type = if ($ctx.Config.credentials.Contains($key)) { $ctx.Config.credentials[$key].type } else { 'secret' }
+    if ($view.Kind -eq 'file') {
+        # Binary has no faithful [string] form; handing back a mangled one
+        # would look like it worked.
+        if ($view.IsBinary) {
+            throw (New-CredBinaryContentError -ProjectName $ctx.Name -Key $key -Noun 'a string')
+        }
+        $text = [string]$view.Fields['secret']
+        if ($AsSecureString) { return (ConvertTo-CredSecureString -PlainText $text) }
+        return $text
+    }
+
+    if (-not $view.Fields.Contains($Field)) {
         throw (New-CredErrorRecord -Code 'NoCredential' -Category ObjectNotFound -Target $Field `
             -Message "'$($ctx.Name)/$key' has no '$Field' field." `
-            -Next @("It is a '$type' credential with: $(@($entry.Keys) -join ', ')",
+            -Next @("It is a '$($view.Kind)' credential with: $(@($view.Fields.Keys) -join ', ')",
                     "To give it a username: cred add $($ctx.Name)/$key --user <name>"))
     }
 
-    $value = [string]$entry[$Field]
+    $value = [string]$view.Fields[$Field]
     if ($AsSecureString) { return (ConvertTo-CredSecureString -PlainText $value) }
     return $value
 }
 
-function Get-CredNearestKey {
+function Read-CredValue {
     <#
         .SYNOPSIS
-        Cheap "did you mean" suggestion (Levenshtein, distance <= 2).
+        One credential's bytes, together with what it is.
+
+        .DESCRIPTION
+        For a caller that has to decide how to write a value out: the bytes are
+        the same question for every kind, but a `file` credential is written
+        raw and everything else is written as text, and binary content must not
+        be sent to a terminal at all.
+
+        This exists so the CLI can answer all of that with a single call.
+        `cred get` used to open the store itself and index .Entries, which put
+        store resolution and entry-kind policy inside a script that is supposed
+        to parse argv and print.
+
+        Still one decryption. Peer of read_value in cred_store.py.
+
+        .EXAMPLE
+        $v = Read-CredValue acme-api/ssl-key
+        if ($v.Kind -eq 'file') { [System.IO.File]::WriteAllBytes($p, $v.Bytes) }
     #>
     [CmdletBinding()]
-    [OutputType([string])]
-    param([string]$Key, [string[]]$Candidates)
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$Name,
+        [ValidateSet('secret', 'user')][string]$Field = 'secret',
+        [string]$Project,
+        [string]$Path
+    )
 
-    if (-not $Candidates -or [string]::IsNullOrEmpty($Key)) { return $null }
-    $best = $null; $bestScore = [int]::MaxValue
+    $entry = Get-CredEntryView -Name $Name -Project $Project -Path $Path
+    $view  = $entry.View
 
-    foreach ($c in $Candidates) {
-        $a = $Key.ToLowerInvariant(); $b = ([string]$c).ToLowerInvariant()
-        if ($b.Length -eq 0) { continue }
-        $prev = 0..$b.Length
-        for ($i = 1; $i -le $a.Length; $i++) {
-            $cur = @($i) + (1..$b.Length | ForEach-Object { 0 })
-            for ($j = 1; $j -le $b.Length; $j++) {
-                $cost = if ($a[$i - 1] -eq $b[$j - 1]) { 0 } else { 1 }
-                $cur[$j] = [Math]::Min([Math]::Min($cur[$j - 1] + 1, $prev[$j] + 1), $prev[$j - 1] + $cost)
-            }
-            $prev = $cur
-        }
-        $d = $prev[$b.Length]
-        if ($d -lt $bestScore) { $bestScore = $d; $best = $c }
+    return [pscustomobject]@{
+        Project  = $entry.Context.Name
+        Key      = $entry.Key
+        Kind     = $view.Kind
+        IsBinary = [bool]$view.IsBinary
+        Bytes    = (Get-CredEntryBytes -Projection $view -Field $Field -ProjectName $entry.Context.Name)
     }
-    if ($bestScore -le 2) { return $best }
-    return $null
 }
