@@ -35,14 +35,10 @@ function Export-CredFile {
         [string]$Path
     )
 
-    $ref = Split-CredReference -Reference $Name
-    $key = $ref.Key
-    if ($ref.Project -and -not $Project) { $Project = $ref.Project }
-
-    $store = Open-CredStore -Project $Project -Path $Path
-    $ctx   = $store.Context
-    $null  = Get-CredEntryOrThrow -Project $ctx -Key $key -Values $store.Values
-    $view  = $store.Entries[$key]
+    $entry = Get-CredEntryView -Name $Name -Project $Project -Path $Path
+    $key   = $entry.Key
+    $ctx   = $entry.Context
+    $view  = $entry.View
 
     $target = $OutFile
     if (Test-Path -LiteralPath $target -PathType Container) {

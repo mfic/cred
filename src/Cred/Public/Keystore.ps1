@@ -32,7 +32,8 @@ function Protect-CredIdentity {
         [string]$Backup,
         [switch]$Force,
         # Which backend's key. Only providers whose key is a file cred manages
-        # can be wrapped; gpg keeps its own keyring and is refused by name.
+        # can be wrapped; any other is refused by name rather than silently
+        # having age's key wrapped on its behalf.
         [string]$Provider = 'age'
     )
 
@@ -63,8 +64,7 @@ function Protect-CredIdentity {
             throw (New-CredErrorRecord -Code 'Usage' -Target $Backup `
                 -Message "'$Backup' already exists." -Next "Choose another path, or pass -Force.")
         }
-        Set-CredFileText -Path $Backup -Text $text
-        Protect-CredPath -Path $Backup
+        Write-CredPrivateFileText -Path $Backup -Text $text
         Write-Warning "Unwrapped key copied to '$Backup'. That file is the key -- store it somewhere safe and offline."
     }
     elseif (-not $Force) {
@@ -75,8 +75,7 @@ function Protect-CredIdentity {
     if (-not $PSCmdlet.ShouldProcess($Path, "Wrap with $(Get-CredKeystoreName)")) { return }
     $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
 
-    Set-CredFileText -Path $target -Text (New-CredWrappedIdentityJson -IdentityText $text)
-    Protect-CredPath -Path $target
+    Write-CredPrivateFileText -Path $target -Text (New-CredWrappedIdentityJson -IdentityText $text)
 
     # Prove the wrapped copy opens before removing the original.
     $check = Get-CredIdentityText -Path $target
@@ -126,8 +125,7 @@ function Unprotect-CredIdentity {
     $text   = Get-CredIdentityText -Path $Path
     $target = Join-Path (Split-Path -Parent $Path) 'identity.txt'
 
-    Set-CredFileText -Path $target -Text $text
-    Protect-CredPath -Path $target
+    Write-CredPrivateFileText -Path $target -Text $text
     Remove-Item -LiteralPath $Path -Force -Confirm:$false
 
     Write-Warning "'$target' is now a plaintext key, protected only by file permissions."

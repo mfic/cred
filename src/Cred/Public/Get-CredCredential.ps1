@@ -31,24 +31,17 @@ function Get-CredCredential {
         [string]$Path
     )
 
-    $ref = Split-CredReference -Reference $Name
-    if ($ref.Project -and -not $Project) { $Project = $ref.Project }
-    $key = $ref.Key
-
-    $store = Open-CredStore -Project $Project -Path $Path
-    $ctx   = $store.Context
-    $null  = Get-CredEntryOrThrow -Project $ctx -Key $key -Values $store.Values
-    $view  = $store.Entries[$key]
+    $entry = Get-CredEntryView -Name $Name -Project $Project -Path $Path
+    $key   = $entry.Key
+    $ctx   = $entry.Context
+    $view  = $entry.View
 
     # This used to ignore the kind entirely, so asking for a PSCredential over
     # a binary file credential handed back a base64 blob as the password and
     # looked like it had worked. Same rule as Get-Cred: text is returnable,
     # binary is not a string.
     if ($view.IsBinary) {
-        throw (New-CredErrorRecord -Code 'Usage' -Category InvalidArgument -Target $key `
-            -Message "'$($ctx.Name)/$key' holds binary content, which is not a password." `
-            -Next @("Write it to a file: Export-CredFile $($ctx.Name)/$key -OutFile <path>",
-                    "Or from the CLI:    cred get $($ctx.Name)/$key --out <path>"))
+        throw (New-CredBinaryContentError -ProjectName $ctx.Name -Key $key -Noun 'a password')
     }
 
     if (-not $UserName) {

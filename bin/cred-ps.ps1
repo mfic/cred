@@ -140,7 +140,7 @@ GETTING STARTED
 
 COMMANDS
   init [name]                      Create a store here
-      --provider <age|gpg>         Encryption backend (default: age)
+      --provider <name>            Encryption backend (default: age)
       --recipient <key>            Recipient(s) instead of your own key
       --force                      Overwrite an existing store
 
@@ -188,6 +188,7 @@ COMMANDS
   key protect                      Wrap it with the OS keystore (DPAPI)
       --backup <file>              Save the unwrapped key first (do this)
   key unprotect                    Unwrap it, before moving machine or account
+      --provider <name>            Which backend's key (default: age)
 
   import <path>                    Import PSCredential files into a store
       --name <key>                 Name for a single file
@@ -317,20 +318,12 @@ function Invoke-CredCli {
                 return 0
             }
 
-            $field = [string](Get-Opt $o 'field' 'secret')
-            if (Get-Opt $o 'field') { $call.Field = $field }
+            if (Get-Opt $o 'field') { $call.Field = Get-Opt $o 'field' }
 
-            # One decryption: the store view answers both "what kind is it" and
-            # "what are its bytes". This used to pass a [ref] into Get-Cred.
-            $ref   = Split-CredReference -Reference $p.Positional[0]
-            $open  = @{}
-            if ($call.Contains('Path')) { $open.Path = $call.Path }
-            $open.Project = if ($call.Contains('Project')) { $call.Project } else { $ref.Project }
-            $store = Open-CredStore @open
-            $view  = $store.Entries[$ref.Key]
-            $bytes = Get-Cred @call -AsBytes
+            # One call, one decryption: the bytes and what they are.
+            $v = Read-CredValue @call
 
-            if ($view -and $view.Kind -eq 'file') {
+            if ($v.Kind -eq 'file') {
                 # Exact bytes, and no trailing newline of ours: piping this to a
                 # file must produce the file that went in, byte for byte.
                 #
@@ -338,16 +331,16 @@ function Invoke-CredCli {
                 # python/cred.py does. Sniffing for a NUL byte instead meant a
                 # base64-stored file with no NUL was blocked by one
                 # implementation and printed by the other.
-                if ($view.IsBinary -and -not [Console]::IsOutputRedirected) {
+                if ($v.IsBinary -and -not [Console]::IsOutputRedirected) {
                     throw (UsageError "'$($p.Positional[0])' holds binary content. Writing it to a terminal would corrupt it. Write it to a file: cred get $($p.Positional[0]) --out <path>")
                 }
                 $stdout = [Console]::OpenStandardOutput()
-                $stdout.Write($bytes, 0, $bytes.Length)
+                $stdout.Write($v.Bytes, 0, $v.Bytes.Length)
                 $stdout.Flush()
                 return 0
             }
 
-            $value = [System.Text.UTF8Encoding]::new($false).GetString($bytes)
+            $value = [System.Text.UTF8Encoding]::new($false).GetString($v.Bytes)
             Write-CredSecret -Value $value -NoNewline:([bool](Get-Opt $o 'no-newline'))
             return 0
         }
@@ -424,15 +417,8 @@ function Invoke-CredCli {
             if (Get-Opt $o 'except') { $call.Exclude = (Get-Opt $o 'except') -split ',' }
             if (Get-Opt $o 'prefix') { $call.Prefix = Get-Opt $o 'prefix' }
 
-            # Open the store once and take both answers off it, rather than
-            # asking Get-CredEnvironment for the variables and a [ref] for the
-            # rest.
-            $open = @{}
-            if ($call.Contains('Project')) { $open.Project = $call.Project }
-            if ($call.Contains('Path'))    { $open.Path    = $call.Path }
-            $store = Open-CredStore @open
-            $projected = Get-CredStoreEnvironment -Store $store `
-                            -Only $call.Only -Exclude $call.Exclude -Prefix $call.Prefix
+            # One call for both answers, off one decryption.
+            $projected = Get-CredEnvironmentReport @call
             $table   = $projected.Variables
             $skipped = $projected.Skipped
             if ($skipped.Count -gt 0) {

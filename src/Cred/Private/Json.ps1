@@ -56,7 +56,9 @@ function Set-CredFileText {
         Write text atomically: temp file in the same directory, fsync, replace.
 
         Callers only ever pass ciphertext or non-secret config through here, so
-        the transient temp file never contains plaintext secrets.
+        the transient temp file never contains plaintext secrets. Anything that
+        *is* a secret goes through Write-CredPrivateFileText instead, which pays
+        for the permission work this one skips.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -144,6 +146,61 @@ function Set-CredFileBytes {
             Remove-Item -LiteralPath $tmp -Force -Confirm:$false -ErrorAction SilentlyContinue
         }
     }
+}
+
+function Write-CredPrivateFile {
+    <#
+        .SYNOPSIS
+        Atomic byte-exact write of secret material, to a file only this user
+        can read.
+
+        Set-CredFileBytes with the permission work done in the one order that
+        leaves no window:
+
+          1. Restrict the staged file, which nothing has published yet.
+          2. Restrict the destination if it already exists. Move-CredTempIntoPlace
+             lands on File.Replace there, and Replace keeps the *destination's*
+             ACL -- so tightening it after the swap would leave the new secret
+             sitting under the old file's permissions until we got to it.
+          3. Swap. The bytes become visible already restricted, either way.
+
+        Peer of write_private_file in cred_store.py.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes
+    )
+
+    $tmp = New-CredStagedFile -Path $Path -Bytes $Bytes
+    try {
+        Protect-CredPath -Path $tmp
+        if (Test-Path -LiteralPath $Path -PathType Leaf) { Protect-CredPath -Path $Path }
+        Move-CredTempIntoPlace -Temp $tmp -Destination $Path
+
+        # Protect-CredPath is best effort by design. If it quietly failed on the
+        # staged file, this is the published file's second chance.
+        Protect-CredPath -Path $Path
+    }
+    finally {
+        if (Test-Path -LiteralPath $tmp -PathType Leaf) {
+            Remove-Item -LiteralPath $tmp -Force -Confirm:$false -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Write-CredPrivateFileText {
+    <#
+        .SYNOPSIS
+        Write-CredPrivateFile for text. UTF-8, no BOM, same as Set-CredFileText.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text
+    )
+
+    Write-CredPrivateFile -Path $Path -Bytes $script:CredUtf8NoBom.GetBytes($Text)
 }
 
 function ConvertTo-CredHashtable {

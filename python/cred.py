@@ -37,7 +37,7 @@ GETTING STARTED
 
 COMMANDS
   init [name]                      Create a store here
-      --provider <age|gpg>         Encryption backend (default: age)
+      --provider <name>            Encryption backend (default: age)
       --recipient <key>            Recipient(s) instead of your own key
       --force                      Overwrite an existing store
 
@@ -77,6 +77,7 @@ COMMANDS
   key protect                      Wrap it with the OS keystore (DPAPI)
       --backup <file>              Save the unwrapped key first (do this)
   key unprotect                    Unwrap it, before moving machine or account
+      --provider <name>            Which backend's key (default: age)
 
   import <path>                    Import PSCredential files into a store
       --name <key>                 Name for a single file
@@ -245,7 +246,7 @@ def cmd_init(rest: List[str]) -> int:
                   if opts.get("recipient") else None)
     if not recipients:
         # Was `if provider_name == "age"`. A provider that keeps its own keys
-        # (gpg) returns no path and is simply skipped.
+        # returns no path and is simply skipped.
         if prov.get("supports_keystore") or prov["identity_path"](None):
             ident = cs.provider_identity_path(None, provider_name)
             if not ident.is_file():
@@ -277,32 +278,6 @@ def cmd_init(rest: List[str]) -> int:
     return cs.EXIT_OK
 
 
-def read_import_file(spec: str, force: bool) -> bytes:
-    """The exact bytes of a file being imported as a credential."""
-    path = Path(spec).expanduser()
-    if not path.is_file():
-        raise cs.CredError(
-            f"There is no file at '{path}'.",
-            ["Check the path. --file takes the file to import, not its content."],
-            cs.EXIT_NOT_FOUND)
-    try:
-        data = path.read_bytes()
-    except OSError as exc:
-        raise cs.CredError(f"Could not read '{path}': {exc}",
-                           ["Check that you have permission to read it."],
-                           cs.EXIT_GENERAL)
-    if len(data) > cs.MAX_FILE_BYTES and not force:
-        raise cs.CredError(
-            f"'{path.name}' is {len(data) // 1024} KiB; the limit is "
-            f"{cs.MAX_FILE_BYTES // 1024} KiB.",
-            ["The whole store is re-encrypted on every write, so a large file "
-             "is paid for again on every unrelated 'cred add'.",
-             "Keys and certificates are kilobytes. If this really belongs "
-             "here: cred add ... --file <path> --force"],
-            cs.EXIT_USAGE)
-    return data
-
-
 def cmd_add(rest: List[str]) -> int:
     opts, pos = read_options(rest, switches=("stdin", "allow-empty", "force"))
     if not pos:
@@ -330,7 +305,7 @@ def cmd_add(rest: List[str]) -> int:
     encoding: Optional[str] = None
     filename = ""
     if is_file:
-        data = read_import_file(str(file_spec), bool(opts.get("force")))
+        data = cs.read_import_file(str(file_spec), bool(opts.get("force")))
         # Byte-exact: no newline stripping, no line-ending translation. A PEM
         # that round-trips through `cred get --out` must be the same file.
         secret, encoding = cs.encode_file_content(data)
@@ -372,10 +347,10 @@ def cmd_add(rest: List[str]) -> int:
         defs = proj.config.setdefault("credentials", {})
         d = defs.get(key)
         if d is None:
-            d = {"type": kind, "env": cs.default_env_names(key, kind)}
+            d = {"type": kind, "env": cs.env_names(key, kind)}
             defs[key] = d
         d["type"] = kind
-        d.setdefault("env", cs.default_env_names(key, kind))
+        d.setdefault("env", cs.env_names(key, kind))
         if kind == "file":
             # A file has no environment representation, and the leftovers of a
             # previous type would be a lie in a committed, readable file.
@@ -384,7 +359,7 @@ def cmd_add(rest: List[str]) -> int:
         else:
             d.pop("filename", None)
             if kind == "userpass" and "user" not in d["env"]:
-                d["env"]["user"] = cs.default_env_names(key, kind)["user"]
+                d["env"]["user"] = cs.env_names(key, kind)["user"]
             if opts.get("env"):
                 d["env"]["secret"] = str(opts["env"])
         if opts.get("desc"):
@@ -407,69 +382,38 @@ def cmd_get(rest: List[str]) -> int:
     if not pos:
         raise cs.CredError("cred get <project>/<key>", [], cs.EXIT_USAGE)
 
-    proj_ref, key = cs.split_reference(pos[0])
-    project = cs.resolve_project(opts.get("project") or proj_ref, opts.get("path"))
-    values = cs.read_values(project)
-    entry = cs.entry_or_raise(project, key, values)
-
-    defs = project.config.get("credentials") or {}
-    view = cs.resolve_entry(key, entry, defs.get(key))
     field = str(opts.get("field") or "secret")
     out_spec = opts.get("out")
 
     if out_spec is not None and out_spec is not True:
-        return write_credential_to_file(project, view, str(out_spec),
-                                        bool(opts.get("force")), field)
+        resolved = cs.entry_view(pos[0], opts.get("project"), opts.get("path"))
+        wrote = cs.export_credential_file(resolved["project"], resolved["view"],
+                                          str(out_spec), bool(opts.get("force")),
+                                          field)
+        out(f"Wrote {wrote['file']} ({wrote['byte_count']} bytes), "
+            "readable only by you.")
+        out("This is plaintext on disk. Delete it when you are done.")
+        return cs.EXIT_OK
 
-    if view["kind"] == "file":
+    # One call, one decryption: the bytes and what they are.
+    value = cs.read_value(pos[0], opts.get("project"), opts.get("path"), field)
+
+    if value["kind"] == "file":
         # Exact bytes, and no trailing newline of ours: `cred get x > k.pem`
         # must produce the file that went in.
-        if view["is_binary"] and sys.stdout.isatty():
+        if value["is_binary"] and sys.stdout.isatty():
             raise cs.CredError(
-                f"'{project.name}/{key}' holds binary content.",
+                f"'{value['project']}/{value['key']}' holds binary content.",
                 ["Writing it to a terminal would corrupt it.",
-                 f"Write it to a file: cred get {project.name}/{key} "
+                 f"Write it to a file: cred get {value['project']}/{value['key']} "
                  f"--out <path>"],
                 cs.EXIT_USAGE)
-        sys.stdout.buffer.write(cs.entry_bytes(view, field, project.name))
+        sys.stdout.buffer.write(value["bytes"])
         sys.stdout.buffer.flush()
         return cs.EXIT_OK
 
-    if field not in view["fields"]:
-        raise cs.CredError(
-            f"'{project.name}/{key}' has no '{field}' field.",
-            [f"It is a '{view['kind']}' credential with: "
-             f"{', '.join(view['fields'])}",
-             f"To give it a username: cred add {project.name}/{key} --user <name>"],
-            cs.EXIT_NOT_FOUND)
-
-    write_secret(str(view["fields"][field]), newline=not opts.get("no-newline"))
-    return cs.EXIT_OK
-
-
-def write_credential_to_file(project, view: Dict[str, Any], spec: str,
-                             force: bool, field: str = "secret") -> int:
-    """`cred get --out` -- the only path that deliberately writes plaintext.
-
-    It exists because a private key is useless to openssl or nginx as a string
-    on stdout. Everything else in cred keeps plaintext off disk; this says so
-    out loud rather than doing it quietly.
-    """
-    key = view["key"]
-    target = Path(spec).expanduser()
-    if target.is_dir():
-        target = target / (view["filename"] or key)
-    if target.exists() and not force:
-        raise cs.CredError(
-            f"'{target}' already exists.",
-            ["Overwriting a key file is not something to do by accident.",
-             "Pass --force if that is what you mean."],
-            cs.EXIT_USAGE)
-
-    data = cs.entry_bytes(view, field, project.name)
-    cs.write_private_file(target, data)
-    out(f"Wrote {target} ({len(data)} bytes), readable only by you.")
-    out("This is plaintext on disk. Delete it when you are done.")
+    write_secret(value["bytes"].decode("utf-8"),
+                 newline=not opts.get("no-newline"))
     return cs.EXIT_OK
 
 
@@ -705,8 +649,8 @@ def cmd_keygen(rest: List[str]) -> int:
 def cmd_key(rest: List[str]) -> int:
     sub = rest[0].lower() if rest else ""
     opts, _ = read_options(rest[1:] if rest else [], switches=("force",))
-    # Wrapping is meaningless for a provider that keeps its own keyring, and
-    # silently wrapping age's key for a gpg project would be worse than a
+    # Wrapping is meaningless for a provider that keeps its own keys, and
+    # silently wrapping age's key for such a project would be worse than a
     # refusal.
     prov = cs.assert_keystore_supported(None, opts.get("provider") or None)
     path = cs.provider_identity_path(None, prov["name"])
@@ -757,8 +701,7 @@ def _key_protect(path, opts) -> int:
             raise cs.CredError(f"'{backup_path}' already exists.",
                                ["Choose another path, or pass --force."],
                                cs.EXIT_USAGE)
-        cs.write_text_atomic(backup_path, text)
-        cs.restrict_path(backup_path)
+        cs.write_private_text(backup_path, text)
         out(f"Unwrapped key copied to '{backup_path}'. That file is the key -- "
             "store it somewhere safe and offline.")
     else:
@@ -766,8 +709,7 @@ def _key_protect(path, opts) -> int:
             "key cannot be recovered.")
 
     target = path.parent / cs.WRAPPED_IDENTITY_NAME
-    cs.write_text_atomic(target, cs.wrap_identity(text))
-    cs.restrict_path(target)
+    cs.write_private_text(target, cs.wrap_identity(text))
 
     # Prove the wrapped copy opens before removing the original.
     if cs.identity_text(target).strip() != text.strip():
@@ -790,8 +732,7 @@ def _key_unprotect(path) -> int:
 
     text = cs.identity_text(path)
     target = path.parent / "identity.txt"
-    cs.write_text_atomic(target, text)
-    cs.restrict_path(target)
+    cs.write_private_text(target, text)
     path.unlink()
     out(f"Key unwrapped to {target}")
     out(f"'{target}' is now a plaintext key, protected only by file permissions.")
@@ -1085,9 +1026,9 @@ def cmd_import(rest: List[str]) -> int:
             defs = proj.config.setdefault("credentials", {})
             d = defs.setdefault(_k, {})
             d["type"] = kind
-            d.setdefault("env", cs.default_env_names(_k, kind))
+            d.setdefault("env", cs.env_names(_k, kind))
             if kind == "userpass" and "user" not in d["env"]:
-                d["env"]["user"] = cs.default_env_names(_k, kind)["user"]
+                d["env"]["user"] = cs.env_names(_k, kind)["user"]
             if opts.get("desc"):
                 d["description"] = str(opts["desc"])
 

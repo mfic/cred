@@ -303,6 +303,53 @@ function Get-CredEntryOrThrow {
     return $Values[$Key]
 }
 
+function Get-CredEntryView {
+    <#
+        .SYNOPSIS
+        A reference such as 'acme-api/db' resolved all the way to one entry:
+        split the name, open the store, prove the credential exists, hand back
+        what it is.
+
+        .DESCRIPTION
+        Every single-credential read path wants exactly this and nothing else,
+        and each one used to spell it out itself -- four lines that had to stay
+        in step across Get-Cred, Get-CredCredential, Export-CredFile and the
+        CLI. The order matters (Get-CredEntryOrThrow before touching .Entries,
+        so a missing key gets the message with the near-miss hint rather than a
+        null), which is precisely the kind of thing that drifts when it is
+        written out four times.
+
+        Still one decryption: the opened store comes back too, for a caller
+        that has more to ask of it.
+
+        .EXAMPLE
+        $e = Get-CredEntryView -Name acme-api/db
+        $e.View.Kind
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Name,
+        [string]$Project,
+        [string]$Path
+    )
+
+    $ref = Split-CredReference -Reference $Name
+    $key = $ref.Key
+    if ($ref.Project -and -not $Project) { $Project = $ref.Project }
+
+    $store = Open-CredStore -Project $Project -Path $Path
+    $ctx   = $store.Context
+    $null  = Get-CredEntryOrThrow -Project $ctx -Key $key -Values $store.Values
+
+    return [pscustomobject]@{
+        Key     = $key
+        Context = $ctx
+        View    = $store.Entries[$key]
+        Store   = $store
+    }
+}
+
 function Write-CredStoreValues {
     <#
         .SYNOPSIS

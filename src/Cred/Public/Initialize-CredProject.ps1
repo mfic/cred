@@ -18,7 +18,7 @@ function Initialize-CredProject {
         Set up the repository in the current directory.
 
         .EXAMPLE
-        Initialize-CredProject -Project acme-api -Provider gpg
+        Initialize-CredProject -Project acme-api -Provider age
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]

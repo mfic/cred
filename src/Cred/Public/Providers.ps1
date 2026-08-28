@@ -53,10 +53,10 @@ function Register-CredProvider {
 
         The key half used to sit outside this contract entirely, so the
         keystore commands reached past the seam into age and DPAPI directly and
-        `cred key protect` silently operated on an age key file even for a gpg
-        project. A provider that says nothing here is taken to keep its keys
-        somewhere cred does not manage -- which is exactly true of gpg, whose
-        keys live in its own keyring.
+        `cred key protect` silently operated on an age key file even for a
+        project that used neither. A provider that says nothing here is taken to
+        keep its keys somewhere cred does not manage -- a remote vault or KMS,
+        say, where there is no local file to wrap.
 
         Encrypt and Decrypt must not write plaintext to disk and must not pass
         secret material as command-line arguments.

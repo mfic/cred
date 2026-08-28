@@ -271,32 +271,3 @@ function Read-CredImportFile {
     return $bytes
 }
 
-function Write-CredPrivateFile {
-    <#
-        .SYNOPSIS
-        Write bytes to a new file only this user can read.
-
-        Permissions are applied to the staged file before it is put in place,
-        so there is no window in which the content exists world-readable.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes
-    )
-
-    $dir = Split-Path -Parent $Path
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    }
-    $tmp = "$Path.tmp$PID"
-    try {
-        [System.IO.File]::WriteAllBytes($tmp, $Bytes)
-        Protect-CredPath -Path $tmp
-        [System.IO.File]::Copy($tmp, $Path, $true)
-        Protect-CredPath -Path $Path
-    }
-    finally {
-        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -Confirm:$false -ErrorAction SilentlyContinue }
-    }
-}
