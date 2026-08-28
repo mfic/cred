@@ -19,6 +19,9 @@ Four rules hold the design together:
 
 1. **A CLI contains no behaviour.** `python/cred.py` and `bin/cred-ps.ps1` both
    parse argv, call one function, print, and pick an exit code. Nothing else.
+   Even the argv parser lives in the module (`Read-CredOptions`,
+   `Split-CredArgv`): inside a script its only interface is a process, so the
+   fiddliest code in the repository had no direct test.
 2. **All crypto is behind the provider contract.** Nothing above
    `Providers.ps1` knows what encryption is. Swapping backends is one file.
 3. **All OS knowledge lives in `Platform.ps1` and `Process.ps1`.** Nothing else
@@ -75,8 +78,11 @@ What we deliberately did *not* use, and why:
   much larger dependency, and it would still need age or gpg underneath. More
   moving parts for a benefit that does not apply here.
 
-`gpg` ships as a second provider — both because it proves the seam is real and
-because people with an established GnuPG keyring should not have to abandon it.
+`age` is the only provider that ships. A `gpg` provider used to ship beside it,
+to prove the seam was real; it was removed once the seam had other reasons to
+exist. The seam stays because the backends worth adding next are remote ones —
+a vault or a KMS — and those are exactly what the optional key half of the
+contract was written for.
 
 ## The provider contract
 
@@ -94,6 +100,19 @@ A provider is a `PSCustomObject`:
 | `Encrypt` | `($PlainBytes, $Config) -> byte[]` | |
 | `Decrypt` | `($CipherBytes, $CipherPath, $Config) -> byte[]` | |
 
+And, optionally, the *key* rather than the store:
+
+| Member | Signature | Purpose |
+| --- | --- | --- |
+| `IdentityPath` | `($Config) -> string \| $null` | where cred keeps this backend's key |
+| `SupportsKeystore` | bool | can `cred key protect` wrap it |
+
+A provider that declares neither keeps its keys somewhere cred does not manage
+— a remote vault or KMS, where there is no local file to wrap. This half used to
+sit *outside* the contract: the keystore commands called an age-specific helper
+directly, so `cred key protect` in such a project would cheerfully wrap age's
+key file. Both implementations now refuse by name instead.
+
 Two invariants a provider must not break:
 
 - **No plaintext to disk.** Encryption and decryption stream over pipes.
@@ -105,7 +124,7 @@ test that registers a toy backend and drives the whole stack through it, so a
 change that quietly breaks the seam fails the suite.
 
 `python/cred_store.py` mirrors this exactly, as a dict of the same members in
-`PROVIDERS`, reached through `get_provider(name)`. Both ship `age` and `gpg`.
+`PROVIDERS`, reached through `get_provider(name)`. Both ship `age`.
 
 ## Data model
 
@@ -125,6 +144,80 @@ the encrypted store, because a username is half a credential.
 
 That is the whole format. A shell reimplementation needs to understand exactly
 this, which is the point.
+
+There are three credential types: `secret` (one value), `userpass` (a value and
+a username), and `file` (the exact bytes of a private key or certificate).
+
+A file credential adds one key to its store entry and two to its declaration:
+
+```json
+// store.age              config.json
+{ "secret": "LS0tLS1C…",  { "type": "file", "env": {},
+  "encoding": "base64" }    "filename": "server.key" }
+```
+
+Three decisions worth not rediscovering:
+
+- **`encoding` lives in the store, not the config.** It describes the stored
+  bytes, so a store that has outlived its `config.json` still decodes
+  correctly. `filename` lives in the config, because it is documentation — the
+  readable half should say what the blob is. `entry_kind` /
+  `Get-CredEntryKind` trusts the store first for exactly this reason.
+- **Text stays text; only non-UTF-8 (or NUL-bearing) content becomes base64.**
+  A PEM in the store is still greppable once decrypted and still diffs
+  sensibly. Base64 is the fallback, not the rule.
+- **`file` maps to no environment variable.** `environment_and_skipped` skips
+  the type outright *and* ignores any entry field that is not `user` or `secret`,
+  so the `encoding` marker can never become `$env:SSL_KEY_ENCODING`. Both
+  implementations return the skipped names alongside the variables, from a
+  single decryption, so `cred exec` can say what it left out without
+  decrypting twice.
+
+`cred get --out` and `cred export` are the only paths that write a *credential*
+in plaintext to disk. They exist because openssl and nginx want a path, not a
+string, and both say out loud what they did. Together with the key files —
+`cred key gen`, `key protect --backup`, `key unprotect` — they are the callers
+of one writer: `Write-CredPrivateFile` in `Private/Json.ps1`, `write_private_file`
+in `python/cred_store.py`. Everything else writes ciphertext or non-secret
+config through the plain atomic writers, which do no permission work.
+
+The private writer exists because the ordering is easy to get wrong, and wrong
+here means a readable window rather than a visible bug. It restricts the staged
+file before publishing it, and — on Windows, where `File.Replace` keeps the
+*destination's* ACL rather than the incoming file's — restricts an existing
+destination before the swap too. Tightening afterwards would leave the new
+secret under the old file's permissions for as long as it took to get there.
+
+## One question, one place to answer it
+
+Two internal seams carry most of the module's weight.
+
+**What a credential *is*** lives in `Private/Entry.ps1` (`resolve_entry` in
+`python/cred_store.py`). Give it a store entry and its `config.json`
+declaration and it returns the kind, the value-bearing fields, the environment
+variables the credential becomes, its exact bytes, and the line `cred list`
+should print. Nothing above it re-derives any of that.
+
+That question used to be answered independently at every access path, and the
+copies had drifted: `Get-CredList` read `type` straight off the declaration
+rather than asking, so a store that had outlived its `config.json` listed a
+binary file credential as a secret; and `Get-CredCredential` ignored kind
+altogether, handing back a base64 blob as a password. Adding a fourth
+credential type should be one edit, not eleven.
+
+**Reading a store** goes through `Open-CredStore`, whose private half is
+`New-CredStoreView`. It is the counterpart to `Update-CredStoreValues` on the
+write side: writes always had a single shared path, reads did not, and seven
+callers each hand-assembled resolve → decrypt → look up the declaration →
+project. The tell was `[ref]` out-parameters growing on `Get-Cred` and
+`Get-CredEnvironment` to smuggle a projection back out without decrypting
+twice. Those parameters are gone; `Get-CredStoreEnvironment` returns the
+variables and the deliberately-skipped file credentials together, from one
+decryption.
+
+`Get-CredList` is the deliberate exception: without `-Verify` it must not
+decrypt at all, so it resolves entries against an empty store and lets the
+declaration speak for itself.
 
 Outside every repository, in `%APPDATA%\cred` or `$XDG_CONFIG_HOME/cred`:
 
@@ -228,8 +321,7 @@ and re-parsing it, which would add a leak surface for no gain. That is why the
 module is not a wrapper around the CLI and never shells out to it.
 
 `bin/cred-ps` is the same CLI implemented in PowerShell, kept for machines with
-pwsh but no Python. It is not a fallback that degrades: it is a full peer, and
-it is the one that ships `gpg` support in the same seam.
+pwsh but no Python. It is not a fallback that degrades: it is a full peer.
 
 Neither implementation calls the other. They interoperate because the *files*
 are the contract, and nothing else is:
@@ -245,12 +337,23 @@ are the contract, and nothing else is:
 `tests/Interop.Tests.ps1` drives both against a single store and asserts
 byte-exact round trips in each direction, identical exit codes, identical
 default environment-variable names, and that neither loses the other's writes.
+
+A round trip proves the two agree, not that either is right: it passes whenever
+both are wrong in the same way, which is exactly how four divergences survived
+undetected -- a project resolving to `store.age` in Python and a different
+filename in PowerShell; a staged write verified by length on one side and by content on
+the other; a userpass credential whose declaration named only `user` injecting
+`$env:KEY` here and `$env:KEY_PASSWORD` there; and a binary-to-terminal guard
+keyed off the stored marker in one implementation and off NUL bytes in the
+other. `tests/fixtures/` is therefore the contract as an artifact: committed
+stores, and the exact resolution each implementation must produce.
+`tests/Conformance.Tests.ps1` holds both to it. A third implementation in `sh`
+would use the same corpus as its conformance suite.
 `tests/PythonCli.Tests.ps1` covers the Python CLI on its own. Those two files
 are what stop the implementations drifting.
 
-The only remaining asymmetry is deliberate: `gpg` is implemented in both, but
-`cred-ps` is the one with the PowerShell-native object API, because that is not
-a CLI concern.
+The only remaining asymmetry is deliberate: `cred-ps` is the one with the
+PowerShell-native object API, because that is not a CLI concern.
 
 A third implementation in `sh` would need nothing new from this codebase: `jq`
 over `config.json`, `age -d -i` over the store, `flock` on `.creds/.lock`, and
@@ -362,13 +465,16 @@ src/Cred/
   Private/
     Platform.ps1  OS detection, config paths, ACLs, Windows argv quoting
     Errors.ps1    error records with next steps; code → exit code
+    Entry.ps1     what a credential IS: kind, bytes, env names, file content
     Json.ps1      UTF-8 no-BOM I/O, atomic writes, JSON that behaves on 5.1
     Process.ps1   child processes: byte pipes in, byte pipes out
-    Secrets.ps1   SecureString conversion, prompting, raw stdout
-    Providers.ps1 the crypto seam: age, gpg
+    Secrets.ps1   SecureString conversion and prompting
+    Providers.ps1 the crypto seam: age, and where a provider keeps its key
     Config.ps1    project discovery, registry, config read/write
-    Store.ps1     locking, decrypt/encrypt of the value set
+    Store.ps1     locking, the read spine (store view), the write spine
   Public/         one file per area; every function has help and examples
+    Open-CredStore.ps1  one decryption, every entry resolved
+    CommandLine.ps1     argv parsing, callable so it can be tested
 python/
   cred.py         the CLI: argv, output, exit codes. No behaviour.
   cred_store.py   the store as a library: providers, formats, locking, DPAPI,
@@ -382,6 +488,10 @@ tests/
   Keystore.Tests.ps1     wrapping the key, and that it leaves no key on disk
   Migration.Tests.ps1    the PSCredential import/export boundary
   PythonCli.Tests.ps1    the default CLI on its own
+  pyunit.py              the Python argv parser and entry rules, directly
   Interop.Tests.ps1      PowerShell and Python against one store
+  Conformance.Tests.ps1  both implementations against fixed bytes
+  fixtures/              the format as an artifact: stores + expected results
+  conformance.py         dumps the Python implementation's view of a fixture
   Invoke-Tests.ps1       runs everything under both editions
 ```

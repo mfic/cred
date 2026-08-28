@@ -1,0 +1,17 @@
+{
+  "skipped": [
+    "blob",
+    "notes"
+  ],
+  "variables": {
+    "DB_PASSWORD": "p@ss w/ spaces",
+    "DB_USER": "svc",
+    "DOTTED_KEY": "dotted-value",
+    "HALF_DECLARED_PASSWORD": "half-pw",
+    "HALF_DECLARED_USER": "dave",
+    "MY_LOGIN": "carol",
+    "MY_PASS": "custom-pw",
+    "TOKEN": "tok-äöü-🔑",
+    "UNDECLARED": "no-declaration-here"
+  }
+}

@@ -18,7 +18,7 @@ function Initialize-CredProject {
         Set up the repository in the current directory.
 
         .EXAMPLE
-        Initialize-CredProject -Project acme-api -Provider gpg
+        Initialize-CredProject -Project acme-api -Provider age
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
@@ -63,7 +63,7 @@ function Initialize-CredProject {
     $recipients = @($Recipient)
     if (-not $recipients -or $recipients.Count -eq 0) {
         if ($Provider -eq 'age') {
-            $identityPath = Get-CredAgeIdentityPath -Config $null
+            $identityPath = Get-CredIdentityPath -Config $null
             if (-not (Test-Path -LiteralPath $identityPath -PathType Leaf)) {
                 Write-Verbose "No identity at '$identityPath'; creating one."
                 $null = New-CredIdentity

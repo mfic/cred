@@ -1,0 +1,50 @@
+{
+  "credentials": {
+    "blob": {
+      "env": {},
+      "filename": "cert.der",
+      "type": "file"
+    },
+    "custom": {
+      "env": {
+        "secret": "MY_PASS",
+        "user": "MY_LOGIN"
+      },
+      "type": "userpass"
+    },
+    "db": {
+      "description": "the application database",
+      "env": {
+        "secret": "DB_PASSWORD",
+        "user": "DB_USER"
+      },
+      "type": "userpass"
+    },
+    "dotted.key": {
+      "env": {},
+      "type": "secret"
+    },
+    "half-declared": {
+      "env": {
+        "user": "HALF_DECLARED_USER"
+      },
+      "type": "userpass"
+    },
+    "notes": {
+      "env": {},
+      "filename": "notes.txt",
+      "type": "file"
+    },
+    "token": {
+      "env": {
+        "secret": "TOKEN"
+      },
+      "type": "secret"
+    }
+  },
+  "project": "conformance",
+  "provider": "age",
+  "recipients": [],
+  "store": "store.age",
+  "version": 1
+}

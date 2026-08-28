@@ -30,8 +30,14 @@ function Protect-CredIdentity {
     param(
         [string]$Path,
         [string]$Backup,
-        [switch]$Force
+        [switch]$Force,
+        # Which backend's key. Only providers whose key is a file cred manages
+        # can be wrapped; any other is refused by name rather than silently
+        # having age's key wrapped on its behalf.
+        [string]$Provider = 'age'
     )
+
+    $null = Assert-CredKeystoreSupported -ProviderName $Provider
 
     if (-not (Test-CredKeystoreAvailable)) {
         throw (New-CredErrorRecord -Code 'ProviderMissing' `
@@ -40,7 +46,7 @@ function Protect-CredIdentity {
                     "Elsewhere, protect the key file itself with a passphrase: age -p identity.txt"))
     }
 
-    if (-not $Path) { $Path = Get-CredAgeIdentityPath -Config $null }
+    if (-not $Path) { $Path = Get-CredIdentityPath -Config $null -ProviderName $Provider }
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw (New-CredErrorRecord -Code 'NoIdentity' -Target $Path `
@@ -58,8 +64,7 @@ function Protect-CredIdentity {
             throw (New-CredErrorRecord -Code 'Usage' -Target $Backup `
                 -Message "'$Backup' already exists." -Next "Choose another path, or pass -Force.")
         }
-        Set-CredFileText -Path $Backup -Text $text
-        Protect-CredPath -Path $Backup
+        Write-CredPrivateFileText -Path $Backup -Text $text
         Write-Warning "Unwrapped key copied to '$Backup'. That file is the key -- store it somewhere safe and offline."
     }
     elseif (-not $Force) {
@@ -70,8 +75,7 @@ function Protect-CredIdentity {
     if (-not $PSCmdlet.ShouldProcess($Path, "Wrap with $(Get-CredKeystoreName)")) { return }
     $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
 
-    Set-CredFileText -Path $target -Text (New-CredWrappedIdentityJson -IdentityText $text)
-    Protect-CredPath -Path $target
+    Write-CredPrivateFileText -Path $target -Text (New-CredWrappedIdentityJson -IdentityText $text)
 
     # Prove the wrapped copy opens before removing the original.
     $check = Get-CredIdentityText -Path $target
@@ -106,9 +110,10 @@ function Unprotect-CredIdentity {
     #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     [OutputType([pscustomobject])]
-    param([string]$Path)
+    param([string]$Path, [string]$Provider = 'age')
 
-    if (-not $Path) { $Path = Get-CredAgeIdentityPath -Config $null }
+    $null = Assert-CredKeystoreSupported -ProviderName $Provider
+    if (-not $Path) { $Path = Get-CredIdentityPath -Config $null -ProviderName $Provider }
 
     if (-not (Test-CredIdentityIsWrapped -Path $Path)) {
         Write-Verbose "'$Path' is not wrapped."
@@ -120,8 +125,7 @@ function Unprotect-CredIdentity {
     $text   = Get-CredIdentityText -Path $Path
     $target = Join-Path (Split-Path -Parent $Path) 'identity.txt'
 
-    Set-CredFileText -Path $target -Text $text
-    Protect-CredPath -Path $target
+    Write-CredPrivateFileText -Path $target -Text $text
     Remove-Item -LiteralPath $Path -Force -Confirm:$false
 
     Write-Warning "'$target' is now a plaintext key, protected only by file permissions."
@@ -138,9 +142,9 @@ function Get-CredIdentityInfo {
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
-    param([string]$Path)
+    param([string]$Path, [string]$Provider = 'age')
 
-    if (-not $Path) { $Path = Get-CredAgeIdentityPath -Config $null }
+    if (-not $Path) { $Path = Get-CredIdentityPath -Config $null -ProviderName $Provider }
     $exists  = Test-Path -LiteralPath $Path -PathType Leaf
     $wrapped = $exists -and (Test-CredIdentityIsWrapped -Path $Path)
 
@@ -150,6 +154,6 @@ function Get-CredIdentityInfo {
         Protection       = if ($wrapped) { (ConvertFrom-CredJson (Get-CredFileText -Path $Path)).protection } else { 'file-permissions' }
         Private          = if ($exists) { Test-CredPathIsPrivate -Path $Path } else { $false }
         KeystoreAvailable = (Test-CredKeystoreAvailable)
-        Recipient        = if ($exists) { try { & (Get-CredProviderInternal -Name 'age').GetRecipient $null } catch { $null } } else { $null }
+        Recipient        = if ($exists) { try { & (Get-CredProviderInternal -Name $Provider).GetRecipient $null } catch { $null } } else { $null }
     }
 }

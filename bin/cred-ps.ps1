@@ -42,75 +42,9 @@ Import-Module $moduleManifest -Force -ErrorAction Stop
 
 # ---------------------------------------------------------------- argv -------
 
-function Split-Argv {
-    <#
-        Splits argv at the first bare '--'. Returns the args before it and the
-        verbatim command after it.
-    #>
-    param([string[]]$Argv)
-
-    $idx = [Array]::IndexOf([string[]]$Argv, '--')
-    if ($idx -lt 0) {
-        return [pscustomobject]@{ Head = @($Argv); Tail = @() }
-    }
-    $head = [System.Collections.Generic.List[string]]::new()
-    $tail = [System.Collections.Generic.List[string]]::new()
-    for ($i = 0; $i -lt $Argv.Count; $i++) {
-        if ($i -lt $idx)      { $head.Add([string]$Argv[$i]) }
-        elseif ($i -gt $idx)  { $tail.Add([string]$Argv[$i]) }
-    }
-    return [pscustomobject]@{ Head = $head.ToArray(); Tail = $tail.ToArray() }
-}
-
-function Read-Options {
-    <#
-        Parses `--flag`, `--opt value`, `--opt=value` and `-x` short forms out
-        of an argument list, leaving the positional arguments behind.
-
-        $Switches names the options that take no value.
-    #>
-    param(
-        [string[]]$Argv,
-        [string[]]$Switches = @(),
-        [hashtable]$Short = @{}
-    )
-
-    $opts = @{}
-    $positional = [System.Collections.Generic.List[string]]::new()
-    $i = 0
-    while ($i -lt $Argv.Count) {
-        $a = [string]$Argv[$i]
-
-        if ($a -match '^--([A-Za-z][A-Za-z0-9-]*)(=(.*))?$') {
-            $name  = $Matches[1].ToLowerInvariant()
-            $inline = if ($Matches[2]) { $Matches[3] } else { $null }
-
-            if ($name -in $Switches) {
-                $opts[$name] = $true
-            }
-            elseif ($null -ne $inline) {
-                $opts[$name] = $inline
-            }
-            elseif ($i + 1 -lt $Argv.Count -and [string]$Argv[$i + 1] -notlike '--*') {
-                $opts[$name] = [string]$Argv[$i + 1]; $i++
-            }
-            else {
-                $opts[$name] = $true
-            }
-        }
-        elseif ($a -match '^-([A-Za-z])$' -and $Short.ContainsKey($Matches[1])) {
-            $name = $Short[$Matches[1]]
-            if ($name -in $Switches) { $opts[$name] = $true }
-            elseif ($i + 1 -lt $Argv.Count) { $opts[$name] = [string]$Argv[$i + 1]; $i++ }
-            else { $opts[$name] = $true }
-        }
-        else {
-            $positional.Add($a)
-        }
-        $i++
-    }
-    return [pscustomobject]@{ Options = $opts; Positional = @($positional) }
-}
+# Split-CredArgv and Read-CredOptions used to live here. A parser inside a script has
+# no interface but a process, so the fiddliest code in the repo had no direct
+# test. They are Split-CredArgv and Read-CredOptions in the module now.
 
 function Get-Opt {
     param([hashtable]$Options, [string]$Name, $Default = $null)
@@ -121,6 +55,9 @@ function Get-Opt {
 # --------------------------------------------------------------- output ------
 
 function Write-Line { param([string]$Text = '') [Console]::Out.WriteLine($Text) }
+
+# An aside for the human, on stderr so it cannot pollute a pipe.
+function Write-CredNote { param([string]$Text) [Console]::Error.WriteLine($Text) }
 
 function Write-CredSecret {
     <#
@@ -203,7 +140,7 @@ GETTING STARTED
 
 COMMANDS
   init [name]                      Create a store here
-      --provider <age|gpg>         Encryption backend (default: age)
+      --provider <name>            Encryption backend (default: age)
       --recipient <key>            Recipient(s) instead of your own key
       --force                      Overwrite an existing store
 
@@ -211,6 +148,8 @@ COMMANDS
       --user <name>                Make it a username/password pair
       --value <secret>             Non-interactive (leaks to shell history)
       --stdin                      Read the value from stdin
+      --file <path>                Store a file's exact bytes (PEM, cert, key)
+      --filename <name>            Record a different name than the source
       --env <NAME>                 Environment variable name to map it to
       --desc <text>                What it is for
       --allow-empty                Permit an empty value
@@ -218,6 +157,8 @@ COMMANDS
   get <project>/<key>              Print a secret
       --field <secret|user>        Which half of a userpass pair
       -n, --no-newline             Omit the trailing newline
+      --out <path>                 Write to a file instead of stdout
+      --force                      Allow --out to overwrite
 
   list [project]                   Show credential names (never values)
       --verify                     Also decrypt and flag missing values
@@ -247,6 +188,7 @@ COMMANDS
   key protect                      Wrap it with the OS keystore (DPAPI)
       --backup <file>              Save the unwrapped key first (do this)
   key unprotect                    Unwrap it, before moving machine or account
+      --provider <name>            Which backend's key (default: age)
 
   import <path>                    Import PSCredential files into a store
       --name <key>                 Name for a single file
@@ -291,7 +233,7 @@ function Invoke-CredCli {
         return 0
     }
 
-    $split  = Split-Argv -Argv $Argv
+    $split  = Split-CredArgv -Argv $Argv
     $head   = @($split.Head)
     $tail   = @($split.Tail)
     $verb   = ([string]$head[0]).ToLowerInvariant()
@@ -305,7 +247,7 @@ function Invoke-CredCli {
         }
 
         'init' {
-            $p = Read-Options -Argv $rest -Switches @('force') -Short @{}
+            $p = Read-CredOptions -Argv $rest -Switches @('force') -Short @{}
             $o = $p.Options
             $call = @{}
             if ($p.Positional.Count -gt 0) { $call.Project = $p.Positional[0] }
@@ -326,13 +268,16 @@ function Invoke-CredCli {
         }
 
         { $_ -in 'add', 'set' } {
-            $p = Read-Options -Argv $rest -Switches @('stdin', 'allow-empty') -Short @{}
+            $p = Read-CredOptions -Argv $rest -Switches @('stdin', 'allow-empty', 'force') -Short @{}
             $o = $p.Options
             if ($p.Positional.Count -lt 1) { throw (UsageError 'cred add <project>/<key> [--user <name>]') }
 
             $call = @{ Name = $p.Positional[0] }
             if ($p.Positional.Count -gt 1)  { $call.Secret = $p.Positional[1] }
             if (Get-Opt $o 'value')         { $call.Secret = Get-Opt $o 'value' }
+            if (Get-Opt $o 'file')          { $call.File = Get-Opt $o 'file' }
+            if (Get-Opt $o 'filename')      { $call.FileName = Get-Opt $o 'filename' }
+            if (Get-Opt $o 'force')         { $call.Force = $true }
             if (Get-Opt $o 'user')          { $call.User = Get-Opt $o 'user' }
             if (Get-Opt $o 'desc')          { $call.Description = Get-Opt $o 'desc' }
             if (Get-Opt $o 'description')   { $call.Description = Get-Opt $o 'description' }
@@ -346,26 +291,62 @@ function Invoke-CredCli {
             $r = Set-Cred @call
             $what = if ($r.Created) { 'Added' } else { 'Updated' }
             Write-Line "$what $($r.Project)/$($r.Key) ($($r.Type))"
+            if ($r.Type -eq 'file') {
+                $how = if ($r.Encoding) { 'base64' } else { 'text' }
+                Write-Line "  $($r.FileName), $($r.ByteCount) bytes, stored as $how"
+                Write-Line "  Not injected by 'cred exec'. Read it back with: cred get $($r.Project)/$($r.Key) --out <path>"
+            }
             return 0
         }
 
         'get' {
-            $p = Read-Options -Argv $rest -Switches @('no-newline') -Short @{ 'n' = 'no-newline' }
+            $p = Read-CredOptions -Argv $rest -Switches @('no-newline', 'force') -Short @{ 'n' = 'no-newline' }
             $o = $p.Options
             if ($p.Positional.Count -lt 1) { throw (UsageError 'cred get <project>/<key>') }
 
             $call = @{ Name = $p.Positional[0] }
-            if (Get-Opt $o 'field')   { $call.Field = Get-Opt $o 'field' }
             if (Get-Opt $o 'path')    { $call.Path = Get-Opt $o 'path' }
             if (Get-Opt $o 'project') { $call.Project = Get-Opt $o 'project' }
 
-            $value = Get-Cred @call
+            if (Get-Opt $o 'out') {
+                $call.OutFile = Get-Opt $o 'out'
+                if (Get-Opt $o 'field') { $call.Field = Get-Opt $o 'field' }
+                if (Get-Opt $o 'force') { $call.Force = $true }
+                $w = Export-CredFile @call
+                Write-Line "Wrote $($w.File) ($($w.ByteCount) bytes), readable only by you."
+                Write-Line 'This is plaintext on disk. Delete it when you are done.'
+                return 0
+            }
+
+            if (Get-Opt $o 'field') { $call.Field = Get-Opt $o 'field' }
+
+            # One call, one decryption: the bytes and what they are.
+            $v = Read-CredValue @call
+
+            if ($v.Kind -eq 'file') {
+                # Exact bytes, and no trailing newline of ours: piping this to a
+                # file must produce the file that went in, byte for byte.
+                #
+                # The guard keys off the stored 'encoding' marker, exactly as
+                # python/cred.py does. Sniffing for a NUL byte instead meant a
+                # base64-stored file with no NUL was blocked by one
+                # implementation and printed by the other.
+                if ($v.IsBinary -and -not [Console]::IsOutputRedirected) {
+                    throw (UsageError "'$($p.Positional[0])' holds binary content. Writing it to a terminal would corrupt it. Write it to a file: cred get $($p.Positional[0]) --out <path>")
+                }
+                $stdout = [Console]::OpenStandardOutput()
+                $stdout.Write($v.Bytes, 0, $v.Bytes.Length)
+                $stdout.Flush()
+                return 0
+            }
+
+            $value = [System.Text.UTF8Encoding]::new($false).GetString($v.Bytes)
             Write-CredSecret -Value $value -NoNewline:([bool](Get-Opt $o 'no-newline'))
             return 0
         }
 
         'list' {
-            $p = Read-Options -Argv $rest -Switches @('verify', 'json') -Short @{}
+            $p = Read-CredOptions -Argv $rest -Switches @('verify', 'json') -Short @{}
             $o = $p.Options
             $call = @{}
             if ($p.Positional.Count -gt 0) { $call.Project = $p.Positional[0] }
@@ -392,7 +373,7 @@ function Invoke-CredCli {
         }
 
         'exec' {
-            $p = Read-Options -Argv $rest -Switches @() -Short @{}
+            $p = Read-CredOptions -Argv $rest -Switches @() -Short @{}
             $o = $p.Options
             if ($tail.Count -eq 0) {
                 throw (UsageError 'cred exec <project> -- <command> [args]')
@@ -409,7 +390,7 @@ function Invoke-CredCli {
         }
 
         { $_ -in 'rm', 'remove', 'delete' } {
-            $p = Read-Options -Argv $rest -Switches @('yes', 'keep-definition') -Short @{ 'y' = 'yes' }
+            $p = Read-CredOptions -Argv $rest -Switches @('yes', 'keep-definition') -Short @{ 'y' = 'yes' }
             $o = $p.Options
             if ($p.Positional.Count -lt 1) { throw (UsageError 'cred rm <project>/<key>') }
 
@@ -427,7 +408,7 @@ function Invoke-CredCli {
         }
 
         'env' {
-            $p = Read-Options -Argv $rest -Switches @() -Short @{}
+            $p = Read-CredOptions -Argv $rest -Switches @() -Short @{}
             $o = $p.Options
             $call = @{}
             if ($p.Positional.Count -gt 0) { $call.Project = $p.Positional[0] }
@@ -436,7 +417,14 @@ function Invoke-CredCli {
             if (Get-Opt $o 'except') { $call.Exclude = (Get-Opt $o 'except') -split ',' }
             if (Get-Opt $o 'prefix') { $call.Prefix = Get-Opt $o 'prefix' }
 
-            $table  = Get-CredEnvironment @call
+            # One call for both answers, off one decryption.
+            $projected = Get-CredEnvironmentReport @call
+            $table   = $projected.Variables
+            $skipped = $projected.Skipped
+            if ($skipped.Count -gt 0) {
+                $ref = if ($call.Contains('Project')) { "$($call.Project)/$($skipped[0])" } else { $skipped[0] }
+                Write-CredNote "Not shown (file credentials): $($skipped -join ', '). Read one with: cred get $ref --out <path>"
+            }
             $format = [string](Get-Opt $o 'format' 'powershell')
             foreach ($k in ($table.Keys | Sort-Object)) {
                 $line = if ($format -eq 'posix') {
@@ -453,7 +441,7 @@ function Invoke-CredCli {
             $sub = if ($rest.Count -gt 0) { ([string]$rest[0]).ToLowerInvariant() } else { '' }
             if ($sub -in 'add', 'rm', 'remove') {
                 $subArgv = @(if ($rest.Count -gt 1) { $rest[1..($rest.Count - 1)] } else { @() })
-                $p = Read-Options -Argv $subArgv -Switches @('yes') -Short @{ 'y' = 'yes' }
+                $p = Read-CredOptions -Argv $subArgv -Switches @('yes') -Short @{ 'y' = 'yes' }
                 $keys = @($p.Positional)
                 if ($keys.Count -eq 0) { throw (UsageError "cred recipients $sub <public-key> [--project <name>]") }
                 $call = @{ Recipient = $keys }
@@ -476,7 +464,7 @@ function Invoke-CredCli {
                 return 0
             }
 
-            $p = Read-Options -Argv $rest -Switches @() -Short @{}
+            $p = Read-CredOptions -Argv $rest -Switches @() -Short @{}
             $call = @{}
             if ($p.Positional.Count -gt 0) { $call.Project = $p.Positional[0] }
             if (Get-Opt $p.Options 'path') { $call.Path = Get-Opt $p.Options 'path' }
@@ -485,7 +473,7 @@ function Invoke-CredCli {
         }
 
         { $_ -in 'keygen', 'newkey' } {
-            $p = Read-Options -Argv $rest -Switches @('show', 'force', 'protect') -Short @{}
+            $p = Read-CredOptions -Argv $rest -Switches @('show', 'force', 'protect') -Short @{}
             $o = $p.Options
             $call = @{}
             if (Get-Opt $o 'show')  { $call.Show = $true }
@@ -534,7 +522,7 @@ function Invoke-CredCli {
         }
 
         { $_ -in 'doctor', 'check' } {
-            $p = Read-Options -Argv $rest -Switches @('repair') -Short @{}
+            $p = Read-CredOptions -Argv $rest -Switches @('repair') -Short @{}
             $call = @{}
             if ($p.Positional.Count -gt 0) { $call.Project = $p.Positional[0] }
             if (Get-Opt $p.Options 'path') { $call.Path = Get-Opt $p.Options 'path' }
@@ -547,7 +535,7 @@ function Invoke-CredCli {
         }
 
         { $_ -in 'claude', 'agent', 'brief' } {
-            $p = Read-Options -Argv $rest -Switches @('write') -Short @{}
+            $p = Read-CredOptions -Argv $rest -Switches @('write') -Short @{}
             $call = @{}
             if ($p.Positional.Count -gt 0) { $call.Project = $p.Positional[0] }
             if (Get-Opt $p.Options 'path') { $call.Path = Get-Opt $p.Options 'path' }
@@ -565,7 +553,7 @@ function Invoke-CredCli {
         'key' {
             $sub = if ($rest.Count -gt 0) { ([string]$rest[0]).ToLowerInvariant() } else { '' }
             $subArgv = @(if ($rest.Count -gt 1) { $rest[1..($rest.Count - 1)] } else { @() })
-            $p = Read-Options -Argv $subArgv -Switches @('force') -Short @{}
+            $p = Read-CredOptions -Argv $subArgv -Switches @('force') -Short @{}
 
             switch ($sub) {
                 'protect' {
@@ -597,7 +585,7 @@ function Invoke-CredCli {
         }
 
         'import' {
-            $p = Read-Options -Argv $rest -Switches @('force', 'dry-run') -Short @{}
+            $p = Read-CredOptions -Argv $rest -Switches @('force', 'dry-run') -Short @{}
             $o = $p.Options
             if ($p.Positional.Count -lt 1) { throw (UsageError 'cred import <file-or-folder> [--name <key>]') }
 
@@ -616,7 +604,7 @@ function Invoke-CredCli {
         }
 
         'export' {
-            $p = Read-Options -Argv $rest -Switches @('yes', 'force') -Short @{ 'y' = 'yes' }
+            $p = Read-CredOptions -Argv $rest -Switches @('yes', 'force') -Short @{ 'y' = 'yes' }
             $o = $p.Options
             if ($p.Positional.Count -lt 1) { throw (UsageError 'cred export <folder> [--only <a,b>]') }
 
@@ -662,24 +650,13 @@ function Merge-Env {
 
 # --------------------------------------------------------------- main --------
 
-# Code -> exit code. Mirrors $script:CredExitCodes inside the module; kept here
-# so the CLI never has to reach into module-private state.
-$script:ExitCodes = @{
-    Usage = 2; NoProject = 3; NoCredential = 3; NoIdentity = 4; DecryptFailed = 4
-    ProviderMissing = 5; StoreCorrupt = 6; StoreLocked = 7; CommandFailed = 8
-}
-
 try {
     exit (Invoke-CredCli -Argv $script:Argv)
 }
 catch {
     $record = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_ } else { $_.ErrorRecord }
     Write-CredCliError -Record $record
-
-    $code = 1
-    if ($record.FullyQualifiedErrorId -match '^Cred\.([A-Za-z]+)') {
-        $name = $Matches[1]
-        if ($script:ExitCodes.ContainsKey($name)) { $code = $script:ExitCodes[$name] }
-    }
-    exit $code
+    # The module owns the code -> exit code table. This used to be a second
+    # copy here, which is the kind of duplication that drifts silently.
+    exit (Get-CredExitCode -ErrorRecord $record)
 }

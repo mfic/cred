@@ -6,3 +6,7 @@ tests/results-*.xml
 .idea/
 Thumbs.db
 *.swp
+
+# Python
+__pycache__/
+*.py[cod]

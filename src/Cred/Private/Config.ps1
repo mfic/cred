@@ -95,6 +95,13 @@ function Split-CredReference {
         Parse "project/key", "key", or "project/" into its parts.
 
         Credential keys may not contain '/', so the split is unambiguous.
+
+        Exported because the CLI has to agree with the module about what a
+        reference means; its Python peer, cs.split_reference, is public for
+        the same reason.
+
+        .EXAMPLE
+        (Split-CredReference 'acme-api/db').Key
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Reference)
@@ -266,22 +273,18 @@ function New-CredDefinition {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Key,
-        [ValidateSet('secret', 'userpass')][string]$Type = 'secret',
+        [ValidateSet('secret', 'userpass', 'file')][string]$Type = 'secret',
         [string]$Description,
-        [hashtable]$Env
+        [hashtable]$Env,
+        [string]$FileName
     )
 
-    $slug = ($Key -replace '[^A-Za-z0-9]', '_').ToUpperInvariant()
     $def = [ordered]@{ type = $Type }
-    $def.env = if ($Type -eq 'userpass') {
-        [ordered]@{
-            user   = if ($Env -and $Env.user)   { $Env.user }   else { "${slug}_USER" }
-            secret = if ($Env -and $Env.secret) { $Env.secret } else { "${slug}_PASSWORD" }
-        }
-    }
-    else {
-        [ordered]@{ secret = if ($Env -and $Env.secret) { $Env.secret } else { $slug } }
-    }
+    # The naming convention lives in Get-CredEnvNames, which also returns the
+    # empty map a file credential needs. Spelling it out again here is how the
+    # copies drifted apart in the first place.
+    $def.env = Get-CredEnvNames -Key $Key -Kind $Type -Env $Env
+    if ($Type -eq 'file') { $def.filename = $FileName }
     if ($Description) { $def.description = $Description }
     return $def
 }

@@ -29,7 +29,7 @@ rather than text.
 ```powershell
 # 0. one-off: install the encryption backend and put cred on your PATH
 winget install FiloSottile.age
-$env:PATH += ";C:\Users\you\projects\creds-helper\bin"
+$env:PATH += ";C:\tools\cred\bin"
 
 # 1. one-off: create your personal key (stored outside every repo, backed up by you)
 cred keygen
@@ -154,6 +154,12 @@ $env  = Get-CredEnvironment acme-api            # hashtable of env-var name → 
 $env.STRIPE_API_KEY
 
 $key  = Get-Cred acme-api/stripe -AsSecureString
+
+Export-CredFile acme-api/ssl-key -OutFile D:\tmp\server.key   # a file credential
+
+# The two that answer a whole question in one decryption:
+$r = Get-CredEnvironmentReport acme-api         # .Variables and .Skipped together
+$v = Read-CredValue acme-api/ssl-key            # .Bytes with .Kind and .IsBinary
 ```
 
 ---
@@ -164,7 +170,9 @@ $key  = Get-Cred acme-api/stripe -AsSecureString
 | --- | --- |
 | `cred init [name]` | Create `.creds/` here and register the project |
 | `cred add <p>/<k>` | Add or replace a credential (prompts, no echo) |
+| `cred add <p>/<k> --file <path>` | Store a file's exact bytes (key, certificate) |
 | `cred get <p>/<k>` | Print one secret |
+| `cred get <p>/<k> --out <path>` | Write it back out as a file |
 | `cred list [p]` | Credential names and descriptions, no decryption |
 | `cred exec <p> -- …` | Run a command with the secrets injected |
 | `cred rm <p>/<k>` | Delete a credential |
@@ -226,14 +234,14 @@ The rest, and why not:
 | | Verdict |
 | --- | --- |
 | **sops** | Genuinely excellent, and the closest competitor — per-value encryption means readable diffs. But it is a much larger dependency whose real strength is cloud KMS integration we do not need, and it would still need age or gpg underneath. Complexity without a matching payoff here. |
-| **gpg** | Installed on this machine, and shipped as a provider for people already invested in it. But the keyring, agent, pinentry and trust model are a large surface that fails in confusing ways, key handling differs meaningfully across platforms, and its output is not reproducible. age exists precisely because of this. |
+| **gpg** | Shipped as a second provider for a while, for people already invested in it, then removed as unused. The keyring, agent, pinentry and trust model are a large surface that fails in confusing ways, key handling differs meaningfully across platforms, and its output is not reproducible. age exists precisely because of this. |
 | **DPAPI** | Disqualified. It is machine- and account-bound, so the encrypted file cannot travel with the code — which is the entire requirement — and it does not exist off Windows, so there is no Linux port at all. |
 | **raw OpenSSL** | Disqualified for the default. Using it correctly means choosing a KDF, an AEAD mode, a nonce policy and a versioned file format by hand: writing a crypto format rather than using one. Fine as a provider someone adds later; wrong as the thing your passwords depend on. |
 
 Crypto is behind a provider interface (see `src/Cred/Private/Providers.ps1`), so
-swapping backends touches one file. `age` and `gpg` both ship; the contract is
-documented in `Register-CredProvider`'s help and exercised by a test that
-registers a fake backend.
+swapping backends touches one file. `age` is the only provider that ships; the
+contract is documented in `Register-CredProvider`'s help and exercised by a test
+that registers a fake backend.
 
 Full reasoning, and what a Linux port actually requires, in
 [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -250,7 +258,7 @@ Alongside it, the `Cred` **PowerShell module** exists for the one job a CLI
 cannot do: handing a live `PSCredential` or hashtable to a PowerShell script.
 
 ```powershell
-Import-Module C:\tools\creds-helper\src\Cred\Cred.psd1
+Import-Module C:\tools\cred\src\Cred\Cred.psd1
 $cred = Get-CredCredential acme-api/db
 Invoke-Sqlcmd -ServerInstance db01 -Credential $cred
 ```
@@ -265,6 +273,46 @@ Why Python is the default: it is the runtime most likely to already be present
 on a Linux box or in a container, it starts faster than pwsh, and it keeps the
 CLI to one implementation rather than two that have to agree. PowerShell stays
 where it is genuinely better -- native objects inside PowerShell scripts.
+
+## Files: private keys and certificates
+
+A TLS private key is a credential like any other, but it is a *file*, and the
+things that consume it — openssl, nginx, curl — want bytes, not a string.
+
+```powershell
+cred add acme-api/ssl-key --file .\server.key --desc "TLS private key"
+cred get acme-api/ssl-key --out D:\tmp\server.key
+```
+
+The import is byte-exact: no newline stripping, no line-ending translation, and
+binary (`.pfx`, `.p12`, DER) is stored base64 so it survives the JSON store.
+What came in is what comes out — there is a test that drives this through both
+the Python and PowerShell implementations in each direction.
+
+`config.json` records the type and the original filename, so the readable half
+of the store still says what exists:
+
+```json
+"ssl-key": { "type": "file", "env": {}, "filename": "server.key",
+             "description": "TLS private key" }
+```
+
+Two deliberate limits:
+
+- **`cred exec` does not inject file credentials.** A PEM is not usable as an
+  environment variable, and `export SSL_KEY=-----BEGIN…` breaks the shell it is
+  pasted into. `cred exec` and `cred env` say which ones they skipped.
+- **`--out` is the one place cred writes plaintext to disk.** It creates the
+  file readable only by you, refuses to overwrite without `--force`, and tells
+  you what it did. Delete it when the tool that needed it is done. Everything
+  else in cred still keeps plaintext off disk.
+
+Keep files small. The whole store is re-encrypted on every write, so a large
+file is paid for again on every unrelated `cred add`; anything over 1 MiB needs
+`--force` and probably belongs somewhere else.
+
+In PowerShell the same two operations are `Set-Cred -File` and
+`Export-CredFile`.
 
 ## Protecting the key itself
 
@@ -343,9 +391,11 @@ which puts the value straight into the transcript. See
 
 What this does guarantee:
 
-- Plaintext is never written to disk. Encryption and decryption stream over
-  pipes to and from the backend process; even the temp file used for atomic
-  writes only ever holds ciphertext.
+- Plaintext is never written to disk unless you ask for it in so many words.
+  Encryption and decryption stream over pipes to and from the backend process;
+  even the temp file used for atomic writes only ever holds ciphertext. The two
+  exceptions are explicit and named: `cred get --out` and `cred export`, both of
+  which create the file readable only by you and tell you what they did.
 - Secrets are never passed as command-line arguments, so they cannot be read out
   of the process list.
 - `cred get` writes to the raw console handle, so `Start-Transcript` does not
@@ -386,23 +436,22 @@ What it does not:
   change
 - [age](https://age-encrypted.org) 1.2+ — `winget install FiloSottile.age`,
   `brew install age`, `apt install age`
-- Optional: GnuPG, if you would rather use the `gpg` provider
 
 ## Installing
 
 ```powershell
-git clone <this repo> C:\tools\creds-helper
-$env:PATH += ";C:\tools\creds-helper\bin"   # cred (Python), cred-ps (PowerShell)
+git clone <this repo> C:\tools\cred
+$env:PATH += ";C:\tools\cred\bin"   # cred (Python), cred-ps (PowerShell)
 
 # For native PSCredential / hashtable objects inside PowerShell scripts:
-Import-Module C:\tools\creds-helper\src\Cred\Cred.psd1
+Import-Module C:\tools\cred\src\Cred\Cred.psd1
 ```
 
 Make the PATH change permanent:
 
 ```powershell
 [Environment]::SetEnvironmentVariable('PATH',
-    [Environment]::GetEnvironmentVariable('PATH','User') + ';C:\tools\creds-helper\bin', 'User')
+    [Environment]::GetEnvironmentVariable('PATH','User') + ';C:\tools\cred\bin', 'User')
 ```
 
 ## Testing

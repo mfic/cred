@@ -1,0 +1,81 @@
+{
+  "blob": {
+    "bytes_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==",
+    "display": "file: cert.der",
+    "env": {},
+    "filename": "cert.der",
+    "is_binary": true,
+    "kind": "file"
+  },
+  "custom": {
+    "bytes_b64": "Y3VzdG9tLXB3",
+    "display": "MY_LOGIN, MY_PASS",
+    "env": {
+      "MY_LOGIN": "carol",
+      "MY_PASS": "custom-pw"
+    },
+    "filename": "",
+    "is_binary": false,
+    "kind": "userpass"
+  },
+  "db": {
+    "bytes_b64": "cEBzcyB3LyBzcGFjZXM=",
+    "display": "DB_USER, DB_PASSWORD",
+    "env": {
+      "DB_PASSWORD": "p@ss w/ spaces",
+      "DB_USER": "svc"
+    },
+    "filename": "",
+    "is_binary": false,
+    "kind": "userpass"
+  },
+  "dotted.key": {
+    "bytes_b64": "ZG90dGVkLXZhbHVl",
+    "display": "DOTTED_KEY",
+    "env": {
+      "DOTTED_KEY": "dotted-value"
+    },
+    "filename": "",
+    "is_binary": false,
+    "kind": "secret"
+  },
+  "half-declared": {
+    "bytes_b64": "aGFsZi1wdw==",
+    "display": "HALF_DECLARED_USER, HALF_DECLARED_PASSWORD",
+    "env": {
+      "HALF_DECLARED_PASSWORD": "half-pw",
+      "HALF_DECLARED_USER": "dave"
+    },
+    "filename": "",
+    "is_binary": false,
+    "kind": "userpass"
+  },
+  "notes": {
+    "bytes_b64": "bGluZSBvbmUKendlaXRlIFplaWxlIG1pdCBVbWxhdXRlbjogw6TDtsO8CnRoaXJkIGxpbmUJdGFiYmVkCg==",
+    "display": "file: notes.txt",
+    "env": {},
+    "filename": "notes.txt",
+    "is_binary": false,
+    "kind": "file"
+  },
+  "token": {
+    "bytes_b64": "dG9rLcOkw7bDvC3wn5SR",
+    "display": "TOKEN",
+    "env": {
+      "TOKEN": "tok-äöü-🔑"
+    },
+    "filename": "",
+    "is_binary": false,
+    "kind": "secret"
+  },
+  "undeclared": {
+    "bytes_b64": "bm8tZGVjbGFyYXRpb24taGVyZQ==",
+    "display": "UNDECLARED",
+    "env": {
+      "UNDECLARED": "no-declaration-here"
+    },
+    "filename": "",
+    "is_binary": false,
+    "kind": "secret"
+  }
+}

@@ -181,7 +181,6 @@ Check                Status  Detail                                   Fix
 -------------------  ------  ---------------------------------------  ---
 python               Ok      3.14.0 (win32)
 provider:age         Ok      age and age-keygen found.
-provider:gpg         Ok      gpg found.
 identity             Ok      ...cred\identity.txt
 identity protection  Ok      file-permissions
 project              Ok      acme-api at C:\work\acme-api
