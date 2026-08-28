@@ -33,9 +33,17 @@ function Invoke-CredCommand {
         [switch]$PassThru
     )
 
-    $ctx    = Resolve-CredProject -Name $Project -Path $Path
-    $secrets = Get-CredEnvironment -Project $ctx.Name -Path $ctx.Root `
-                                   -Only $Only -Exclude $Exclude -Prefix $Prefix
+    # One decryption gives both the variables and the file credentials left
+    # out of them, so saying what was skipped costs nothing extra.
+    $store = Open-CredStore -Project $Project -Path $Path
+    $ctx   = $store.Context
+    $projected = Get-CredStoreEnvironment -Store $store -Only $Only -Exclude $Exclude -Prefix $Prefix
+    $secrets   = $projected.Variables
+    if ($projected.Skipped.Count -gt 0) {
+        [Console]::Error.WriteLine(
+            "Not injected (file credentials): $($projected.Skipped -join ', '). " +
+            "Read one with: cred get $($ctx.Name)/$($projected.Skipped[0]) --out <path>")
+    }
 
     # Start from this process's environment so the child still sees PATH etc.
     $envTable = @{}

@@ -30,8 +30,13 @@ function Protect-CredIdentity {
     param(
         [string]$Path,
         [string]$Backup,
-        [switch]$Force
+        [switch]$Force,
+        # Which backend's key. Only providers whose key is a file cred manages
+        # can be wrapped; gpg keeps its own keyring and is refused by name.
+        [string]$Provider = 'age'
     )
+
+    $null = Assert-CredKeystoreSupported -ProviderName $Provider
 
     if (-not (Test-CredKeystoreAvailable)) {
         throw (New-CredErrorRecord -Code 'ProviderMissing' `
@@ -40,7 +45,7 @@ function Protect-CredIdentity {
                     "Elsewhere, protect the key file itself with a passphrase: age -p identity.txt"))
     }
 
-    if (-not $Path) { $Path = Get-CredAgeIdentityPath -Config $null }
+    if (-not $Path) { $Path = Get-CredIdentityPath -Config $null -ProviderName $Provider }
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw (New-CredErrorRecord -Code 'NoIdentity' -Target $Path `
@@ -106,9 +111,10 @@ function Unprotect-CredIdentity {
     #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     [OutputType([pscustomobject])]
-    param([string]$Path)
+    param([string]$Path, [string]$Provider = 'age')
 
-    if (-not $Path) { $Path = Get-CredAgeIdentityPath -Config $null }
+    $null = Assert-CredKeystoreSupported -ProviderName $Provider
+    if (-not $Path) { $Path = Get-CredIdentityPath -Config $null -ProviderName $Provider }
 
     if (-not (Test-CredIdentityIsWrapped -Path $Path)) {
         Write-Verbose "'$Path' is not wrapped."
@@ -138,9 +144,9 @@ function Get-CredIdentityInfo {
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
-    param([string]$Path)
+    param([string]$Path, [string]$Provider = 'age')
 
-    if (-not $Path) { $Path = Get-CredAgeIdentityPath -Config $null }
+    if (-not $Path) { $Path = Get-CredIdentityPath -Config $null -ProviderName $Provider }
     $exists  = Test-Path -LiteralPath $Path -PathType Leaf
     $wrapped = $exists -and (Test-CredIdentityIsWrapped -Path $Path)
 
@@ -150,6 +156,6 @@ function Get-CredIdentityInfo {
         Protection       = if ($wrapped) { (ConvertFrom-CredJson (Get-CredFileText -Path $Path)).protection } else { 'file-permissions' }
         Private          = if ($exists) { Test-CredPathIsPrivate -Path $Path } else { $false }
         KeystoreAvailable = (Test-CredKeystoreAvailable)
-        Recipient        = if ($exists) { try { & (Get-CredProviderInternal -Name 'age').GetRecipient $null } catch { $null } } else { $null }
+        Recipient        = if ($exists) { try { & (Get-CredProviderInternal -Name $Provider).GetRecipient $null } catch { $null } } else { $null }
     }
 }

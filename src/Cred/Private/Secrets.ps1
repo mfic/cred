@@ -107,23 +107,10 @@ function Resolve-CredSecretInput {
     return $plain
 }
 
-function Write-CredSecretToStdout {
-    <#
-        .SYNOPSIS
-        Emit a secret to the real stdout handle.
+# Writing a secret to the real stdout handle is a CLI concern, and the CLI does
+# it in Write-CredSecret (bin/cred-ps.ps1). A second copy lived here with no
+# caller; a dead function that mirrors live code is a trap for the next reader.
 
-        Deliberately NOT Write-Output: the PowerShell pipeline is captured by
-        Start-Transcript and by the host's output history, so a secret written
-        through it ends up in a transcript file. [Console]::Out is the raw
-        handle and bypasses both, while still piping and redirecting normally.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][AllowEmptyString()][string]$Value,
-        [switch]$NoNewline
-    )
-
-    if ($NoNewline) { [Console]::Out.Write($Value) }
-    else            { [Console]::Out.Write($Value + [Environment]::NewLine) }
-    [Console]::Out.Flush()
-}
+# Everything about what a credential entry IS -- its kind, its exact bytes, the
+# environment variables it becomes, the file it came from -- now lives in
+# Private/Entry.ps1. This file is about turning input into a secret and back.

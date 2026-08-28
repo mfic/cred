@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "project": "gpg-default",
+  "provider": "gpg",
+  "recipients": [],
+  "credentials": {}
+}

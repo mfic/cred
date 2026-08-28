@@ -40,13 +40,20 @@ function Get-CredList {
 
     foreach ($key in ($keys | Sort-Object)) {
         $def = if ($defs.Contains($key)) { $defs[$key] } else { $null }
-        $envNames = if ($def -and $def.env) { @($def.env.Values) } else { @() }
+
+        # Ask the entry what it is rather than reading 'type' off the
+        # declaration. Without a decrypted store there is no entry to ask, so
+        # an empty one still lets the definition speak for itself -- and when
+        # -Verify gave us the real entry, the store wins over a config.json
+        # that has fallen behind it.
+        $entry = if ($values -and $values.Contains($key)) { $values[$key] } else { [ordered]@{} }
+        $view  = Resolve-CredEntry -Key $key -Entry $entry -Definition $def
 
         $row = [ordered]@{
             Project     = $ctx.Name
             Key         = $key
-            Type        = if ($def) { $def.type } else { 'secret' }
-            Environment = ($envNames -join ', ')
+            Type        = $view.Kind
+            Environment = $view.Display
             Description = if ($def -and $def.description) { $def.description } else { '' }
         }
         if ($Verify) {

@@ -45,12 +45,16 @@ COMMANDS
       --user <name>                Make it a username/password pair
       --value <secret>             Non-interactive (leaks to shell history)
       --stdin                      Read the value from stdin
+      --file <path>                Store a file's exact bytes (PEM, cert, key)
+      --filename <name>            Record a different name than the source
       --env <NAME>                 Environment variable name to map it to
       --desc <text>                What it is for
 
   get <project>/<key>              Print a secret
       --field <secret|user>        Which half of a userpass pair
       -n, --no-newline             Omit the trailing newline
+      --out <path>                 Write to a file instead of stdout
+      --force                      Allow --out to overwrite
 
   list [project]                   Show credential names (never values)
       --json                       Machine-readable
@@ -125,11 +129,14 @@ def read_options(argv: List[str], switches=(), short=None):
     while i < len(argv):
         a = argv[i]
         if a.startswith("--") and len(a) > 2:
-            name, _, inline = a[2:].partition("=")
+            name, eq, inline = a[2:].partition("=")
             name = name.lower()
             if name in switches:
                 opts[name] = True
-            elif inline:
+            elif eq:
+                # An explicit '=' means the value is whatever follows it, even
+                # the empty string. Testing `inline` instead made `--prefix=`
+                # a flag here and an empty prefix in the PowerShell peer.
                 opts[name] = inline
             elif i + 1 < len(argv) and not argv[i + 1].startswith("--"):
                 opts[name] = argv[i + 1]
@@ -155,6 +162,11 @@ def read_options(argv: List[str], switches=(), short=None):
 
 def out(text: str = "") -> None:
     sys.stdout.write(text + "\n")
+
+
+def note(text: str) -> None:
+    """An aside for the human, on stderr so it cannot pollute a pipe."""
+    sys.stderr.write(text + "\n")
 
 
 def write_secret(value: str, newline: bool = True) -> None:
@@ -232,10 +244,12 @@ def cmd_init(rest: List[str]) -> int:
     recipients = ([r.strip() for r in str(opts["recipient"]).split(",")]
                   if opts.get("recipient") else None)
     if not recipients:
-        if provider_name == "age":
-            ident = cs.identity_path(None)
+        # Was `if provider_name == "age"`. A provider that keeps its own keys
+        # (gpg) returns no path and is simply skipped.
+        if prov.get("supports_keystore") or prov["identity_path"](None):
+            ident = cs.provider_identity_path(None, provider_name)
             if not ident.is_file():
-                cs.age_new_identity(ident)
+                prov["new_identity"](ident)
         recipients = [prov["recipient"](None)]
 
     (root / cs.CREDS_DIR).mkdir(parents=True, exist_ok=True)
@@ -263,8 +277,34 @@ def cmd_init(rest: List[str]) -> int:
     return cs.EXIT_OK
 
 
+def read_import_file(spec: str, force: bool) -> bytes:
+    """The exact bytes of a file being imported as a credential."""
+    path = Path(spec).expanduser()
+    if not path.is_file():
+        raise cs.CredError(
+            f"There is no file at '{path}'.",
+            ["Check the path. --file takes the file to import, not its content."],
+            cs.EXIT_NOT_FOUND)
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise cs.CredError(f"Could not read '{path}': {exc}",
+                           ["Check that you have permission to read it."],
+                           cs.EXIT_GENERAL)
+    if len(data) > cs.MAX_FILE_BYTES and not force:
+        raise cs.CredError(
+            f"'{path.name}' is {len(data) // 1024} KiB; the limit is "
+            f"{cs.MAX_FILE_BYTES // 1024} KiB.",
+            ["The whole store is re-encrypted on every write, so a large file "
+             "is paid for again on every unrelated 'cred add'.",
+             "Keys and certificates are kilobytes. If this really belongs "
+             "here: cred add ... --file <path> --force"],
+            cs.EXIT_USAGE)
+    return data
+
+
 def cmd_add(rest: List[str]) -> int:
-    opts, pos = read_options(rest, switches=("stdin", "allow-empty"))
+    opts, pos = read_options(rest, switches=("stdin", "allow-empty", "force"))
     if not pos:
         raise cs.CredError("cred add <project>/<key> [--user <name>]",
                            ["Run 'cred help' for the full surface."], cs.EXIT_USAGE)
@@ -277,8 +317,25 @@ def cmd_add(rest: List[str]) -> int:
 
     project = cs.resolve_project(opts.get("project") or proj_ref, opts.get("path"))
     user = opts.get("user")
+    file_spec = opts.get("file")
+    is_file = file_spec is not None and file_spec is not True
 
-    if opts.get("stdin"):
+    if is_file and user:
+        raise cs.CredError(
+            "--file and --user cannot be combined.",
+            ["A file credential is one blob of content; it has no username.",
+             "If you need both, store them as two credentials."],
+            cs.EXIT_USAGE)
+
+    encoding: Optional[str] = None
+    filename = ""
+    if is_file:
+        data = read_import_file(str(file_spec), bool(opts.get("force")))
+        # Byte-exact: no newline stripping, no line-ending translation. A PEM
+        # that round-trips through `cred get --out` must be the same file.
+        secret, encoding = cs.encode_file_content(data)
+        filename = str(opts.get("filename") or Path(str(file_spec)).name)
+    elif opts.get("stdin"):
         secret = read_stdin_secret()
     elif opts.get("value") is not None and opts.get("value") is not True:
         secret = str(opts["value"])
@@ -290,20 +347,26 @@ def cmd_add(rest: List[str]) -> int:
         secret = prompt_secret(label)
 
     if not secret and not opts.get("allow-empty"):
-        raise cs.CredError("An empty value was given.",
-                           ["Provide a value, or pass --allow-empty."],
-                           cs.EXIT_USAGE)
+        raise cs.CredError(
+            "The file is empty." if is_file else "An empty value was given.",
+            ["Provide a value, or pass --allow-empty."],
+            cs.EXIT_USAGE)
 
     created = {"v": False}
 
     def mutate(values, proj):
         existing = values.get(key)
         created["v"] = existing is None
-        kind = "userpass" if (user or (existing and "user" in existing)) else "secret"
+        if is_file:
+            kind = "file"
+        else:
+            kind = "userpass" if (user or (existing and "user" in existing)) else "secret"
         entry: Dict[str, str] = {}
         if kind == "userpass":
             entry["user"] = user or (existing or {}).get("user", "")
         entry["secret"] = secret
+        if encoding:
+            entry["encoding"] = encoding
         values[key] = entry
 
         defs = proj.config.setdefault("credentials", {})
@@ -313,21 +376,34 @@ def cmd_add(rest: List[str]) -> int:
             defs[key] = d
         d["type"] = kind
         d.setdefault("env", cs.default_env_names(key, kind))
-        if kind == "userpass" and "user" not in d["env"]:
-            d["env"]["user"] = cs.default_env_names(key, kind)["user"]
+        if kind == "file":
+            # A file has no environment representation, and the leftovers of a
+            # previous type would be a lie in a committed, readable file.
+            d["env"] = {}
+            d["filename"] = filename
+        else:
+            d.pop("filename", None)
+            if kind == "userpass" and "user" not in d["env"]:
+                d["env"]["user"] = cs.default_env_names(key, kind)["user"]
+            if opts.get("env"):
+                d["env"]["secret"] = str(opts["env"])
         if opts.get("desc"):
             d["description"] = str(opts["desc"])
-        if opts.get("env"):
-            d["env"]["secret"] = str(opts["env"])
 
     cs.update_store(project, mutate)
     kind = project.config["credentials"][key]["type"]
     out(f"{'Added' if created['v'] else 'Updated'} {project.name}/{key} ({kind})")
+    if is_file:
+        detail = "base64" if encoding else "text"
+        out(f"  {filename}, {len(data)} bytes, stored as {detail}")
+        out(f"  Not injected by 'cred exec'. Read it back with: "
+            f"cred get {project.name}/{key} --out <path>")
     return cs.EXIT_OK
 
 
 def cmd_get(rest: List[str]) -> int:
-    opts, pos = read_options(rest, switches=("no-newline",), short={"n": "no-newline"})
+    opts, pos = read_options(rest, switches=("no-newline", "force"),
+                             short={"n": "no-newline"})
     if not pos:
         raise cs.CredError("cred get <project>/<key>", [], cs.EXIT_USAGE)
 
@@ -336,16 +412,64 @@ def cmd_get(rest: List[str]) -> int:
     values = cs.read_values(project)
     entry = cs.entry_or_raise(project, key, values)
 
+    defs = project.config.get("credentials") or {}
+    view = cs.resolve_entry(key, entry, defs.get(key))
     field = str(opts.get("field") or "secret")
-    if field not in entry:
-        kind = (project.config.get("credentials", {}).get(key) or {}).get("type", "secret")
+    out_spec = opts.get("out")
+
+    if out_spec is not None and out_spec is not True:
+        return write_credential_to_file(project, view, str(out_spec),
+                                        bool(opts.get("force")), field)
+
+    if view["kind"] == "file":
+        # Exact bytes, and no trailing newline of ours: `cred get x > k.pem`
+        # must produce the file that went in.
+        if view["is_binary"] and sys.stdout.isatty():
+            raise cs.CredError(
+                f"'{project.name}/{key}' holds binary content.",
+                ["Writing it to a terminal would corrupt it.",
+                 f"Write it to a file: cred get {project.name}/{key} "
+                 f"--out <path>"],
+                cs.EXIT_USAGE)
+        sys.stdout.buffer.write(cs.entry_bytes(view, field, project.name))
+        sys.stdout.buffer.flush()
+        return cs.EXIT_OK
+
+    if field not in view["fields"]:
         raise cs.CredError(
             f"'{project.name}/{key}' has no '{field}' field.",
-            [f"It is a '{kind}' credential with: {', '.join(entry)}",
+            [f"It is a '{view['kind']}' credential with: "
+             f"{', '.join(view['fields'])}",
              f"To give it a username: cred add {project.name}/{key} --user <name>"],
             cs.EXIT_NOT_FOUND)
 
-    write_secret(str(entry[field]), newline=not opts.get("no-newline"))
+    write_secret(str(view["fields"][field]), newline=not opts.get("no-newline"))
+    return cs.EXIT_OK
+
+
+def write_credential_to_file(project, view: Dict[str, Any], spec: str,
+                             force: bool, field: str = "secret") -> int:
+    """`cred get --out` -- the only path that deliberately writes plaintext.
+
+    It exists because a private key is useless to openssl or nginx as a string
+    on stdout. Everything else in cred keeps plaintext off disk; this says so
+    out loud rather than doing it quietly.
+    """
+    key = view["key"]
+    target = Path(spec).expanduser()
+    if target.is_dir():
+        target = target / (view["filename"] or key)
+    if target.exists() and not force:
+        raise cs.CredError(
+            f"'{target}' already exists.",
+            ["Overwriting a key file is not something to do by accident.",
+             "Pass --force if that is what you mean."],
+            cs.EXIT_USAGE)
+
+    data = cs.entry_bytes(view, field, project.name)
+    cs.write_private_file(target, data)
+    out(f"Wrote {target} ({len(data)} bytes), readable only by you.")
+    out("This is plaintext on disk. Delete it when you are done.")
     return cs.EXIT_OK
 
 
@@ -360,9 +484,14 @@ def cmd_list(rest: List[str]) -> int:
     rows = []
     for k in keys:
         d = defs.get(k) or {}
+        # Ask the entry what it is rather than reading 'type' off the
+        # declaration. Without --verify there is no entry to ask, so an empty
+        # one still lets the definition speak for itself; with --verify the
+        # store wins over a config.json that has fallen behind it.
+        view = cs.resolve_entry(k, (values or {}).get(k) or {}, d)
         row = {"Project": project.name, "Key": k,
-               "Type": d.get("type", "secret"),
-               "Environment": ", ".join(str(v) for v in (d.get("env") or {}).values()),
+               "Type": view["kind"],
+               "Environment": view["display"],
                "Description": d.get("description", "")}
         if values is not None:
             row["HasValue"] = bool(values.get(k, {}).get("secret"))
@@ -403,8 +532,11 @@ def cmd_exec(rest: List[str], tail: List[str]) -> int:
                  f"Add one with: cred add {project.name}/{missing[0]}"],
                 cs.EXIT_NOT_FOUND)
 
-    secrets = cs.build_environment(project, only, exclude,
-                                   str(opts.get("prefix") or ""))
+    secrets, skipped = cs.environment_and_skipped(
+        project, only, exclude, str(opts.get("prefix") or ""))
+    if skipped:
+        note(f"Not injected (file credentials): {', '.join(skipped)}. "
+             f"Read one with: cred get {project.name}/{skipped[0]} --out <path>")
     env = dict(os.environ)
     env.update(secrets)
     env["CRED_PROJECT"] = project.name
@@ -464,8 +596,11 @@ def cmd_env(rest: List[str]) -> int:
                                  opts.get("path"))
     only = [s.strip() for s in str(opts["only"]).split(",")] if opts.get("only") else None
     exclude = [s.strip() for s in str(opts["except"]).split(",")] if opts.get("except") else None
-    values = cs.build_environment(project, only, exclude,
-                                  str(opts.get("prefix") or ""))
+    values, skipped = cs.environment_and_skipped(
+        project, only, exclude, str(opts.get("prefix") or ""))
+    if skipped:
+        note(f"Not shown (file credentials): {', '.join(skipped)}. "
+             f"Read one with: cred get {project.name}/{skipped[0]} --out <path>")
 
     fmt = str(opts.get("format") or "posix")
     posix_quote = "'" + chr(92) + "''"
@@ -527,7 +662,7 @@ def cmd_recipients(rest: List[str]) -> int:
     project = cs.resolve_project(pos[0] if pos else opts.get("project"),
                                  opts.get("path"))
     try:
-        mine = cs.age_recipient(project.config)
+        mine = cs.provider_for(project.config)["recipient"](project.config)
     except cs.CredError:
         mine = None
     rows = [{"Recipient": r, "IsMe": str(r == mine)}
@@ -538,15 +673,17 @@ def cmd_recipients(rest: List[str]) -> int:
 
 def cmd_keygen(rest: List[str]) -> int:
     opts, _ = read_options(rest, switches=("show", "force"))
-    path = Path(opts["path"]) if opts.get("path") else cs.identity_path(None)
+    prov = cs.provider_for(None, opts.get("provider") or None)
+    path = (Path(opts["path"]) if opts.get("path")
+            else cs.provider_identity_path(None, prov["name"]))
 
     if opts.get("show"):
-        write_secret(cs.age_recipient(None))
+        write_secret(prov["recipient"](None))
         return cs.EXIT_OK
 
     if path.is_file() and not opts.get("force"):
         out(f"Key already exists at {path}")
-        out(f"Public key: {cs.age_recipient(None)}")
+        out(f"Public key: {prov['recipient'](None)}")
         return cs.EXIT_OK
 
     if path.is_file() and opts.get("force"):
@@ -557,7 +694,7 @@ def cmd_keygen(rest: List[str]) -> int:
         cs.restrict_path(backup)
         out(f"Existing key moved to {backup}")
 
-    created, pub = cs.age_new_identity(path)
+    created, pub = prov["new_identity"](path)
     out(f"Created a new key at {created}")
     out(f"Public key: {pub}")
     out("")
@@ -568,7 +705,11 @@ def cmd_keygen(rest: List[str]) -> int:
 def cmd_key(rest: List[str]) -> int:
     sub = rest[0].lower() if rest else ""
     opts, _ = read_options(rest[1:] if rest else [], switches=("force",))
-    path = cs.identity_path(None)
+    # Wrapping is meaningless for a provider that keeps its own keyring, and
+    # silently wrapping age's key for a gpg project would be worse than a
+    # refusal.
+    prov = cs.assert_keystore_supported(None, opts.get("provider") or None)
+    path = cs.provider_identity_path(None, prov["name"])
 
     if sub == "protect":
         return _key_protect(path, opts)
@@ -582,7 +723,7 @@ def cmd_key(rest: List[str]) -> int:
     out(f"keystore    {'available' if cs.keystore_available() else 'not available on this platform'}")
     if path.is_file():
         try:
-            out(f"public key  {cs.age_recipient(None)}")
+            out(f"public key  {prov['recipient'](None)}")
         except cs.CredError:
             pass
     return cs.EXIT_OK
@@ -702,13 +843,18 @@ def cmd_doctor(rest: List[str]) -> int:
     home = cs.cred_home()
     row("cred home", "Ok" if home.is_dir() else "Warn", str(home), "Run: cred init")
 
-    ident = cs.identity_path(None)
-    if ident.is_file():
-        row("identity", "Ok", str(ident))
-        row("identity protection", "Ok",
-            "dpapi-currentuser" if cs.identity_is_wrapped(ident) else "file-permissions")
-    else:
-        row("identity", "Warn", f"No key at '{ident}'.", "Run: cred keygen")
+    try:
+        ident = cs.provider_identity_path(None)
+        if ident.is_file():
+            row("identity", "Ok", str(ident))
+            row("identity protection", "Ok",
+                "dpapi-currentuser" if cs.identity_is_wrapped(ident)
+                else "file-permissions")
+        else:
+            row("identity", "Warn", f"No key at '{ident}'.", "Run: cred keygen")
+    except cs.CredError:
+        # A provider that keeps its own keyring has no key file to report on.
+        row("identity", "Ok", "held by the provider, not by cred")
 
     try:
         project = cs.resolve_project(pos[0] if pos else opts.get("project"),
@@ -731,7 +877,7 @@ def cmd_doctor(rest: List[str]) -> int:
             f"Run: cred add {project.name}/<key>")
 
     try:
-        mine = cs.age_recipient(project.config)
+        mine = cs.provider_for(project.config)["recipient"](project.config)
     except cs.CredError:
         mine = None
     recipients = project.config.get("recipients") or []
@@ -818,9 +964,15 @@ def build_agent_brief(project) -> str:
         lines.append("| --- | --- | --- | --- |")
         for key in sorted(defs):
             d = defs[key]
-            env = ", ".join(str(v) for v in (d.get("env") or {}).values())
-            lines.append(f"| `{project.name}/{key}` | {d.get('type', 'secret')} "
-                         f"| `{env}` | {d.get('description', '')} |")
+            view = cs.resolve_entry(key, {}, d)
+            if view["kind"] == "file":
+                env = f"none — file `{view['filename'] or key}`"
+            else:
+                env = "`" + ", ".join(view["env_names"].values()) + "`"
+            lines.append(f"| `{project.name}/{key}` | {view['kind']} "
+                         f"| {env} | {d.get('description', '')} |")
+    has_files = any(cs.resolve_entry(k, {}, d or {})["kind"] == "file"
+                    for k, d in defs.items())
     lines += [
         "",
         "**Preferred — run a command with the secrets injected.** The value "
@@ -843,6 +995,23 @@ def build_agent_brief(project) -> str:
         f"cred list {project.name}",
         "```",
         "",
+    ]
+    if has_files:
+        lines += [
+            "**File credentials** (private keys, certificates) are not injected "
+            "by `cred exec`, because their content is not usable as an "
+            "environment variable. When a command genuinely needs one as a "
+            "file on disk:",
+            "",
+            "```",
+            f"cred get {project.name}/<key> --out <path>",
+            "```",
+            "",
+            "That writes plaintext to disk. Only do it when a tool requires a "
+            "path, tell the user you did, and delete the file afterwards.",
+            "",
+        ]
+    lines += [
         "If `cred` reports that it cannot decrypt, stop and tell the user: their "
         "key is missing or is not a recipient. Do not attempt to work around it.",
         "",
@@ -986,14 +1155,22 @@ def cmd_export(rest: List[str]) -> int:
             return cs.EXIT_OK
 
     values = cs.read_values(project)
+    defs = project.config.get("credentials") or {}
     rows = []
     for key in sorted(values):
         if only and key not in only:
             continue
-        entry = values[key]
-        user = entry.get("user") or key
+        view = cs.resolve_entry(key, values[key], defs.get(key))
+        # A file credential has no PSCredential shape, so it goes back out as
+        # the file it came in as -- which is what anyone exporting one wants.
+        if view["kind"] == "file":
+            target = dest / (view["filename"] or key)
+            cs.write_private_file(target, cs.entry_bytes(view, project_name=project.name))
+            rows.append({"Key": key, "UserName": "-", "File": str(target)})
+            continue
+        user = view["fields"].get("user") or key
         target = dest / f"{key}.cred.xml"
-        cs.write_clixml_credential(target, user, str(entry["secret"]))
+        cs.write_clixml_credential(target, user, str(view["fields"]["secret"]))
         rows.append({"Key": key, "UserName": user, "File": str(target)})
 
     table(rows, ["Key", "UserName", "File"])

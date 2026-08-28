@@ -19,11 +19,14 @@ function Get-Cred {
         Invoke-RestMethod $url -Headers @{ Authorization = "Bearer $(Get-Cred acme-api/gh)" }
     #>
     [CmdletBinding()]
-    [OutputType([string], [System.Security.SecureString])]
+    [OutputType([string], [System.Security.SecureString], [byte[]])]
     param(
         [Parameter(Mandatory, Position = 0)][string]$Name,
         [ValidateSet('secret', 'user')][string]$Field = 'secret',
         [switch]$AsSecureString,
+        # Exact bytes rather than a [string]. This is how a file credential is
+        # read without a lossy trip through text, and it is what the CLI uses.
+        [switch]$AsBytes,
         [string]$Project,
         [string]$Path
     )
@@ -32,50 +35,38 @@ function Get-Cred {
     $key = $ref.Key
     if ($ref.Project -and -not $Project) { $Project = $ref.Project }
 
-    $ctx    = Resolve-CredProject -Name $Project -Path $Path
-    $values = Read-CredStoreValues -Project $ctx
-    $entry  = Get-CredEntryOrThrow -Project $ctx -Key $key -Values $values
+    # One decryption, already resolved. A caller who needs the kind as well as
+    # the value calls Open-CredStore rather than passing a [ref] in here.
+    $store = Open-CredStore -Project $Project -Path $Path
+    $ctx   = $store.Context
+    $null  = Get-CredEntryOrThrow -Project $ctx -Key $key -Values $store.Values
+    $view  = $store.Entries[$key]
 
-    if (-not $entry.Contains($Field)) {
-        $type = if ($ctx.Config.credentials.Contains($key)) { $ctx.Config.credentials[$key].type } else { 'secret' }
+    # Exact bytes are the same question for every kind, so they are one call.
+    if ($AsBytes) { return (Get-CredEntryBytes -Projection $view -Field $Field -ProjectName $ctx.Name) }
+
+    if ($view.Kind -eq 'file') {
+        # Binary has no faithful [string] form; handing back a mangled one
+        # would look like it worked.
+        if ($view.IsBinary) {
+            throw (New-CredErrorRecord -Code 'Usage' -Category InvalidArgument -Target $key `
+                -Message "'$($ctx.Name)/$key' holds binary content, which is not a string." `
+                -Next @("Write it to a file: Export-CredFile $($ctx.Name)/$key -OutFile <path>",
+                        "Or from the CLI:    cred get $($ctx.Name)/$key --out <path>"))
+        }
+        $text = [string]$view.Fields['secret']
+        if ($AsSecureString) { return (ConvertTo-CredSecureString -PlainText $text) }
+        return $text
+    }
+
+    if (-not $view.Fields.Contains($Field)) {
         throw (New-CredErrorRecord -Code 'NoCredential' -Category ObjectNotFound -Target $Field `
             -Message "'$($ctx.Name)/$key' has no '$Field' field." `
-            -Next @("It is a '$type' credential with: $(@($entry.Keys) -join ', ')",
+            -Next @("It is a '$($view.Kind)' credential with: $(@($view.Fields.Keys) -join ', ')",
                     "To give it a username: cred add $($ctx.Name)/$key --user <name>"))
     }
 
-    $value = [string]$entry[$Field]
+    $value = [string]$view.Fields[$Field]
     if ($AsSecureString) { return (ConvertTo-CredSecureString -PlainText $value) }
     return $value
-}
-
-function Get-CredNearestKey {
-    <#
-        .SYNOPSIS
-        Cheap "did you mean" suggestion (Levenshtein, distance <= 2).
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param([string]$Key, [string[]]$Candidates)
-
-    if (-not $Candidates -or [string]::IsNullOrEmpty($Key)) { return $null }
-    $best = $null; $bestScore = [int]::MaxValue
-
-    foreach ($c in $Candidates) {
-        $a = $Key.ToLowerInvariant(); $b = ([string]$c).ToLowerInvariant()
-        if ($b.Length -eq 0) { continue }
-        $prev = 0..$b.Length
-        for ($i = 1; $i -le $a.Length; $i++) {
-            $cur = @($i) + (1..$b.Length | ForEach-Object { 0 })
-            for ($j = 1; $j -le $b.Length; $j++) {
-                $cost = if ($a[$i - 1] -eq $b[$j - 1]) { 0 } else { 1 }
-                $cur[$j] = [Math]::Min([Math]::Min($cur[$j - 1] + 1, $prev[$j] + 1), $prev[$j - 1] + $cost)
-            }
-            $prev = $cur
-        }
-        $d = $prev[$b.Length]
-        if ($d -lt $bestScore) { $bestScore = $d; $best = $c }
-    }
-    if ($bestScore -le 2) { return $best }
-    return $null
 }

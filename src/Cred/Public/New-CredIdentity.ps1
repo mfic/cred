@@ -34,7 +34,7 @@ function New-CredIdentity {
     $providerObj = Get-CredProviderInternal -Name $Provider
     $null        = Assert-CredProviderAvailable -Provider $providerObj
 
-    if (-not $Path) { $Path = Get-CredAgeIdentityPath -Config $null }
+    if (-not $Path) { $Path = Get-CredIdentityPath -Config $null }
     $exists = Test-Path -LiteralPath $Path -PathType Leaf
 
     if ($Show) {
