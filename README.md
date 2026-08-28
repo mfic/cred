@@ -27,9 +27,11 @@ rather than text.
 ## 60-second quickstart
 
 ```powershell
-# 0. one-off: install the encryption backend and put cred on your PATH
+# 0. one-off: install the runtime and the encryption backend, and put cred on your PATH
+winget install Python.Python.3.12     # the cred CLI is Python; skip if you have 3.8+
 winget install FiloSottile.age
 $env:PATH += ";C:\tools\cred\bin"
+# No Python on this machine? Use cred-ps instead -- same commands, PowerShell.
 
 # 1. one-off: create your personal key (stored outside every repo, backed up by you)
 cred keygen
