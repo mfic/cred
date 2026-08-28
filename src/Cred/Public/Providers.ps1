@@ -34,7 +34,7 @@ function Register-CredProvider {
         Add or replace an encryption backend.
 
         .DESCRIPTION
-        A provider is a PSCustomObject with these members:
+        A provider is a PSCustomObject. These members are required:
 
           Name          [string]
           Summary       [string]
@@ -45,6 +45,18 @@ function Register-CredProvider {
           GetRecipient  [scriptblock] ($Config)                            -> [string]
           Encrypt       [scriptblock] ($PlainBytes, $Config)               -> [byte[]]
           Decrypt       [scriptblock] ($CipherBytes, $CipherPath, $Config) -> [byte[]]
+
+        These are optional, and describe the *key* rather than the store:
+
+          IdentityPath     [scriptblock] ($Config) -> [string] or $null
+          SupportsKeystore [bool]
+
+        The key half used to sit outside this contract entirely, so the
+        keystore commands reached past the seam into age and DPAPI directly and
+        `cred key protect` silently operated on an age key file even for a gpg
+        project. A provider that says nothing here is taken to keep its keys
+        somewhere cred does not manage -- which is exactly true of gpg, whose
+        keys live in its own keyring.
 
         Encrypt and Decrypt must not write plaintext to disk and must not pass
         secret material as command-line arguments.

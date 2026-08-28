@@ -219,6 +219,21 @@ function Export-Cred {
         if ($Only -and $key -notin $Only) { continue }
 
         $entry = $values[$key]
+        $def   = if ($ctx.Config.credentials.Contains($key)) { $ctx.Config.credentials[$key] } else { $null }
+
+        # A file credential has no PSCredential shape, so it goes back out as
+        # the file it came in as -- which is what anyone exporting one wants.
+        if ((Get-CredEntryKind -Entry $entry -Definition $def) -eq 'file') {
+            $leaf = if ($def -and $def.Contains('filename') -and $def.filename) { $def.filename } else { $key }
+            $fileTarget = Join-Path $Path $leaf
+            if ($PSCmdlet.ShouldProcess($fileTarget, "Export $($ctx.Name)/$key")) {
+                $ConfirmPreference = 'None'
+                Write-CredPrivateFile -Path $fileTarget -Bytes (ConvertFrom-CredFileContent -Entry $entry)
+                $out.Add([pscustomobject]@{ Key = $key; UserName = '-'; File = $fileTarget })
+            }
+            continue
+        }
+
         $user  = if ($entry.Contains('user') -and $entry['user']) { [string]$entry['user'] } else { $key }
         $file  = Join-Path $Path "$key.cred.xml"
 

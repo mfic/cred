@@ -189,6 +189,177 @@ Describe 'Both directions in one store' -Skip:(-not ($script:HasAge -and $script
     }
 }
 
+Describe 'File credentials cross the implementations byte for byte' -Skip:(-not ($script:HasAge -and $script:HasPython)) {
+
+    BeforeAll {
+        function New-TestFile {
+            <# Bytes on disk, written raw so no encoder can normalise them. #>
+            param([byte[]]$Bytes, [string]$Name = 'f.bin')
+            $path = Join-Path $script:Sandbox "$([guid]::NewGuid().ToString('N').Substring(0,8))-$Name"
+            [System.IO.File]::WriteAllBytes($path, $Bytes)
+            return $path
+        }
+        $utf8 = [System.Text.UTF8Encoding]::new($false)
+        # A PEM with LF endings, one with CRLF, and something that is not text
+        # at all -- the three shapes a private key or certificate arrives in.
+        $script:PemLf   = $utf8.GetBytes("-----BEGIN PRIVATE KEY-----`nMIIEvQIBADAN`nab+/`n-----END PRIVATE KEY-----`n")
+        $script:PemCrLf = $utf8.GetBytes("-----BEGIN CERTIFICATE-----`r`nMIIC`r`n`r`n-----END CERTIFICATE-----`r`n")
+        $script:Binary  = [byte[]](0..255) + [byte[]](0..255)
+    }
+
+    It 'PowerShell imports a <label> and Python returns the same bytes' -ForEach @(
+        @{ label = 'LF PEM';   which = 'PemLf' }
+        @{ label = 'CRLF PEM'; which = 'PemCrLf' }
+        @{ label = 'binary';   which = 'Binary' }
+    ) {
+        $bytes = Get-Variable -Name $which -Scope Script -ValueOnly
+        $src   = New-TestFile -Bytes $bytes -Name 'server.key'
+        $p     = New-TestProject
+        $null  = Set-Cred -Name "$($p.Name)/f" -File $src
+
+        $dest = Join-Path $script:Sandbox "py-$([guid]::NewGuid().ToString('N').Substring(0,8)).out"
+        $r = Invoke-PyCred -CliArgs @('get', "$($p.Name)/f", '--out', $dest)
+        $r.ExitCode | Should -Be 0 -Because $r.StdErr
+        [System.IO.File]::ReadAllBytes($dest) | Should -Be $bytes
+    }
+
+    It 'Python imports a <label> and PowerShell returns the same bytes' -ForEach @(
+        @{ label = 'LF PEM';   which = 'PemLf' }
+        @{ label = 'CRLF PEM'; which = 'PemCrLf' }
+        @{ label = 'binary';   which = 'Binary' }
+    ) {
+        $bytes = Get-Variable -Name $which -Scope Script -ValueOnly
+        $src   = New-TestFile -Bytes $bytes -Name 'cert.pfx'
+        $p     = New-TestProject
+        $r     = Invoke-PyCred -CliArgs @('add', "$($p.Name)/f", '--file', $src)
+        $r.ExitCode | Should -Be 0 -Because $r.StdErr
+
+        $dest = Join-Path $script:Sandbox "ps-$([guid]::NewGuid().ToString('N').Substring(0,8)).out"
+        $null = Export-CredFile -Name "$($p.Name)/f" -OutFile $dest
+        [System.IO.File]::ReadAllBytes($dest) | Should -Be $bytes
+    }
+
+    It 'agrees on the stored encoding for text and for binary' {
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/pem" -File (New-TestFile -Bytes $script:PemLf)
+        $null = Set-Cred -Name "$($p.Name)/bin" -File (New-TestFile -Bytes $script:Binary)
+
+        # The declaration is plaintext and committed, so both sides must write
+        # the same thing into it.
+        $r = Invoke-PyCred -CliArgs @('list', $p.Name, '--json')
+        $rows = $r.StdOut | ConvertFrom-Json
+        ($rows | Where-Object Key -eq 'pem').Type | Should -Be 'file'
+        ($rows | Where-Object Key -eq 'bin').Type | Should -Be 'file'
+    }
+
+    It 'leaves file credentials out of the environment on both sides' {
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/pem" -File (New-TestFile -Bytes $script:PemLf)
+        $null = Set-Cred -Name "$($p.Name)/tok" -Secret 'plain-token'
+
+        # One decryption gives the variables and the file credentials left out
+        # of them; that used to be a [ref] out-parameter on Get-CredEnvironment.
+        $projected = Get-CredStoreEnvironment -Store (Open-CredStore -Project $p.Name)
+        @($projected.Variables.Keys) | Should -Be @('TOK')
+        $projected.Skipped           | Should -Be @('pem')
+
+        @((Get-CredEnvironment -Project $p.Name).Keys) | Should -Be @('TOK')
+
+        $r = Invoke-PyCred -CliArgs @('env', $p.Name)
+        $r.StdOut | Should -Match 'TOK='
+        $r.StdOut | Should -Not -Match 'BEGIN PRIVATE KEY'
+        $r.StdErr | Should -Match 'file credentials'
+    }
+
+    It 'refuses to hand a binary file credential back as a PSCredential' {
+        # Get-CredCredential used to ignore the kind entirely, so this returned
+        # a base64 blob as the password and looked like it had worked. Every
+        # access path now asks Resolve-CredEntry the same question.
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/bin" -File (New-TestFile -Bytes $script:Binary)
+        { Get-CredCredential -Name "$($p.Name)/bin" } |
+            Should -Throw -ExpectedMessage '*binary content*'
+    }
+
+    It 'reports a binary file credential as a file when config.json has lost the declaration' {
+        # The store wins over the config wherever the store has something to
+        # say: 'encoding' is only ever set by the file importer. Get-CredList
+        # used to read 'type' straight off the declaration and called this a
+        # secret. (A *text* file credential carries no marker, so its kind
+        # genuinely lives in config.json alone -- that is the format, not a
+        # bug, and Get-CredList still reports it from the declaration.)
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/bin" -File (New-TestFile -Bytes $script:Binary)
+
+        $cfgPath = Join-Path (Join-Path $p.Path '.creds') 'config.json'
+        $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
+        $cfg.credentials.PSObject.Properties.Remove('bin')
+        Set-Content -LiteralPath $cfgPath -Value ($cfg | ConvertTo-Json -Depth 10) -Encoding UTF8
+
+        (Get-CredList -Project $p.Name -Verify | Where-Object Key -eq 'bin').Type |
+            Should -BeExactly 'file'
+        # And it is still excluded from the injected environment.
+        @((Get-CredEnvironment -Project $p.Name).Keys) | Should -Not -Contain 'BIN'
+    }
+
+    It 'never lets the encoding marker become an environment variable' {
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/bin" -File (New-TestFile -Bytes $script:Binary)
+        $t = Get-CredEnvironment -Project $p.Name
+        @($t.Keys) | Should -Not -Contain 'BIN_ENCODING'
+        @($t.Keys).Count | Should -Be 0
+    }
+
+    It 'refuses to overwrite an existing file on both sides' {
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/pem" -File (New-TestFile -Bytes $script:PemLf)
+        $dest = New-TestFile -Bytes ([byte[]](1, 2, 3)) -Name 'occupied'
+
+        { Export-CredFile -Name "$($p.Name)/pem" -OutFile $dest } |
+            Should -Throw -ExpectedMessage '*already exists*'
+        (Invoke-PyCred -CliArgs @('get', "$($p.Name)/pem", '--out', $dest)).ExitCode | Should -Be 2
+
+        # -Force is the way through, and it really does replace the content.
+        $null = Export-CredFile -Name "$($p.Name)/pem" -OutFile $dest -Force
+        [System.IO.File]::ReadAllBytes($dest) | Should -Be $script:PemLf
+    }
+
+    It 'refuses -File together with -User on both sides' {
+        $p   = New-TestProject
+        $src = New-TestFile -Bytes $script:PemLf
+        { Set-Cred -Name "$($p.Name)/x" -File $src -User 'bob' } |
+            Should -Throw -ExpectedMessage '*cannot be combined*'
+        (Invoke-PyCred -CliArgs @('add', "$($p.Name)/x", '--file', $src, '--user', 'bob')).ExitCode |
+            Should -Be 2
+    }
+
+    It 'honours --field when writing a userpass credential to a file' {
+        # The bug this guards against: --out ignored --field and wrote the
+        # password when the username was asked for -- silently, and into a
+        # file the caller then trusted.
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/db" -User 'alice' -Secret 'PASSWORD-NOT-USERNAME'
+
+        $dest = Join-Path $script:Sandbox "field-$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+        $r = Invoke-PyCred -CliArgs @('get', "$($p.Name)/db", '--field', 'user', '--out', $dest)
+        $r.ExitCode | Should -Be 0 -Because $r.StdErr
+        [System.IO.File]::ReadAllText($dest) | Should -BeExactly 'alice'
+
+        $dest2 = "$dest.ps"
+        $null = Export-CredFile -Name "$($p.Name)/db" -OutFile $dest2 -Field user
+        [System.IO.File]::ReadAllText($dest2) | Should -BeExactly 'alice'
+    }
+
+    It 'never prints the content of a file credential in a list' {
+        $p = New-TestProject
+        $utf8 = [System.Text.UTF8Encoding]::new($false)
+        $null = Set-Cred -Name "$($p.Name)/pem" -File (New-TestFile -Bytes ($utf8.GetBytes('FILECANARY')))
+        $r = Invoke-PyCred -CliArgs @('list', $p.Name)
+        ($r.StdOut + $r.StdErr) | Should -Not -Match 'FILECANARY'
+        (Get-CredList -Project $p.Name | Out-String) | Should -Not -Match 'FILECANARY'
+    }
+}
+
 Describe 'Matching behaviour' -Skip:(-not ($script:HasAge -and $script:HasPython)) {
 
     It 'uses the same exit code for <case>' -ForEach @(

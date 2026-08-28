@@ -12,9 +12,19 @@
       InstallHint    [string]   what to tell the user when it is missing
       Test           [scriptblock] () -> @{ Available; Path; Detail }
       NewIdentity    [scriptblock] ($Path) -> @{ Path; Recipient }
-      GetRecipient   [scriptblock] () -> [string] this machine's public key
+      GetRecipient   [scriptblock] ($Config) -> [string] this machine's public key
       Encrypt        [scriptblock] ($PlainBytes, $Config) -> [byte[]]
       Decrypt        [scriptblock] ($CipherBytes, $CipherPath, $Config) -> [byte[]]
+
+    And, optionally, the key half -- which used to sit outside the seam
+    entirely, so `cred key protect` reached straight into age and DPAPI and
+    would happily wrap an age key file for a gpg project:
+
+      IdentityPath     [scriptblock] ($Config) -> [string] or $null
+      SupportsKeystore [bool]
+
+    A provider that declares neither is taken to keep its keys somewhere cred
+    does not manage. That is the truth for gpg, which has its own keyring.
 
     Providers must never write plaintext to disk and never accept secret
     material as a command-line argument.
@@ -25,7 +35,67 @@ $script:CredProviders = @{}
 function Register-CredProviderInternal {
     [CmdletBinding()]
     param([Parameter(Mandatory)][pscustomobject]$Provider)
+
+    # Fill in the optional half of the contract once, here, so no caller has to
+    # test for the members' existence.
+    if (-not $Provider.PSObject.Properties['IdentityPath']) {
+        Add-Member -InputObject $Provider -NotePropertyName IdentityPath `
+                   -NotePropertyValue { param($Config) $null } -Force
+    }
+    if (-not $Provider.PSObject.Properties['SupportsKeystore']) {
+        Add-Member -InputObject $Provider -NotePropertyName SupportsKeystore `
+                   -NotePropertyValue $false -Force
+    }
     $script:CredProviders[$Provider.Name] = $Provider
+}
+
+function Get-CredIdentityPath {
+    <#
+        .SYNOPSIS
+        Where this project's key lives, according to its provider.
+
+        Replaces Get-CredAgeIdentityPath at every call site outside this file.
+        The old name was the honest one -- it always returned an age path --
+        which is precisely why the keystore commands were age-only.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([object]$Config, [string]$ProviderName)
+
+    if (-not $ProviderName) {
+        $ProviderName = if ($Config -and $Config.provider) { [string]$Config.provider } else { 'age' }
+    }
+    $provider = Get-CredProviderInternal -Name $ProviderName
+    $path     = & $provider.IdentityPath $Config
+    if (-not $path) {
+        throw (New-CredErrorRecord -Code 'NoIdentity' -Target $ProviderName `
+            -Message "The '$ProviderName' provider does not keep its key in a file cred manages." `
+            -Next @("gpg keeps keys in its own keyring; manage them with gpg itself.",
+                    "Only providers with a cred-managed key file support 'cred key'."))
+    }
+    return $path
+}
+
+function Assert-CredKeystoreSupported {
+    <#
+        .SYNOPSIS
+        Refuse a keystore operation the provider cannot honour, rather than
+        wrapping some other provider's key file.
+    #>
+    [CmdletBinding()]
+    param([object]$Config, [string]$ProviderName)
+
+    if (-not $ProviderName) {
+        $ProviderName = if ($Config -and $Config.provider) { [string]$Config.provider } else { 'age' }
+    }
+    $provider = Get-CredProviderInternal -Name $ProviderName
+    if (-not $provider.SupportsKeystore) {
+        throw (New-CredErrorRecord -Code 'Usage' -Category InvalidOperation -Target $ProviderName `
+            -Message "The '$ProviderName' provider has no key for cred to wrap." `
+            -Next @("gpg holds your private key in its own keyring, which has its own protection.",
+                    "'cred key protect' applies to providers whose key is a file cred manages, such as age."))
+    }
+    return $provider
 }
 
 function Get-CredProviderInternal {
@@ -213,6 +283,10 @@ $script:CredAgeProvider = [pscustomobject]@{
     StoreFileName = 'store.age'
     InstallHint   = "Install age:  winget install FiloSottile.age   (or: brew install age / apt install age)"
 
+    # cred owns this key file, so it is cred's to locate and to wrap.
+    IdentityPath     = { param($Config) Get-CredAgeIdentityPath -Config $Config }
+    SupportsKeystore = $true
+
     Test = {
         $path = Resolve-CredExecutable -Name 'age' -OverridePath $env:CRED_AGE_PATH
         if (-not $path) {
@@ -349,6 +423,12 @@ $script:CredGpgProvider = [pscustomobject]@{
     Summary       = 'GnuPG public-key encryption against your existing keyring'
     StoreFileName = 'store.asc'
     InstallHint   = "Install GnuPG:  winget install GnuPG.GnuPG   (or: apt install gnupg)"
+
+    # gpg holds the private key in its own keyring. cred has no key file to
+    # point at and nothing to wrap, and saying so is better than silently
+    # operating on age's key.
+    IdentityPath     = { param($Config) $null }
+    SupportsKeystore = $false
 
     Test = {
         $path = Resolve-CredExecutable -Name 'gpg' -OverridePath $env:CRED_GPG_PATH

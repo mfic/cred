@@ -242,6 +242,36 @@ Describe 'Provider contract' {
         Register-CredProvider -Provider $fake -Confirm:$false
         (Get-CredProvider -Name 'test-xor').Available | Should -BeTrue
     }
+
+    It 'defaults the optional key half of the contract' {
+        # A provider that says nothing about identity keeps its keys somewhere
+        # cred does not manage. Registration fills that in so no caller has to
+        # test for the members' existence.
+        $p = InModule { Get-CredProviderInternal -Name 'test-xor' }
+        $p.SupportsKeystore | Should -BeFalse
+        (InModule { & (Get-CredProviderInternal -Name 'test-xor').IdentityPath $null }) |
+            Should -BeNullOrEmpty
+    }
+
+    It 'declares the key half for age and withholds it for gpg' {
+        # The seam used to cover the store but not the key, so `cred key
+        # protect` reached past it and would wrap an age key file even for a
+        # gpg project.
+        (InModule { (Get-CredProviderInternal -Name 'age').SupportsKeystore }) | Should -BeTrue
+        (InModule { (Get-CredProviderInternal -Name 'gpg').SupportsKeystore }) | Should -BeFalse
+    }
+
+    It 'refuses a keystore operation the provider cannot honour' {
+        { InModule { Assert-CredKeystoreSupported -ProviderName 'gpg' } } |
+            Should -Throw -ExpectedMessage '*no key for cred to wrap*'
+        { Protect-CredIdentity -Provider 'gpg' -Confirm:$false } |
+            Should -Throw -ExpectedMessage '*no key for cred to wrap*'
+    }
+
+    It 'refuses to name a key file for a provider that keeps its own' {
+        { InModule { Get-CredIdentityPath -Config $null -ProviderName 'gpg' } } |
+            Should -Throw -ExpectedMessage '*does not keep its key in a file*'
+    }
 }
 
 Describe 'Confirmation does not leak downstream' {
@@ -282,5 +312,65 @@ Describe 'Confirmation does not leak downstream' {
                 Where-Object { $_.Name -like "$leaf.*" }) | Should -BeNullOrEmpty
         }
         finally { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Describe 'Command-line parsing' {
+    # This code used to live in bin/cred-ps.ps1, where its only interface was a
+    # process: testing it meant spawning pwsh with a real store and a real key,
+    # so nothing tested it at all. These are the cases that were unguarded.
+
+    It 'splits argv at the first bare -- and leaves the tail verbatim' {
+        $s = InModule { Split-CredArgv @('exec', 'acme', '--', 'npm', 'run', '--', 'x') }
+        $s.Head | Should -Be @('exec', 'acme')
+        $s.Tail | Should -Be @('npm', 'run', '--', 'x')
+    }
+
+    It 'gives an empty tail when there is no separator' {
+        $s = InModule { Split-CredArgv @('list', 'acme') }
+        $s.Head | Should -Be @('list', 'acme')
+        @($s.Tail).Count | Should -Be 0
+    }
+
+    It 'reads --opt value, --opt=value and switches' {
+        $p = InModule {
+            Read-CredOptions @('acme/db', '--user', 'svc', '--desc=a b', '--stdin') -Switches @('stdin')
+        }
+        $p.Options['user']  | Should -BeExactly 'svc'
+        $p.Options['desc']  | Should -BeExactly 'a b'
+        $p.Options['stdin'] | Should -BeTrue
+        $p.Positional       | Should -Be @('acme/db')
+    }
+
+    It 'does not let a value-taking option swallow the next flag' {
+        # `cred add x --env --stdin` must not set env='--stdin'.
+        $p = InModule { Read-CredOptions @('x', '--env', '--stdin') -Switches @('stdin') }
+        $p.Options['env']   | Should -BeTrue
+        $p.Options['stdin'] | Should -BeTrue
+    }
+
+    It 'treats a trailing value-taking option as a flag rather than reading past the end' {
+        $p = InModule { Read-CredOptions @('x', '--field') }
+        $p.Options['field'] | Should -BeTrue
+        $p.Positional       | Should -Be @('x')
+    }
+
+    It 'maps short forms and lower-cases option names' {
+        $p = InModule { Read-CredOptions @('-n', 'x') -Switches @('no-newline') -Short @{ n = 'no-newline' } }
+        $p.Options['no-newline'] | Should -BeTrue
+        $p.Positional            | Should -Be @('x')
+
+        $u = InModule { Read-CredOptions @('--Field', 'user') }
+        $u.Options['field'] | Should -BeExactly 'user'
+    }
+
+    It 'keeps an empty --opt= as an empty string, not as a flag' {
+        $p = InModule { Read-CredOptions @('--prefix=') }
+        $p.Options['prefix'] | Should -BeExactly ''
+    }
+
+    It 'leaves a negative number or a lone dash positional' {
+        $p = InModule { Read-CredOptions @('-', 'x') }
+        $p.Positional | Should -Be @('-', 'x')
     }
 }

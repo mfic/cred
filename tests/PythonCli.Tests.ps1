@@ -282,3 +282,15 @@ Describe 'Python CLI leak hygiene' -Skip:(-not ($script:HasAge -and $script:HasP
         $r.StdErr | Should -Match 'no credential named'
     }
 }
+
+
+Describe 'Python units' -Skip:(-not $script:HasPython) {
+    # cred.py is the default implementation everywhere, so its pure functions
+    # are checked directly rather than only through the process. tests/pyunit.py
+    # holds the cases; this runs them under the one runner.
+    It 'passes tests/pyunit.py' {
+        $harness = Join-Path $PSScriptRoot 'pyunit.py'
+        $out = & $script:PyExe $harness 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($out -join [Environment]::NewLine)
+    }
+}

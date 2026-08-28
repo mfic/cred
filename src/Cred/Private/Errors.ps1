@@ -54,6 +54,22 @@ function New-CredErrorRecord {
 }
 
 function Get-CredExitCode {
+    <#
+        .SYNOPSIS
+        The process exit code for an error this module threw.
+
+        .DESCRIPTION
+        Exported because the CLI needs it. It used to be private, so
+        bin/cred-ps.ps1 carried its own copy of the table and the module's
+        version had no caller outside the tests. One table, one place to
+        change it.
+
+        Anything unrecognised is 1, so a new code cannot silently become a
+        success.
+
+        .EXAMPLE
+        try { Get-Cred acme-api/db } catch { exit (Get-CredExitCode -ErrorRecord $_) }
+    #>
     [CmdletBinding()]
     [OutputType([int])]
     param([object]$ErrorRecord)

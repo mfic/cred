@@ -44,7 +44,7 @@ function Test-CredHealth {
     $credHome = Get-CredHomeDirectory
     Add-Row 'cred home' $(if (Test-Path -LiteralPath $credHome) { 'Ok' } else { 'Warn' }) $credHome 'Run: cred init'
 
-    $identity = Get-CredAgeIdentityPath -Config $null
+    $identity = Get-CredIdentityPath -Config $null
     if (Test-Path -LiteralPath $identity -PathType Leaf) {
         Add-Row 'identity' 'Ok' $identity
         if (Test-CredPathIsPrivate -Path $identity) {
