@@ -29,9 +29,40 @@ function Get-CredEnvironment {
         [string]$Prefix
     )
 
-    # A caller that also needs to know which file credentials were left out
-    # opens the store itself -- Open-CredStore plus Get-CredStoreEnvironment
-    # gives both from one decryption. That used to be a [ref] parameter here.
+    return (Get-CredEnvironmentReport -Project $Project -Only $Only -Exclude $Exclude `
+                                      -Path $Path -Prefix $Prefix).Variables
+}
+
+function Get-CredEnvironmentReport {
+    <#
+        .SYNOPSIS
+        The variables to inject, and the file credentials deliberately left out.
+
+        .DESCRIPTION
+        Both answers from one decryption. `cred env` and `cred exec` have to
+        tell the user what they skipped, and asking Get-CredEnvironment for the
+        variables and then opening the store again for the rest would decrypt
+        twice -- so this is the function they call, and Get-CredEnvironment is
+        the convenience wrapper for the common case.
+
+        It also spares the CLI from opening the store itself, which is not a
+        script's job. Peer of environment_and_skipped in cred_store.py.
+
+        .EXAMPLE
+        $r = Get-CredEnvironmentReport acme-api
+        $r.Variables.DB_PASSWORD
+        $r.Skipped   # file credentials, which map to no variable
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Position = 0)][string]$Project,
+        [string[]]$Only,
+        [string[]]$Exclude,
+        [string]$Path,
+        [string]$Prefix
+    )
+
     $store = Open-CredStore -Project $Project -Path $Path
-    return (Get-CredStoreEnvironment -Store $store -Only $Only -Exclude $Exclude -Prefix $Prefix).Variables
+    return (Get-CredStoreEnvironment -Store $store -Only $Only -Exclude $Exclude -Prefix $Prefix)
 }

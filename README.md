@@ -156,6 +156,10 @@ $env.STRIPE_API_KEY
 $key  = Get-Cred acme-api/stripe -AsSecureString
 
 Export-CredFile acme-api/ssl-key -OutFile D:\tmp\server.key   # a file credential
+
+# The two that answer a whole question in one decryption:
+$r = Get-CredEnvironmentReport acme-api         # .Variables and .Skipped together
+$v = Read-CredValue acme-api/ssl-key            # .Bytes with .Kind and .IsBinary
 ```
 
 ---
@@ -230,14 +234,14 @@ The rest, and why not:
 | | Verdict |
 | --- | --- |
 | **sops** | Genuinely excellent, and the closest competitor — per-value encryption means readable diffs. But it is a much larger dependency whose real strength is cloud KMS integration we do not need, and it would still need age or gpg underneath. Complexity without a matching payoff here. |
-| **gpg** | Installed on this machine, and shipped as a provider for people already invested in it. But the keyring, agent, pinentry and trust model are a large surface that fails in confusing ways, key handling differs meaningfully across platforms, and its output is not reproducible. age exists precisely because of this. |
+| **gpg** | Shipped as a second provider for a while, for people already invested in it, then removed as unused. The keyring, agent, pinentry and trust model are a large surface that fails in confusing ways, key handling differs meaningfully across platforms, and its output is not reproducible. age exists precisely because of this. |
 | **DPAPI** | Disqualified. It is machine- and account-bound, so the encrypted file cannot travel with the code — which is the entire requirement — and it does not exist off Windows, so there is no Linux port at all. |
 | **raw OpenSSL** | Disqualified for the default. Using it correctly means choosing a KDF, an AEAD mode, a nonce policy and a versioned file format by hand: writing a crypto format rather than using one. Fine as a provider someone adds later; wrong as the thing your passwords depend on. |
 
 Crypto is behind a provider interface (see `src/Cred/Private/Providers.ps1`), so
-swapping backends touches one file. `age` and `gpg` both ship; the contract is
-documented in `Register-CredProvider`'s help and exercised by a test that
-registers a fake backend.
+swapping backends touches one file. `age` is the only provider that ships; the
+contract is documented in `Register-CredProvider`'s help and exercised by a test
+that registers a fake backend.
 
 Full reasoning, and what a Linux port actually requires, in
 [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -432,7 +436,6 @@ What it does not:
   change
 - [age](https://age-encrypted.org) 1.2+ — `winget install FiloSottile.age`,
   `brew install age`, `apt install age`
-- Optional: GnuPG, if you would rather use the `gpg` provider
 
 ## Installing
 

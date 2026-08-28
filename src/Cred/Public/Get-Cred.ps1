@@ -31,16 +31,12 @@ function Get-Cred {
         [string]$Path
     )
 
-    $ref = Split-CredReference -Reference $Name
-    $key = $ref.Key
-    if ($ref.Project -and -not $Project) { $Project = $ref.Project }
-
     # One decryption, already resolved. A caller who needs the kind as well as
     # the value calls Open-CredStore rather than passing a [ref] in here.
-    $store = Open-CredStore -Project $Project -Path $Path
-    $ctx   = $store.Context
-    $null  = Get-CredEntryOrThrow -Project $ctx -Key $key -Values $store.Values
-    $view  = $store.Entries[$key]
+    $entry = Get-CredEntryView -Name $Name -Project $Project -Path $Path
+    $key   = $entry.Key
+    $ctx   = $entry.Context
+    $view  = $entry.View
 
     # Exact bytes are the same question for every kind, so they are one call.
     if ($AsBytes) { return (Get-CredEntryBytes -Projection $view -Field $Field -ProjectName $ctx.Name) }
@@ -49,10 +45,7 @@ function Get-Cred {
         # Binary has no faithful [string] form; handing back a mangled one
         # would look like it worked.
         if ($view.IsBinary) {
-            throw (New-CredErrorRecord -Code 'Usage' -Category InvalidArgument -Target $key `
-                -Message "'$($ctx.Name)/$key' holds binary content, which is not a string." `
-                -Next @("Write it to a file: Export-CredFile $($ctx.Name)/$key -OutFile <path>",
-                        "Or from the CLI:    cred get $($ctx.Name)/$key --out <path>"))
+            throw (New-CredBinaryContentError -ProjectName $ctx.Name -Key $key -Noun 'a string')
         }
         $text = [string]$view.Fields['secret']
         if ($AsSecureString) { return (ConvertTo-CredSecureString -PlainText $text) }
@@ -69,4 +62,47 @@ function Get-Cred {
     $value = [string]$view.Fields[$Field]
     if ($AsSecureString) { return (ConvertTo-CredSecureString -PlainText $value) }
     return $value
+}
+
+function Read-CredValue {
+    <#
+        .SYNOPSIS
+        One credential's bytes, together with what it is.
+
+        .DESCRIPTION
+        For a caller that has to decide how to write a value out: the bytes are
+        the same question for every kind, but a `file` credential is written
+        raw and everything else is written as text, and binary content must not
+        be sent to a terminal at all.
+
+        This exists so the CLI can answer all of that with a single call.
+        `cred get` used to open the store itself and index .Entries, which put
+        store resolution and entry-kind policy inside a script that is supposed
+        to parse argv and print.
+
+        Still one decryption. Peer of read_value in cred_store.py.
+
+        .EXAMPLE
+        $v = Read-CredValue acme-api/ssl-key
+        if ($v.Kind -eq 'file') { [System.IO.File]::WriteAllBytes($p, $v.Bytes) }
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$Name,
+        [ValidateSet('secret', 'user')][string]$Field = 'secret',
+        [string]$Project,
+        [string]$Path
+    )
+
+    $entry = Get-CredEntryView -Name $Name -Project $Project -Path $Path
+    $view  = $entry.View
+
+    return [pscustomobject]@{
+        Project  = $entry.Context.Name
+        Key      = $entry.Key
+        Kind     = $view.Kind
+        IsBinary = [bool]$view.IsBinary
+        Bytes    = (Get-CredEntryBytes -Projection $view -Field $Field -ProjectName $entry.Context.Name)
+    }
 }

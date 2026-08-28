@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "project": "custom-store-name",
+  "provider": "age",
+  "store": "vault.age",
+  "recipients": [],
+  "credentials": {}
+}

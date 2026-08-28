@@ -78,8 +78,11 @@ What we deliberately did *not* use, and why:
   much larger dependency, and it would still need age or gpg underneath. More
   moving parts for a benefit that does not apply here.
 
-`gpg` ships as a second provider — both because it proves the seam is real and
-because people with an established GnuPG keyring should not have to abandon it.
+`age` is the only provider that ships. A `gpg` provider used to ship beside it,
+to prove the seam was real; it was removed once the seam had other reasons to
+exist. The seam stays because the backends worth adding next are remote ones —
+a vault or a KMS — and those are exactly what the optional key half of the
+contract was written for.
 
 ## The provider contract
 
@@ -104,11 +107,11 @@ And, optionally, the *key* rather than the store:
 | `IdentityPath` | `($Config) -> string \| $null` | where cred keeps this backend's key |
 | `SupportsKeystore` | bool | can `cred key protect` wrap it |
 
-A provider that declares neither keeps its keys somewhere cred does not manage,
-which is the truth for gpg. This half used to sit *outside* the contract: the
-keystore commands called an age-specific helper directly, so `cred key protect`
-in a gpg project would cheerfully wrap age's key file. Both implementations now
-refuse by name instead.
+A provider that declares neither keeps its keys somewhere cred does not manage
+— a remote vault or KMS, where there is no local file to wrap. This half used to
+sit *outside* the contract: the keystore commands called an age-specific helper
+directly, so `cred key protect` in such a project would cheerfully wrap age's
+key file. Both implementations now refuse by name instead.
 
 Two invariants a provider must not break:
 
@@ -121,7 +124,7 @@ test that registers a toy backend and drives the whole stack through it, so a
 change that quietly breaks the seam fails the suite.
 
 `python/cred_store.py` mirrors this exactly, as a dict of the same members in
-`PROVIDERS`, reached through `get_provider(name)`. Both ship `age` and `gpg`.
+`PROVIDERS`, reached through `get_provider(name)`. Both ship `age`.
 
 ## Data model
 
@@ -163,17 +166,27 @@ Three decisions worth not rediscovering:
 - **Text stays text; only non-UTF-8 (or NUL-bearing) content becomes base64.**
   A PEM in the store is still greppable once decrypted and still diffs
   sensibly. Base64 is the fallback, not the rule.
-- **`file` maps to no environment variable.** `build_environment` skips the
-  type outright *and* ignores any entry field that is not `user` or `secret`,
+- **`file` maps to no environment variable.** `environment_and_skipped` skips
+  the type outright *and* ignores any entry field that is not `user` or `secret`,
   so the `encoding` marker can never become `$env:SSL_KEY_ENCODING`. Both
   implementations return the skipped names alongside the variables, from a
   single decryption, so `cred exec` can say what it left out without
   decrypting twice.
 
-`cred get --out` and `cred export` are the only paths that write plaintext to
-disk. They exist because openssl and nginx want a path, not a string. Both
-apply restrictive permissions to the staged file *before* the rename, so the
-content never exists world-readable, and both say out loud what they did.
+`cred get --out` and `cred export` are the only paths that write a *credential*
+in plaintext to disk. They exist because openssl and nginx want a path, not a
+string, and both say out loud what they did. Together with the key files —
+`cred key gen`, `key protect --backup`, `key unprotect` — they are the callers
+of one writer: `Write-CredPrivateFile` in `Private/Json.ps1`, `write_private_file`
+in `python/cred_store.py`. Everything else writes ciphertext or non-secret
+config through the plain atomic writers, which do no permission work.
+
+The private writer exists because the ordering is easy to get wrong, and wrong
+here means a readable window rather than a visible bug. It restricts the staged
+file before publishing it, and — on Windows, where `File.Replace` keeps the
+*destination's* ACL rather than the incoming file's — restricts an existing
+destination before the swap too. Tightening afterwards would leave the new
+secret under the old file's permissions for as long as it took to get there.
 
 ## One question, one place to answer it
 
@@ -308,8 +321,7 @@ and re-parsing it, which would add a leak surface for no gain. That is why the
 module is not a wrapper around the CLI and never shells out to it.
 
 `bin/cred-ps` is the same CLI implemented in PowerShell, kept for machines with
-pwsh but no Python. It is not a fallback that degrades: it is a full peer, and
-it is the one that ships `gpg` support in the same seam.
+pwsh but no Python. It is not a fallback that degrades: it is a full peer.
 
 Neither implementation calls the other. They interoperate because the *files*
 are the contract, and nothing else is:
@@ -328,8 +340,8 @@ default environment-variable names, and that neither loses the other's writes.
 
 A round trip proves the two agree, not that either is right: it passes whenever
 both are wrong in the same way, which is exactly how four divergences survived
-undetected -- a gpg project resolving to `store.age` in Python and `store.asc`
-in PowerShell; a staged write verified by length on one side and by content on
+undetected -- a project resolving to `store.age` in Python and a different
+filename in PowerShell; a staged write verified by length on one side and by content on
 the other; a userpass credential whose declaration named only `user` injecting
 `$env:KEY` here and `$env:KEY_PASSWORD` there; and a binary-to-terminal guard
 keyed off the stored marker in one implementation and off NUL bytes in the
@@ -340,9 +352,8 @@ would use the same corpus as its conformance suite.
 `tests/PythonCli.Tests.ps1` covers the Python CLI on its own. Those two files
 are what stop the implementations drifting.
 
-The only remaining asymmetry is deliberate: `gpg` is implemented in both, but
-`cred-ps` is the one with the PowerShell-native object API, because that is not
-a CLI concern.
+The only remaining asymmetry is deliberate: `cred-ps` is the one with the
+PowerShell-native object API, because that is not a CLI concern.
 
 A third implementation in `sh` would need nothing new from this codebase: `jq`
 over `config.json`, `age -d -i` over the store, `flock` on `.creds/.lock`, and
@@ -458,7 +469,7 @@ src/Cred/
     Json.ps1      UTF-8 no-BOM I/O, atomic writes, JSON that behaves on 5.1
     Process.ps1   child processes: byte pipes in, byte pipes out
     Secrets.ps1   SecureString conversion and prompting
-    Providers.ps1 the crypto seam: age, gpg, and where each keeps its key
+    Providers.ps1 the crypto seam: age, and where a provider keeps its key
     Config.ps1    project discovery, registry, config read/write
     Store.ps1     locking, the read spine (store view), the write spine
   Public/         one file per area; every function has help and examples

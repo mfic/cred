@@ -5,7 +5,7 @@
     Interop.Tests.ps1 drives the two implementations against each other, which
     proves they agree but not that either is right: a round trip passes
     whenever both sides are wrong in the same way. That is how four format
-    divergences survived -- a gpg project resolving to store.age in Python and
+    divergences survived -- a project resolving to store.age in Python and
     store.asc in PowerShell, a write verified by length on one side and by
     content on the other, a userpass fallback naming $env:KEY here and
     $env:KEY_PASSWORD there, and a binary guard keyed off different facts.
@@ -181,11 +181,13 @@ Describe 'The on-disk format is a fixed contract' -Skip:(-not $script:HasAge) {
         @($projected.Skipped) | Should -Be @($expected.skipped)
     }
 
-    It 'names the store from the provider when config.json does not' {
-        # A gpg project with no 'store' key. Python hardcoded store.age here,
-        # so the two implementations opened different files for one repository.
-        $store = Open-CredStore -Path (Join-Path $script:Sandbox 'gpg-default-store')
-        (Split-Path -Leaf $store.Context.StorePath) | Should -BeExactly 'store.asc'
+    It 'takes the store filename from config.json rather than assuming one' {
+        # This used to be a gpg project with no 'store' key, where Python
+        # hardcoded store.age and PowerShell asked the provider. gpg is gone,
+        # so the fixture names the file explicitly instead: an implementation
+        # that assumes the default still opens the wrong file for one repo.
+        $store = Open-CredStore -Path (Join-Path $script:Sandbox 'custom-store-name')
+        (Split-Path -Leaf $store.Context.StorePath) | Should -BeExactly 'vault.age'
     }
 }
 
@@ -203,9 +205,9 @@ Describe 'Both implementations agree with the fixture' -Skip:(-not ($script:HasA
         (ConvertTo-Comparable $got) | Should -BeExactly (ConvertTo-Comparable $expected)
     }
 
-    It 'the Python implementation names a gpg store store.asc' {
-        $got = Invoke-Harness -Mode 'store-name' -Fixture (Join-Path $script:Sandbox 'gpg-default-store') |
+    It 'the Python implementation honours the same store filename' {
+        $got = Invoke-Harness -Mode 'store-name' -Fixture (Join-Path $script:Sandbox 'custom-store-name') |
                ConvertFrom-Json
-        $got.store | Should -BeExactly 'store.asc'
+        $got.store | Should -BeExactly 'vault.age'
     }
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 # cred-ps -- the PowerShell implementation, for bash/zsh/fish.
 #
-# The default `cred` is Python. Reach for this one when you want the gpg
-# provider, or when a machine has PowerShell but not Python.
+# The default `cred` is Python. Reach for this one when a machine has
+# PowerShell but not Python.
 set -e
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

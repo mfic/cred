@@ -53,6 +53,31 @@ function New-CredErrorRecord {
     return $record
 }
 
+function New-CredBinaryContentError {
+    <#
+        .SYNOPSIS
+        The refusal every text-shaped read path gives for a binary credential.
+
+        .DESCRIPTION
+        Three callers ask the same question -- Get-Cred, Get-CredCredential and
+        the CLI's 'get' -- and the answer has to name the same two escape
+        hatches every time, or the user learns one of them and not the other.
+        Noun is what the caller was about to pretend the bytes were.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Management.Automation.ErrorRecord])]
+    param(
+        [Parameter(Mandatory)][string]$ProjectName,
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)][string]$Noun
+    )
+
+    return (New-CredErrorRecord -Code 'Usage' -Category InvalidArgument -Target $Key `
+        -Message "'$ProjectName/$Key' holds binary content, which is not $Noun." `
+        -Next @("Write it to a file: Export-CredFile $ProjectName/$Key -OutFile <path>",
+                "Or from the CLI:    cred get $ProjectName/$Key --out <path>"))
+}
+
 function Get-CredExitCode {
     <#
         .SYNOPSIS
