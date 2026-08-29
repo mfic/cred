@@ -30,7 +30,8 @@ BeforeAll {
     $null = New-Item -ItemType Directory -Path $script:Sandbox -Force
 
     function Invoke-Cred {
-        param([string[]]$CliArgs, [string]$StdIn, [string]$WorkingDirectory)
+        param([string[]]$CliArgs, [string]$StdIn, [string]$WorkingDirectory,
+              [hashtable]$Environment)
 
         $psi = [System.Diagnostics.ProcessStartInfo]::new()
         $psi.FileName = $script:PyExe
@@ -45,6 +46,7 @@ BeforeAll {
         $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
         $psi.EnvironmentVariables.Remove('CRED_PROJECT') | Out-Null
         $psi.EnvironmentVariables.Remove('CRED_IDENTITY_FILE') | Out-Null
+        foreach ($k in $Environment.Keys) { $psi.EnvironmentVariables[$k] = $Environment[$k] }
 
         $quoted = @($script:PyCli) + $CliArgs |
                   ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }
@@ -328,6 +330,50 @@ Describe 'Python CLI init --force does not erase silently' -Skip:(-not ($script:
                             -WorkingDirectory $script:Guard
         $r = Invoke-Cred -CliArgs @('init', '--force', 'guardproj') -WorkingDirectory $script:Guard
         $r.ExitCode | Should -Be 0 -Because $r.StdErr
+    }
+}
+
+Describe 'Python CLI doctor checks the key and the repo' -Skip:(-not ($script:HasAge -and $script:HasPython)) {
+    # These four checks existed only in the PowerShell doctor, so the two
+    # implementations disagreed about what `cred doctor` even reports.
+
+    It 'warns when another principal can read the key, and --repair clears it' -Skip:(-not $script:OnWindows) {
+        $key = Join-Path $script:CredHomeDir 'identity.txt'
+        # *S-1-1-0 is Everyone by SID, so this works on a localised Windows.
+        & icacls $key '/grant' '*S-1-1-0:(R)' 2>&1 | Out-Null
+        (Invoke-Cred -CliArgs @('doctor')).StdOut | Should -Match 'identity permissions\s+Warn'
+
+        (Invoke-Cred -CliArgs @('doctor', '--repair')).StdOut |
+            Should -Match 'identity permissions\s+Ok'
+    }
+
+    It 'fails, and exits 1, when the key sits inside a repository' {
+        $repo = Join-Path $script:Sandbox "keyinrepo-$([guid]::NewGuid().ToString('N'))"
+        $null = New-Item -ItemType Directory -Path $repo -Force
+        $null = Invoke-Cred -CliArgs @('init', 'keyinrepo', '--path', $repo)
+        Copy-Item -LiteralPath (Join-Path $script:CredHomeDir 'identity.txt') `
+                  -Destination (Join-Path $repo 'identity.txt')
+
+        $r = Invoke-Cred -CliArgs @('doctor', '--path', $repo) `
+                         -Environment @{ CRED_IDENTITY_FILE = (Join-Path $repo 'identity.txt') }
+        $r.StdOut   | Should -Match 'identity location\s+Fail'
+        $r.ExitCode | Should -Be 1
+    }
+
+    It 'warns when .creds is gitignored, and is quiet when it is not' {
+        $repo = Join-Path $script:Sandbox "gitrepo-$([guid]::NewGuid().ToString('N'))"
+        $null = New-Item -ItemType Directory -Path $repo -Force
+        & git -C $repo init -q 2>&1 | Out-Null
+        $null = Invoke-Cred -CliArgs @('init', 'gitrepo', '--path', $repo)
+
+        (Invoke-Cred -CliArgs @('doctor', '--path', $repo)).StdOut | Should -Match 'git\s+Ok'
+
+        Set-Content -LiteralPath (Join-Path $repo '.gitignore') -Value '.creds/' -Encoding ascii
+        (Invoke-Cred -CliArgs @('doctor', '--path', $repo)).StdOut | Should -Match 'git\s+Warn'
+    }
+
+    It 'reports how the key is protected' {
+        (Invoke-Cred -CliArgs @('doctor')).StdOut | Should -Match 'identity protection\s+Ok'
     }
 }
 

@@ -54,6 +54,11 @@ function Test-CredHealth {
             Add-Row 'identity permissions' 'Warn' 'Other principals can read your key file.' `
                     "Run: cred doctor --repair"
         }
+        # The peer of this row existed only in python/cred.py, so the two
+        # doctors disagreed about what they reported.
+        Add-Row 'identity protection' 'Ok' $(
+            if (Test-CredIdentityIsWrapped -Path $identity) { 'dpapi-currentuser' }
+            else { 'file-permissions' })
         $inRepo = $false
         try {
             $root = Find-CredProjectRoot -StartPath (Split-Path -Parent $identity)
@@ -140,8 +145,10 @@ function Repair-CredHealth {
         # failure, so --repair reported success no matter what it achieved.
         $failed = [System.Collections.Generic.List[string]]::new()
         if (-not (Protect-CredPath -Path $credHome)) { $failed.Add($credHome) }
+        Remove-CredForeignAccess -Path $credHome
         foreach ($f in @(Get-ChildItem -LiteralPath $credHome -File -ErrorAction SilentlyContinue)) {
             if (-not (Protect-CredPath -Path $f.FullName)) { $failed.Add($f.FullName) }
+            Remove-CredForeignAccess -Path $f.FullName
         }
         if ($failed.Count -gt 0) {
             Write-Warning "Could not tighten permissions on $($failed.Count) path(s) under '$credHome'."

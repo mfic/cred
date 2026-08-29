@@ -97,6 +97,7 @@ COMMANDS
   doctor [project]                 Check the setup and say how to fix it
       --repair                     Re-apply restrictive permissions
                                    Re-registers a cloned or renamed project
+      --repair                     Re-apply restrictive permissions
 
   claude [project]                 Markdown brief for a Claude Code session
       --write                      Write it into the repo's CLAUDE.md
@@ -844,23 +845,16 @@ def cmd_project(rest: List[str]) -> int:
 
 def cmd_doctor(rest: List[str]) -> int:
     opts, pos = read_options(rest, switches=("repair",))
-    rows = []
-
     if opts.get("repair"):
-        # Peer of Repair-CredHealth: re-apply restrictive permissions to the
-        # cred home and everything in it, then report as usual.
-        home = cs.cred_home()
-        home.mkdir(parents=True, exist_ok=True)
-        targets = [home] + [c for c in sorted(home.iterdir()) if c.is_file()]
-        # Say what could not be fixed. restrict_path used to return nothing, so
-        # --repair reported success no matter what it achieved.
-        failed = [t for t in targets if not cs.restrict_path(t)]
+        # On stderr, so the table on stdout stays byte-identical to cred-ps's.
+        home, failed = cs.repair_permissions()
         if failed:
-            note(f"Could not tighten permissions on {len(failed)} path(s):")
-            for t in failed:
-                note(f"  {t}")
+            note(f"Could not tighten permissions on {len(failed)} path(s) under '{home}':")
+            for f in failed:
+                note(f"  {f}")
         else:
-            note(f"Re-applied permissions under {home}")
+            note(f"Re-applied permissions under {home}.")
+    rows = []
 
     def row(check, status, detail, fix=""):
         rows.append({"Check": check, "Status": status, "Detail": detail,
@@ -880,6 +874,12 @@ def cmd_doctor(rest: List[str]) -> int:
         ident = cs.provider_identity_path(None)
         if ident.is_file():
             row("identity", "Ok", str(ident))
+            if cs.path_is_private(ident):
+                row("identity permissions", "Ok", "Readable only by you.")
+            else:
+                row("identity permissions", "Warn",
+                    "Other principals can read your key file.",
+                    "Run: cred doctor --repair")
             # From the file, not from the platform: a key wrapped on another
             # machine is exactly the case worth being able to see here.
             row("identity protection", "Ok",
@@ -889,6 +889,12 @@ def cmd_doctor(rest: List[str]) -> int:
             row("keystore", "Ok" if keystore != "none" else "Warn",
                 keystore if keystore != "none" else "none available here",
                 "Run: cred key protect")
+            # A key inside a repository is one 'git add -A' from being published.
+            if cs.find_project_root(ident.parent):
+                row("identity location", "Fail",
+                    "Your secret key is inside a repository.",
+                    "Move it out of the repo and set CRED_IDENTITY_FILE to "
+                    "the new path.")
         else:
             row("identity", "Warn", f"No key at '{ident}'.", "Run: cred keygen")
     except cs.CredError:
@@ -901,7 +907,9 @@ def cmd_doctor(rest: List[str]) -> int:
     except cs.CredError:
         row("project", "Warn", "Not inside a project (and none named).", "Run: cred init")
         table(rows, ["Check", "Status", "Detail", "Fix"])
-        return cs.EXIT_OK
+        # Still honour a Fail found before the project checks -- a key sitting
+        # inside a repository is a finding whether or not you are in one.
+        return cs.EXIT_GENERAL if any(r["Status"] == "Fail" for r in rows) else cs.EXIT_OK
 
     row("project", "Ok", f"{project.name} at {project.root}")
 
@@ -935,6 +943,17 @@ def cmd_doctor(rest: List[str]) -> int:
     else:
         row("recipients", "Warn", f"{len(recipients)} recipient(s); could not determine yours.",
             "Run: cred keygen")
+
+    # Git hygiene: the store and config are meant to be committed. A .gitignore
+    # that swallows them turns the whole design off without saying so.
+    ignored = cs.git_ignores(project.root, f"{cs.CREDS_DIR}/{cs.CONFIG_NAME}")
+    if ignored is True:
+        row("git", "Warn",
+            ".creds/config.json is gitignored, so it will not travel with the code.",
+            "Remove '.creds' from .gitignore -- the store is encrypted and "
+            "meant to be committed.")
+    elif ignored is False:
+        row("git", "Ok", ".creds is committable.")
 
     table(rows, ["Check", "Status", "Detail", "Fix"])
     return cs.EXIT_GENERAL if any(r["Status"] == "Fail" for r in rows) else cs.EXIT_OK

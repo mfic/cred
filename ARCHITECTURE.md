@@ -188,6 +188,18 @@ file before publishing it, and — on Windows, where `File.Replace` keeps the
 destination before the swap too. Tightening afterwards would leave the new
 secret under the old file's permissions for as long as it took to get there.
 
+Reading those permissions back is `cred doctor`'s job, and it has two traps of
+its own. Both implementations compare **SIDs, not account names**: the same ACL
+reads `VORDEFINIERT\Administratoren` and `NT-AUTORITÄT\SYSTEM` on a German
+Windows, so a check that matched names would report a finding that is not there.
+And `Protect-CredPath` builds a fresh security descriptor, which throws
+`SeSecurityPrivilege` on a path whose DACL is *already* protected — swallowed as
+verbose output by design, so `cred doctor --repair` silently did nothing in the
+one situation it exists for. Repair therefore also drops foreign grants with
+`icacls /remove:g` (`Remove-CredForeignAccess`, `drop_foreign_access`), and
+leaves LocalSystem and Administrators alone, because they can read anything on
+the machine anyway and removing them buys nothing.
+
 ## One question, one place to answer it
 
 Two internal seams carry most of the module's weight.
@@ -388,7 +400,17 @@ filename in PowerShell; a staged write verified by length on one side and by con
 the other; a userpass credential whose declaration named only `user` injecting
 `$env:KEY` here and `$env:KEY_PASSWORD` there; and a binary-to-terminal guard
 keyed off the stored marker in one implementation and off NUL bytes in the
-other. `tests/fixtures/` is therefore the contract as an artifact: committed
+other.
+
+`cred doctor` had drifted furthest of all, and silently, because nothing
+compared the two: key permissions, a key stored inside a repository, git
+hygiene and `--repair` itself existed only in PowerShell, while the
+key-protection row existed only in Python. The two implementations were
+answering different questions about the same machine. They now report the same
+rows, in the same order, and differ only in the first one — `python` or
+`powershell`.
+
+`tests/fixtures/` is therefore the contract as an artifact: committed
 stores, and the exact resolution each implementation must produce.
 `tests/Conformance.Tests.ps1` holds both to it. A third implementation in `sh`
 would use the same corpus as its conformance suite.
