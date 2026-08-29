@@ -117,8 +117,11 @@ function Confirm-CredCliAction {
         return $true
     }
 
-    [Console]::Out.Write("$Question [y/N] ")
-    [Console]::Out.Flush()
+    # The prompt goes to stderr, not stdout, so it cannot end up in a pipe --
+    # the same reason python/cred.py writes its prompt with note() rather than
+    # through input()'s own prompt argument.
+    [Console]::Error.Write("$Question [y/N] ")
+    [Console]::Error.Flush()
     $answer = [Console]::In.ReadLine()
     if ($null -eq $answer) { return $false }
     return ($answer.Trim().ToLowerInvariant() -in @('y', 'yes'))
@@ -143,6 +146,7 @@ COMMANDS
       --provider <name>            Encryption backend (default: age)
       --recipient <key>            Recipient(s) instead of your own key
       --force                      Overwrite an existing store
+      -y, --yes                    Skip the confirmation --force asks for
 
   add|set <project>/<key>          Add or replace a credential
       --user <name>                Make it a username/password pair
@@ -206,6 +210,7 @@ COMMANDS
 
   providers                        Encryption backends and their status
   doctor [project]                 Check the setup and say how to fix it
+                                   Re-registers a cloned or renamed project
       --repair                     Re-apply restrictive permissions
 
   claude [project]                 Markdown brief for a Claude Code session
@@ -248,7 +253,7 @@ function Invoke-CredCli {
         }
 
         'init' {
-            $p = Read-CredOptions -Argv $rest -Switches @('force') -Short @{}
+            $p = Read-CredOptions -Argv $rest -Switches @('force', 'yes') -Short @{ 'y' = 'yes' }
             $o = $p.Options
             $call = @{}
             if ($p.Positional.Count -gt 0) { $call.Project = $p.Positional[0] }
@@ -257,6 +262,32 @@ function Invoke-CredCli {
             if (Get-Opt $o 'recipient')    { $call.Recipient = (Get-Opt $o 'recipient') -split ',' }
             if (Get-Opt $o 'path')         { $call.Path = Get-Opt $o 'path' }
             if (Get-Opt $o 'force')        { $call.Force = $true }
+
+            # The CLI owns the question and hands the module the answer. With
+            # nobody to ask it stays silent and lets the module refuse, so the
+            # message and its next steps render exactly as python/cred.py's --
+            # the local UsageError helper formats flat, without a 'Next:' block.
+            #
+            # Counting goes through the public surface: -Verify unions the
+            # declarations with what is really in the store, and falls back to
+            # the declarations alone when there is no key to decrypt with.
+            if ($call.Force) {
+                $root = if ($call.Path) { $call.Path } else { (Get-Location).ProviderPath }
+                $losing = 0
+                try { $losing = @(Get-CredList -Path $root -Verify).Count }
+                catch {
+                    try { $losing = @(Get-CredList -Path $root).Count } catch { $losing = 0 }
+                }
+                if ($losing -eq 0 -or (Get-Opt $o 'yes')) {
+                    $call.Yes = $true
+                }
+                elseif (-not [Console]::IsInputRedirected) {
+                    $ok = Confirm-CredCliAction `
+                        -Question "cred init --force will erase $losing credential(s) in '$root'."
+                    if (-not $ok) { Write-Line 'Cancelled.'; return 0 }
+                    $call.Yes = $true
+                }
+            }
 
             $r = Initialize-CredProject @call
             Write-Line "Created $($r.Project) in $($r.Root)"

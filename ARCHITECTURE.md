@@ -222,7 +222,8 @@ declaration speak for itself.
 Outside every repository, in `%APPDATA%\cred` or `$XDG_CONFIG_HOME/cred`:
 
 `identity.txt` — your secret key, permissions restricted to you.
-`projects.json` — name → path, so `cred get acme-api/x` works from anywhere.
+`projects.json` — name → path, so `cred get acme-api/x` works from anywhere. A
+cache, not an authority; see "The registry is a cache".
 
 ## Concurrency and durability
 
@@ -248,6 +249,48 @@ Two subtleties that cost real debugging and are worth not rediscovering:
   marshalling arrives as an empty string and throws. We name a backup next to
   the file and delete it immediately; if we die in between, what survives is the
   *previous* contents, which is the safe direction to fail in.
+
+## The registry is a cache
+
+`projects.json` maps a name to a path. The repository is the authority:
+`config.json` and the store travel with the folder and never record where they
+are, which is exactly what makes a clone work. The registry exists only so that
+`cred get acme-api/x` resolves from outside the repo.
+
+That makes it the one file in the design that can be *wrong* rather than merely
+missing — and for a long time only `cred init` ever wrote it. A `git clone` left
+a store nobody had registered; renaming a folder left a name pointing at a path
+that no longer existed. In both cases the unqualified form still worked from
+inside the folder while every `<project>/<key>` reference failed — including
+from inside the folder, because naming a project short-circuits directory
+resolution before the cwd is ever consulted.
+
+There was also no way out. `cred init` refuses on an existing store, and its
+refusal advised `cred init --force`, which rewrote `config.json` and the store
+as empty. The advice for a *renamed folder* therefore led, in two steps, to
+destroying the store being repaired.
+
+Three decisions follow:
+
+- **`cred doctor` reconciles the registry** against the project in front of it
+  (`reconcile_project_registration`, `Sync-CredProjectRegistration`). An
+  unregistered project is registered; a stale path is updated. If the name is
+  registered to a *different* directory that is itself a store, two clones are
+  competing for one name: that is reported and nothing is written, because
+  picking a winner would silently re-point the other one.
+- **It heals from `doctor`, not from the read path.** Resolving a project
+  already holds both the name and the path, so `cred get` could self-heal in one
+  line. It must not. `projects.json` is written with a plain atomic replace and
+  **no lock**, unlike the store — safe today only because the commands that
+  write it are explicit and human-invoked. Healing on every read would make two
+  processes reconciling different projects last-writer-wins on the whole file,
+  and one would silently lose its entry.
+- **`cred init --force` refuses when there is something to lose**, and names the
+  count. It counts without needing a key: the declarations in `config.json` are
+  plaintext and the store is consulted only as a best effort on top. That is
+  deliberately conservative in the safe direction — a store nobody here can
+  decrypt still cannot be erased by accident, while losing your key does not
+  also cost you the ability to start over. `--force --yes` is how you mean it.
 
 ## Encoding
 
@@ -390,6 +433,15 @@ per-cmdlet flag the way it reads:
    `-Confirm:$false` on the `Remove-Item` and `Remove-Variable` calls that clean
    up temp files, backups and plaintext -- housekeeping in a `finally` block is
    never a question for a user.
+
+`python/cred.py` has the peer helper, `confirm()`, for the same reason: one
+place decides how a destructive command asks, and what it does when nobody is
+there to answer. `cred rm`, `cred export` and -- because it can erase a store --
+`cred init --force` all go through it. Two details it owns: EOF counts as
+unanswerable, because a Windows shell can hand us a handle that claims to be a
+terminal but has no input behind it and that used to surface as a traceback; and
+the prompt is written to stderr in both implementations, so it cannot end up in
+a pipe the way `input()`'s own prompt argument would.
 
 ## The OS keystore
 

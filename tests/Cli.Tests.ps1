@@ -255,3 +255,94 @@ Stop-Transcript | Out-Null
         ($r.StdOut + $r.StdErr) | Should -Not -Match 'ERRORCANARY'
     }
 }
+
+Describe 'CLI init --force does not erase silently' -Skip:(-not $script:HasAge) {
+    # The peer of the same block in PythonCli.Tests.ps1. --force used to rewrite
+    # config.json and the store unconditionally, and the route into it was an
+    # error message about a *renamed* folder.
+    BeforeAll {
+        function New-ForceProject {
+            param([string]$Name)
+            $dir = Join-Path $script:Sandbox "$Name-$([guid]::NewGuid().ToString('N'))"
+            $null = New-Item -ItemType Directory -Path $dir -Force
+            $null = Invoke-Cred -CliArgs @('init', $Name, '--path', $dir)
+            $null = Invoke-Cred -CliArgs @('add', "$Name/tok", '--value', 'keepme', '--path', $dir)
+            return $dir
+        }
+    }
+
+    It 'refuses on a non-empty store, names the cost, and changes nothing' {
+        $dir = New-ForceProject -Name 'psguard'
+        $r = Invoke-Cred -CliArgs @('init', 'psguard', '--force', '--path', $dir)
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match 'will erase 1 credential'
+        $r.StdErr   | Should -Match 'cred doctor'
+        (Invoke-Cred -CliArgs @('get', 'tok', '-n', '--path', $dir)).StdOut |
+            Should -BeExactly 'keepme'
+    }
+
+    It 'proceeds when --yes is given' {
+        $dir = New-ForceProject -Name 'psguardyes'
+        $r = Invoke-Cred -CliArgs @('init', 'psguardyes', '--force', '--yes', '--path', $dir)
+        $r.ExitCode | Should -Be 0 -Because $r.StdErr
+        (Invoke-Cred -CliArgs @('list', '--path', $dir)).StdOut | Should -Match 'No credentials defined'
+    }
+
+    It 'does not ask when there is nothing to lose' {
+        $dir = Join-Path $script:Sandbox "psempty-$([guid]::NewGuid().ToString('N'))"
+        $null = New-Item -ItemType Directory -Path $dir -Force
+        $null = Invoke-Cred -CliArgs @('init', 'psempty', '--path', $dir)
+        $r = Invoke-Cred -CliArgs @('init', 'psempty', '--force', '--path', $dir)
+        $r.ExitCode | Should -Be 0 -Because $r.StdErr
+    }
+}
+
+Describe 'CLI doctor reconciles the project registry' -Skip:(-not $script:HasAge) {
+    BeforeAll {
+        function New-RegProject {
+            param([string]$Name)
+            $dir = Join-Path $script:Sandbox "$Name-$([guid]::NewGuid().ToString('N'))"
+            $null = New-Item -ItemType Directory -Path $dir -Force
+            $null = Invoke-Cred -CliArgs @('init', $Name, '--path', $dir)
+            $null = Invoke-Cred -CliArgs @('add', "$Name/tok", '--value', 'v', '--path', $dir)
+            return $dir
+        }
+    }
+
+    It 'registers a store that exists on disk but not in the registry' {
+        $dir = New-RegProject -Name 'psclone'
+        $null = Invoke-Cred -CliArgs @('project', 'rm', 'psclone')
+        (Invoke-Cred -CliArgs @('get', 'psclone/tok')).ExitCode | Should -Be 3
+
+        $d = Invoke-Cred -CliArgs @('doctor', '--path', $dir)
+        $d.StdOut | Should -Match 'registry\s+Fixed'
+        (Invoke-Cred -CliArgs @('get', 'psclone/tok', '-n')).StdOut | Should -BeExactly 'v'
+    }
+
+    It 'updates a stale path after the folder is renamed' {
+        $dir = New-RegProject -Name 'psrename'
+        $moved = Join-Path $script:Sandbox "psmoved-$([guid]::NewGuid().ToString('N'))"
+        Move-Item -LiteralPath $dir -Destination $moved
+        (Invoke-Cred -CliArgs @('get', 'psrename/tok')).ExitCode | Should -Be 3
+
+        $d = Invoke-Cred -CliArgs @('doctor', '--path', $moved)
+        $d.StdOut | Should -Match 'registry\s+Fixed'
+        (Invoke-Cred -CliArgs @('get', 'psrename/tok', '-n')).StdOut | Should -BeExactly 'v'
+    }
+
+    It 'reports a collision rather than stealing the name from another clone' {
+        $first  = New-RegProject -Name 'pscollide'
+        $second = Join-Path $script:Sandbox "pssecond-$([guid]::NewGuid().ToString('N'))"
+        Copy-Item -LiteralPath $first -Destination $second -Recurse
+
+        $d = Invoke-Cred -CliArgs @('doctor', '--path', $second)
+        $d.StdOut | Should -Match 'registry\s+Warn'
+        # Asserted against projects.json rather than the rendered table:
+        # Write-Table truncates to the console width, so both the Fix column and
+        # a long path depend on the terminal. The registry file is the contract.
+        $reg = (Get-Content -LiteralPath (Join-Path $script:CredHomeDir 'projects.json') -Raw |
+                ConvertFrom-Json)
+        $reg.projects.pscollide.path |
+            Should -Be (Resolve-Path -LiteralPath $first).ProviderPath
+    }
+}

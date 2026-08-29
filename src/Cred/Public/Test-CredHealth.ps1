@@ -77,21 +77,10 @@ function Test-CredHealth {
 
     Add-Row 'project' 'Ok' "$($ctx.Name) at $($ctx.Root)"
 
-    # A project resolves by walking up from the cwd, so a healthy store can be
-    # entirely absent from the registry -- fine from inside the directory,
-    # invisible by name from anywhere else. Doctor used to report that as Ok.
-    $entry = try { (Read-CredRegistry).projects[$ctx.Name] } catch { $null }
-    if ($entry -and $entry.path -eq $ctx.Root) {
-        Add-Row 'registry' 'Ok' "Registered as '$($ctx.Name)'."
-    }
-    elseif ($entry) {
-        Add-Row 'registry' 'Warn' "'$($ctx.Name)' is registered at '$($entry.path)', not here." `
-                "Point it here: cred project add '$($ctx.Root)'"
-    }
-    else {
-        Add-Row 'registry' 'Warn' "'$($ctx.Name)' is not registered, so 'cred $($ctx.Name)/<key>' only works from inside this directory." `
-                "Register it: cred project add '$($ctx.Root)'"
-    }
+    # The registry is a cache of name -> path that only 'cred init' ever wrote,
+    # so a clone or a rename left it stale with no command able to fix it.
+    $reg = Sync-CredProjectRegistration -Project $ctx
+    Add-Row 'registry' $reg.Status $reg.Detail $reg.Fix
 
     if (Test-Path -LiteralPath $ctx.StorePath -PathType Leaf) {
         Add-Row 'store' 'Ok' $ctx.StorePath

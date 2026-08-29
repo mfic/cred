@@ -293,3 +293,97 @@ Describe 'Python units' -Skip:(-not $script:HasPython) {
         $LASTEXITCODE | Should -Be 0 -Because ($out -join [Environment]::NewLine)
     }
 }
+
+Describe 'Python CLI init --force does not erase silently' -Skip:(-not ($script:HasAge -and $script:HasPython)) {
+    # --force used to rewrite config.json and the store unconditionally. The
+    # route into it was an error message about a *renamed* folder, so following
+    # the advice destroyed the store you were trying to reach.
+    BeforeEach {
+        $script:Guard = Join-Path $script:Sandbox "guard-$([guid]::NewGuid().ToString('N'))"
+        $null = New-Item -ItemType Directory -Path $script:Guard -Force
+        $null = Invoke-Cred -CliArgs @('init', 'guardproj') -WorkingDirectory $script:Guard
+        $null = Invoke-Cred -CliArgs @('add', 'guardproj/tok', '--value', 'keepme') `
+                            -WorkingDirectory $script:Guard
+    }
+
+    It 'refuses on a non-empty store, names the cost, and changes nothing' {
+        $r = Invoke-Cred -CliArgs @('init', '--force', 'guardproj') -WorkingDirectory $script:Guard
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match 'will erase 1 credential'
+        $r.StdErr   | Should -Match 'cred doctor'
+        (Invoke-Cred -CliArgs @('get', 'tok', '-n', '--path', $script:Guard)).StdOut |
+            Should -BeExactly 'keepme'
+    }
+
+    It 'proceeds when --yes is given' {
+        $r = Invoke-Cred -CliArgs @('init', '--force', '--yes', 'guardproj') `
+                         -WorkingDirectory $script:Guard
+        $r.ExitCode | Should -Be 0 -Because $r.StdErr
+        (Invoke-Cred -CliArgs @('list', '--path', $script:Guard)).StdOut |
+            Should -Match 'No credentials defined'
+    }
+
+    It 'does not ask when there is nothing to lose' {
+        $null = Invoke-Cred -CliArgs @('init', '--force', '--yes', 'guardproj') `
+                            -WorkingDirectory $script:Guard
+        $r = Invoke-Cred -CliArgs @('init', '--force', 'guardproj') -WorkingDirectory $script:Guard
+        $r.ExitCode | Should -Be 0 -Because $r.StdErr
+    }
+}
+
+Describe 'Python CLI doctor reconciles the project registry' -Skip:(-not ($script:HasAge -and $script:HasPython)) {
+    # projects.json is a cache that only `cred init` ever wrote, so a clone or a
+    # rename left every `cred get <project>/<key>` broken with no command able
+    # to repair it.
+    BeforeAll {
+        # Defined here rather than in the Describe body: Pester 5 does not carry
+        # a function declared there into the It blocks.
+        function New-GuardProject {
+            param([string]$Name)
+            $dir = Join-Path $script:Sandbox "$Name-$([guid]::NewGuid().ToString('N'))"
+            $null = New-Item -ItemType Directory -Path $dir -Force
+            $null = Invoke-Cred -CliArgs @('init', $Name) -WorkingDirectory $dir
+            $null = Invoke-Cred -CliArgs @('add', "$Name/tok", '--value', 'v') -WorkingDirectory $dir
+            return $dir
+        }
+    }
+
+    It 'registers a store that exists on disk but not in the registry' {
+        $dir = New-GuardProject -Name 'cloneproj'
+        # Forget it, the way a machine that has only ever cloned the repo would.
+        $null = Invoke-Cred -CliArgs @('project', 'rm', 'cloneproj')
+        (Invoke-Cred -CliArgs @('get', 'cloneproj/tok')).ExitCode | Should -Be 3
+
+        $d = Invoke-Cred -CliArgs @('doctor') -WorkingDirectory $dir
+        $d.StdOut | Should -Match 'registry\s+Fixed'
+        (Invoke-Cred -CliArgs @('get', 'cloneproj/tok', '-n')).StdOut | Should -BeExactly 'v'
+    }
+
+    It 'updates a stale path after the folder is renamed' {
+        $dir = New-GuardProject -Name 'renameproj'
+        $moved = Join-Path (Split-Path -Parent $dir) "renamed-$([guid]::NewGuid().ToString('N'))"
+        Move-Item -LiteralPath $dir -Destination $moved
+        (Invoke-Cred -CliArgs @('get', 'renameproj/tok')).ExitCode | Should -Be 3
+
+        $d = Invoke-Cred -CliArgs @('doctor') -WorkingDirectory $moved
+        $d.StdOut | Should -Match 'registry\s+Fixed'
+        (Invoke-Cred -CliArgs @('get', 'renameproj/tok', '-n')).StdOut | Should -BeExactly 'v'
+    }
+
+    It 'reports a collision rather than stealing the name from another clone' {
+        $first  = New-GuardProject -Name 'collideproj'
+        $second = Join-Path (Split-Path -Parent $first) "second-$([guid]::NewGuid().ToString('N'))"
+        Copy-Item -LiteralPath $first -Destination $second -Recurse
+
+        $d = Invoke-Cred -CliArgs @('doctor') -WorkingDirectory $second
+        $d.StdOut | Should -Match 'registry\s+Warn'
+        $d.StdOut | Should -Match 'cred project rm collideproj'
+        # The other clone keeps the name; nothing was written. Asserted against
+        # projects.json rather than the rendered table, so the check does not
+        # depend on how wide the terminal happens to be.
+        $reg = (Get-Content -LiteralPath (Join-Path $script:CredHomeDir 'projects.json') -Raw |
+                ConvertFrom-Json)
+        $reg.projects.collideproj.path |
+            Should -Be (Resolve-Path -LiteralPath $first).ProviderPath
+    }
+}
