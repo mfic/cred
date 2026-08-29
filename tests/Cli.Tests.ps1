@@ -297,6 +297,31 @@ Describe 'CLI init --force does not erase silently' -Skip:(-not $script:HasAge) 
     }
 }
 
+Describe 'CLI doctor repairs key permissions' -Skip:(-not $script:HasAge) {
+    # Protect-CredPath builds a fresh security descriptor, which fails with
+    # SeSecurityPrivilege on a path whose DACL is already protected -- and the
+    # failure is swallowed as verbose output, so --repair silently did nothing
+    # in the one situation it exists for.
+    It 'warns when another principal can read the key, and --repair clears it' `
+        -Skip:(-not (($PSVersionTable.PSEdition -eq 'Desktop') -or
+                     [bool](Get-Variable -Name IsWindows -ValueOnly -ErrorAction SilentlyContinue))) {
+        $null = Invoke-Cred -CliArgs @('keygen')
+        $key  = Join-Path $script:CredHomeDir 'identity.txt'
+        $key  | Should -Exist
+
+        # *S-1-1-0 is Everyone by SID, so this works on a localised Windows.
+        & icacls $key '/grant' '*S-1-1-0:(R)' 2>&1 | Out-Null
+        (Invoke-Cred -CliArgs @('doctor')).StdOut | Should -Match 'identity permissions\s+Warn'
+
+        (Invoke-Cred -CliArgs @('doctor', '--repair')).StdOut |
+            Should -Match 'identity permissions\s+Ok'
+    }
+
+    It 'reports how the key is protected' {
+        (Invoke-Cred -CliArgs @('doctor')).StdOut | Should -Match 'identity protection\s+Ok'
+    }
+}
+
 Describe 'CLI doctor reconciles the project registry' -Skip:(-not $script:HasAge) {
     BeforeAll {
         function New-RegProject {

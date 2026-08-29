@@ -210,6 +210,221 @@ def restrict_path(path: Path) -> bool:
         return False
 
 
+# ------------------------------------------- permissions, read back again ---
+# restrict_path sets permissions; these report on them, for `cred doctor`.
+# Windows answers are compared as SIDs and not as account names, because the
+# names are localised -- BUILTIN\Administrators is VORDEFINIERT\Administratoren
+# on a German Windows -- and a check that read names would report a finding
+# that is not there. Peer of Test-CredPathIsPrivate in Private/Platform.ps1.
+
+_SID_LOCAL_SYSTEM = "S-1-5-18"
+_SID_ADMINISTRATORS = "S-1-5-32-544"
+
+
+def _sid_to_string(sid_ptr: int) -> Optional[str]:
+    import ctypes
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p,
+                                                ctypes.POINTER(ctypes.c_wchar_p)]
+    advapi32.ConvertSidToStringSidW.restype = ctypes.c_int
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+    out = ctypes.c_wchar_p()
+    if not advapi32.ConvertSidToStringSidW(ctypes.c_void_p(sid_ptr), ctypes.byref(out)):
+        return None
+    try:
+        return out.value
+    finally:
+        kernel32.LocalFree(ctypes.cast(out, ctypes.c_void_p))
+
+
+def _current_user_sid() -> Optional[str]:
+    import ctypes
+    from ctypes import wintypes
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                          ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                             ctypes.c_void_p, wintypes.DWORD,
+                                             ctypes.POINTER(wintypes.DWORD)]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+    TOKEN_QUERY, TOKEN_USER_CLASS = 0x0008, 1
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY,
+                                     ctypes.byref(token)):
+        return None
+    try:
+        size = wintypes.DWORD(0)
+        advapi32.GetTokenInformation(token, TOKEN_USER_CLASS, None, 0,
+                                     ctypes.byref(size))
+        buf = ctypes.create_string_buffer(size.value)
+        if not advapi32.GetTokenInformation(token, TOKEN_USER_CLASS, buf,
+                                            size.value, ctypes.byref(size)):
+            return None
+        # TOKEN_USER opens with a SID_AND_ATTRIBUTES whose first member is the
+        # PSID, so the pointer we want is the first machine word of the buffer.
+        return _sid_to_string(ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0])
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _dacl_allow_sids(path: Path) -> Optional[List[str]]:
+    """Every SID with an allow entry on `path`, or None if it cannot be read."""
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class ACL_HEAD(ctypes.Structure):
+        _fields_ = [("AclRevision", ctypes.c_ubyte), ("Sbz1", ctypes.c_ubyte),
+                    ("AclSize", ctypes.c_ushort), ("AceCount", ctypes.c_ushort),
+                    ("Sbz2", ctypes.c_ushort)]
+
+    class ACE_HEADER(ctypes.Structure):
+        _fields_ = [("AceType", ctypes.c_ubyte), ("AceFlags", ctypes.c_ubyte),
+                    ("AceSize", ctypes.c_ushort)]
+
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_int, ctypes.c_uint,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.GetNamedSecurityInfoW.restype = ctypes.c_uint
+    advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD,
+                                ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.GetAce.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+    SE_FILE_OBJECT, DACL_SECURITY_INFORMATION = 1, 0x00000004
+    ACCESS_ALLOWED_ACE_TYPE = 0
+
+    pdacl, psd = ctypes.c_void_p(), ctypes.c_void_p()
+    if advapi32.GetNamedSecurityInfoW(str(path), SE_FILE_OBJECT,
+                                      DACL_SECURITY_INFORMATION, None, None,
+                                      ctypes.byref(pdacl), None,
+                                      ctypes.byref(psd)) != 0:
+        return None
+    try:
+        if not pdacl:
+            return None                      # a NULL DACL grants everyone access
+        acl = ctypes.cast(pdacl, ctypes.POINTER(ACL_HEAD)).contents
+        sids: List[str] = []
+        for i in range(acl.AceCount):
+            ace = ctypes.c_void_p()
+            if not advapi32.GetAce(pdacl, i, ctypes.byref(ace)):
+                continue
+            header = ctypes.cast(ace, ctypes.POINTER(ACE_HEADER)).contents
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE:
+                continue
+            # ACCESS_ALLOWED_ACE is a 4-byte header, a 4-byte mask, then the SID.
+            text = _sid_to_string(ace.value + 8)
+            if text:
+                sids.append(text)
+        return sids
+    finally:
+        if psd:
+            kernel32.LocalFree(psd)
+
+
+def path_is_private(path: Path) -> bool:
+    """True when only this user can read `path`. Best effort, never a gate.
+
+    Reported by `cred doctor` and nothing else: a permission check that fails
+    closed would otherwise stop someone managing their own secrets on a
+    filesystem that cannot answer the question.
+    """
+    if not path.exists():
+        return False
+    if not is_windows():
+        try:
+            return (path.stat().st_mode & 0o077) == 0
+        except OSError:
+            return False
+    try:
+        sids = _dacl_allow_sids(path)
+        me = _current_user_sid()
+    except Exception:
+        return False
+    if sids is None or me is None:
+        return False
+    # LocalSystem and Administrators can read anything anyway, so their
+    # presence is not a finding.
+    benign = {me, _SID_LOCAL_SYSTEM, _SID_ADMINISTRATORS}
+    return all(s in benign for s in sids)
+
+
+def drop_foreign_access(path: Path) -> None:
+    """Remove explicit grants held by anyone but this user.
+
+    restrict_path's `icacls /inheritance:r /grant:r` replaces *this* user's
+    entry and drops inherited ones, but an explicit grant made to somebody else
+    survives it untouched -- which is the one thing `cred doctor --repair`
+    exists to undo. Benign holders are left alone: LocalSystem and
+    Administrators can read anything on the machine anyway, so removing them
+    buys nothing and is a change this command has no reason to make.
+    """
+    if not is_windows():
+        return
+    me = _current_user_sid()
+    if not me:
+        return
+    foreign = [s for s in (_dacl_allow_sids(path) or [])
+               if s not in (me, _SID_LOCAL_SYSTEM, _SID_ADMINISTRATORS)]
+    if not foreign:
+        return
+    argv = ["icacls", str(path)]
+    for sid in foreign:
+        argv += ["/remove:g", f"*{sid}"]
+    try:
+        subprocess.run(argv, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=False)
+    except Exception:
+        pass
+
+
+def repair_permissions() -> Tuple[Path, List[Path]]:
+    """Re-apply restrictive permissions to the cred home and its files.
+
+    Peer of Repair-CredHealth. Only the directory cred owns; a key placed
+    elsewhere with CRED_IDENTITY_FILE is the caller's to look after. Returns
+    the paths restrict_path could not fix -- it never raises, so a silent
+    failure used to be indistinguishable from success.
+    """
+    home = cred_home()
+    home.mkdir(parents=True, exist_ok=True)
+    failed = []
+    if not restrict_path(home):
+        failed.append(home)
+    drop_foreign_access(home)
+    for child in home.iterdir():
+        if child.is_file():
+            if not restrict_path(child):
+                failed.append(child)
+            drop_foreign_access(child)
+    return home, failed
+
+
+def git_ignores(root: Path, relative: str) -> Optional[bool]:
+    """Whether git ignores `relative` inside `root`. None if git cannot say."""
+    if not (root / ".git").exists():
+        return None
+    git = find_executable("git")
+    if not git:
+        return None
+    try:
+        rc, _, _ = _run([git, "-C", str(root), "check-ignore", "-q", relative],
+                        timeout=15)
+    except CredError:
+        return None
+    return rc == 0                          # 1 means "not ignored", 128 an error
+
+
 def find_executable(name: str, override_env: Optional[str] = None) -> Optional[str]:
     if override_env:
         p = os.environ.get(override_env)

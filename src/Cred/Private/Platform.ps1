@@ -323,6 +323,52 @@ function Test-CredPathIsPrivate {
     }
 }
 
+function Remove-CredForeignAccess {
+    <#
+        .SYNOPSIS
+        Drop explicit grants held by anyone but the current user.
+
+        .DESCRIPTION
+        Protect-CredPath replaces this user's entry and drops inherited ones,
+        but an explicit grant made to somebody else survives it -- and on a path
+        whose DACL is already protected, building a fresh descriptor fails with
+        SeSecurityPrivilege and is swallowed as verbose output, so
+        `cred doctor --repair` silently did nothing in the one situation it
+        exists for. icacls does the job either way.
+
+        LocalSystem and Administrators are left alone: they can read anything on
+        the machine anyway, so removing them buys nothing. Peer of
+        drop_foreign_access in python/cred_store.py.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-CredIsWindows)) { return }
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+
+    try {
+        $me      = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $acl     = Get-CredAcl -Path $Path
+        $foreign = @()
+        foreach ($rule in $acl.Access) {
+            $sid = try { $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
+                   catch { $null }
+            if ($sid -and $sid -ne $me -and
+                $sid -notin @('S-1-5-18', 'S-1-5-32-544') -and $sid -notin $foreign) {
+                $foreign += $sid
+            }
+        }
+        if (-not $foreign) { return }
+
+        $icaclsArgs = @($Path)
+        foreach ($sid in $foreign) { $icaclsArgs += @('/remove:g', "*$sid") }
+        & icacls @icaclsArgs 2>&1 | Out-Null
+    }
+    catch {
+        Write-Verbose "Could not drop foreign access on '$Path': $($_.Exception.Message)"
+    }
+}
+
 function ConvertTo-CredWindowsArgumentString {
     <#
         .SYNOPSIS
