@@ -1117,6 +1117,85 @@ def register_project(name: str, path: Path) -> None:
     write_registry(reg)
 
 
+def registered_path(name: str) -> Optional[Path]:
+    """Where the registry thinks `name` lives, if it knows at all."""
+    entry = read_registry()["projects"].get(name)
+    if not entry or not entry.get("path"):
+        return None
+    return Path(str(entry["path"]))
+
+
+def is_store_root(path: Path) -> bool:
+    return (path / CREDS_DIR / CONFIG_NAME).is_file()
+
+
+def reconcile_project_registration(project: "Project") -> Dict[str, str]:
+    """Make this machine's registry agree with the project in front of us.
+
+    The registry is a cache -- name -> path -- and the repository is the
+    authority: `config.json` and the store travel with the folder and never
+    record where they are. A clone or a rename therefore leaves the cache
+    empty or stale, and every `cred get <project>/<key>` fails while the
+    unqualified form from inside the folder still works.
+
+    Healing is safe exactly when it is unambiguous. If the name is registered
+    to a *different* directory that is itself a store, two clones are
+    competing for one name; picking a winner here would silently re-point the
+    other one, so that case is reported and nothing is written.
+
+    This is reached from `cred doctor`, not from the read path, on purpose:
+    `projects.json` is written without a lock, so healing on every `cred get`
+    would be last-writer-wins between concurrent processes.
+    """
+    root = project.root.resolve()
+    known = registered_path(project.name)
+
+    if known is None:
+        register_project(project.name, root)
+        return {"status": "Fixed",
+                "detail": f"Registered '{project.name}' -> {root}", "fix": ""}
+
+    try:
+        same = known.resolve() == root
+    except OSError:
+        same = False
+    if same:
+        return {"status": "Ok", "detail": str(root), "fix": ""}
+
+    if is_store_root(known):
+        return {"status": "Warn",
+                "detail": f"'{project.name}' is registered to '{known}', "
+                          "which is also a store.",
+                "fix": f"cred project rm {project.name}, then re-run here"}
+
+    register_project(project.name, root)
+    return {"status": "Fixed",
+            "detail": f"Updated '{project.name}' -> {root}", "fix": ""}
+
+
+def existing_credential_count(root: Path) -> int:
+    """How much a store would lose to `cred init --force`, without the key.
+
+    `config.json` is plaintext, so the declared set is always countable; the
+    store is consulted only as a best effort on top of it. Deliberately
+    conservative in the safe direction -- a store nobody here can decrypt
+    counts as whatever the config declares -- so losing your key does not also
+    take away your ability to start over.
+    """
+    if not (root / CREDS_DIR / CONFIG_NAME).is_file():
+        return 0
+    try:
+        project = Project(root)
+    except CredError:
+        return 0
+    count = len(project.config.get("credentials") or {})
+    try:
+        count = max(count, len(read_values(project)))
+    except CredError:
+        pass
+    return count
+
+
 def split_reference(ref: str) -> Tuple[Optional[str], Optional[str]]:
     """'proj/key' -> ('proj','key'); 'key' -> (None,'key'). Keys cannot hold '/'."""
     if "/" in ref:
@@ -1194,7 +1273,7 @@ def resolve_project(name: Optional[str] = None,
                 raise CredError(
                     f"Project '{name}' is registered at '{candidate}', "
                     "but that directory no longer exists.",
-                    ["Re-register it: cd <new-location>; cred init",
+                    ["If you moved or renamed it: cd <new-location>; cred doctor",
                      f"Or forget it: cred project rm {name}"], EXIT_NOT_FOUND)
             return Project(find_project_root(candidate) or candidate)
         if Path(name).is_dir():

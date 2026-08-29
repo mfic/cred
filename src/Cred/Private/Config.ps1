@@ -66,6 +66,121 @@ function Register-CredProjectPath {
     Write-CredRegistry -Registry $reg
 }
 
+function Get-CredRegisteredPath {
+    <#
+        .SYNOPSIS
+        Where the registry thinks $Name lives, or $null if it does not know.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][string]$Name)
+
+    $reg = Read-CredRegistry
+    if (-not $reg.projects.Contains($Name)) { return $null }
+    $entry = $reg.projects[$Name]
+    if (-not $entry -or -not $entry.path) { return $null }
+    return [string]$entry.path
+}
+
+function Test-CredStoreRoot {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][string]$Path)
+
+    $config = Join-Path (Join-Path $Path $script:CredDirName) $script:CredConfigFileName
+    return (Test-Path -LiteralPath $config -PathType Leaf)
+}
+
+function Sync-CredProjectRegistration {
+    <#
+        .SYNOPSIS
+        Make this machine's registry agree with the project in front of us.
+
+        .DESCRIPTION
+        The registry is a cache -- name -> path -- and the repository is the
+        authority: config.json and the store travel with the folder and never
+        record where they are. A clone or a rename therefore leaves the cache
+        empty or stale, and every `cred get <project>/<key>` fails while the
+        unqualified form from inside the folder still works.
+
+        Healing is safe exactly when it is unambiguous. If the name is
+        registered to a *different* directory that is itself a store, two
+        clones are competing for one name; picking a winner here would silently
+        re-point the other one, so that case is reported and nothing written.
+
+        Reached from `cred doctor`, not from the read path, on purpose:
+        projects.json is written without a lock, so healing on every `cred get`
+        would be last-writer-wins between concurrent processes.
+
+        Peer of reconcile_project_registration in python/cred_store.py.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param([Parameter(Mandatory)][object]$Project)
+
+    $root  = (Resolve-Path -LiteralPath $Project.Root).ProviderPath
+    $known = Get-CredRegisteredPath -Name $Project.Name
+
+    if (-not $known) {
+        Register-CredProjectPath -Name $Project.Name -Path $root
+        return [pscustomobject]@{
+            Status = 'Fixed'; Detail = "Registered '$($Project.Name)' -> $root"; Fix = '' }
+    }
+
+    $same = $false
+    try { $same = ((Resolve-Path -LiteralPath $known -ErrorAction Stop).ProviderPath -eq $root) }
+    catch { $same = $false }
+    if ($same) {
+        return [pscustomobject]@{ Status = 'Ok'; Detail = $root; Fix = '' }
+    }
+
+    if (Test-CredStoreRoot -Path $known) {
+        return [pscustomobject]@{
+            Status = 'Warn'
+            Detail = "'$($Project.Name)' is registered to '$known', which is also a store."
+            Fix    = "cred project rm $($Project.Name), then re-run here"
+        }
+    }
+
+    Register-CredProjectPath -Name $Project.Name -Path $root
+    return [pscustomobject]@{
+        Status = 'Fixed'; Detail = "Updated '$($Project.Name)' -> $root"; Fix = '' }
+}
+
+function Get-CredExistingCredentialCount {
+    <#
+        .SYNOPSIS
+        How much a store would lose to `cred init --force`, without the key.
+
+        .DESCRIPTION
+        config.json is plaintext, so the declared set is always countable; the
+        store is consulted only as a best effort on top of it. Deliberately
+        conservative in the safe direction -- a store nobody here can decrypt
+        counts as whatever the config declares -- so losing your key does not
+        also take away your ability to start over.
+
+        Peer of existing_credential_count in python/cred_store.py.
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([Parameter(Mandatory)][string]$Path)
+
+    $config = Join-Path (Join-Path $Path $script:CredDirName) $script:CredConfigFileName
+    if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { return 0 }
+
+    $ctx = try { Resolve-CredProject -Path $Path } catch { $null }
+    if (-not $ctx) { return 0 }
+
+    $count = 0
+    if ($ctx.Config.credentials) { $count = @($ctx.Config.credentials.Keys).Count }
+    try {
+        $stored = @((Read-CredStoreValues -Project $ctx).Keys).Count
+        if ($stored -gt $count) { $count = $stored }
+    }
+    catch { }
+    return $count
+}
+
 function Find-CredProjectRoot {
     <#
         .SYNOPSIS

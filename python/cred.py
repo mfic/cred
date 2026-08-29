@@ -40,6 +40,7 @@ COMMANDS
       --provider <name>            Encryption backend (default: age)
       --recipient <key>            Recipient(s) instead of your own key
       --force                      Overwrite an existing store
+      -y, --yes                    Skip the confirmation --force asks for
 
   add|set <project>/<key>          Add or replace a credential
       --user <name>                Make it a username/password pair
@@ -95,6 +96,7 @@ COMMANDS
   providers                        Encryption backends and their status
   doctor [project]                 Check the setup and say how to fix it
       --repair                     Re-apply restrictive permissions
+                                   Re-registers a cloned or renamed project
 
   claude [project]                 Markdown brief for a Claude Code session
       --write                      Write it into the repo's CLAUDE.md
@@ -205,6 +207,39 @@ def prompt_secret(label: str) -> str:
     return getpass.getpass(f"{label}: ")
 
 
+def confirm(question: str, yes: bool = False, require_tty: bool = True,
+            message: Optional[str] = None,
+            next_steps: Optional[List[str]] = None) -> bool:
+    """Ask the one question a destructive command needs. True means proceed.
+
+    The peer of Confirm-CredCliAction in bin/cred-ps.ps1, and here for the same
+    reason: the decision belongs to the CLI, in one place, so every destructive
+    command asks it the same way and behaves the same way when nobody is there
+    to answer.
+
+    `require_tty` makes an unanswerable prompt an error rather than a silent
+    yes. EOF counts as unanswerable: a Windows shell can hand us a handle that
+    claims to be a terminal but has no input behind it, and that used to reach
+    the user as a traceback.
+    """
+    if yes:
+        return True
+    if sys.stdin.isatty():
+        # The prompt goes to stderr, like note(), so it cannot end up in a pipe
+        # -- input()'s own prompt argument writes to stdout.
+        sys.stderr.write(f"{question} [y/N] ")
+        sys.stderr.flush()
+        try:
+            return input().strip().lower() in ("y", "yes")
+        except EOFError:
+            sys.stderr.write("\n")
+    if not require_tty:
+        return True
+    raise cs.CredError(message or question,
+                       next_steps or ["Pass --yes to confirm non-interactively."],
+                       cs.EXIT_USAGE)
+
+
 def read_stdin_secret() -> str:
     # Raw bytes, decoded as UTF-8 by us -- never the console code page.
     data = sys.stdin.buffer.read().decode("utf-8")
@@ -218,7 +253,7 @@ def read_stdin_secret() -> str:
 # --------------------------------------------------------------- commands ---
 
 def cmd_init(rest: List[str]) -> int:
-    opts, pos = read_options(rest, switches=("force",))
+    opts, pos = read_options(rest, switches=("force", "yes"), short={"y": "yes"})
     root = Path(opts.get("path") or Path.cwd()).resolve()
     name = pos[0] if pos else (opts.get("project") or root.name)
 
@@ -232,8 +267,26 @@ def cmd_init(rest: List[str]) -> int:
         raise cs.CredError(f"'{root}' already has a credential store.",
                            [f"Add a credential:  cred add {name}/<key>",
                             f"See what is there: cred list {name}",
-                            "Start over:        cred init --force"],
+                            "If it was renamed or cloned: cred doctor",
+                            "Start over (erases it): cred init --force"],
                            cs.EXIT_USAGE)
+
+    # --force means "overwrite", and overwriting an empty store is cheap. It is
+    # only a real decision when there is something to lose, so that is the only
+    # time it asks -- and it names the number, because the whole failure mode is
+    # someone reaching for --force to fix a stale path after a rename.
+    if config_path.is_file() and opts.get("force"):
+        losing = cs.existing_credential_count(root)
+        if losing and not confirm(
+                f"cred init --force will erase {losing} credential(s) in '{root}'.",
+                yes=bool(opts.get("yes")),
+                next_steps=[
+                    "Nothing has been changed.",
+                    "If this folder was renamed or cloned, --force is not the "
+                    "fix: run 'cred doctor' here instead.",
+                    "To start over anyway: cred init --force --yes"]):
+            out("Cancelled.")
+            return cs.EXIT_OK
 
     provider_name = str(opts.get("provider") or "age")
     prov = cs.get_provider(provider_name)
@@ -529,15 +582,12 @@ def cmd_rm(rest: List[str]) -> int:
     proj_ref, key = cs.split_reference(pos[0])
     project = cs.resolve_project(opts.get("project") or proj_ref, opts.get("path"))
 
-    if not opts.get("yes"):
-        if not sys.stdin.isatty():
-            raise cs.CredError("Refusing to delete without confirmation.",
-                               ["Pass --yes to delete non-interactively."],
-                               cs.EXIT_USAGE)
-        answer = input(f"Remove {project.name}/{key}? [y/N] ").strip().lower()
-        if answer not in ("y", "yes"):
-            out("Cancelled.")
-            return cs.EXIT_OK
+    if not confirm(f"Remove {project.name}/{key}?",
+                   yes=bool(opts.get("yes")),
+                   message="Refusing to delete without confirmation.",
+                   next_steps=["Pass --yes to delete non-interactively."]):
+        out("Cancelled.")
+        return cs.EXIT_OK
 
     def mutate(values, proj):
         cs.entry_or_raise(proj, key, values)
@@ -855,24 +905,12 @@ def cmd_doctor(rest: List[str]) -> int:
 
     row("project", "Ok", f"{project.name} at {project.root}")
 
-    # A project resolves by walking up from the cwd, so a healthy store can be
-    # entirely absent from the registry -- fine from inside the directory,
-    # invisible by name from anywhere else. Doctor used to report that as Ok.
-    try:
-        entry = cs.read_registry()["projects"].get(project.name)
-    except cs.CredError:
-        entry = None
-    if entry and Path(entry["path"]) == project.root:
-        row("registry", "Ok", f"Registered as '{project.name}'.")
-    elif entry:
-        row("registry", "Warn",
-            f"'{project.name}' is registered at '{entry['path']}', not here.",
-            f"Point it here: cred project add '{project.root}'")
-    else:
-        row("registry", "Warn",
-            f"'{project.name}' is not registered, so 'cred {project.name}/<key>' "
-            "only works from inside this directory.",
-            f"Register it: cred project add '{project.root}'")
+    # The registry is a cache of name -> path that only 'cred init' ever wrote,
+    # so a clone or a rename left it stale with no command able to fix it.
+    reg = cs.reconcile_project_registration(project)
+    row("registry", reg["status"], reg["detail"], reg["fix"])
+
+
     if project.store_path.is_file():
         row("store", "Ok", str(project.store_path))
         try:
@@ -1156,11 +1194,12 @@ def cmd_export(rest: List[str]) -> int:
     dest.mkdir(parents=True, exist_ok=True)
     cs.restrict_path(dest)
 
-    if not opts.get("yes") and sys.stdin.isatty():
-        answer = input(f"Write credential files into '{dest}'? [y/N] ").strip().lower()
-        if answer not in ("y", "yes"):
-            out("Cancelled.")
-            return cs.EXIT_OK
+    # Unlike rm, a non-interactive export proceeds: it is reached from migration
+    # scripts, and refusing there would be a behaviour change, not a safety win.
+    if not confirm(f"Write credential files into '{dest}'?",
+                   yes=bool(opts.get("yes")), require_tty=False):
+        out("Cancelled.")
+        return cs.EXIT_OK
 
     values = cs.read_values(project)
     defs = project.config.get("credentials") or {}

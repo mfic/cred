@@ -27,7 +27,8 @@ function Initialize-CredProject {
         [string]$Path,
         [ValidateNotNullOrEmpty()][string]$Provider = 'age',
         [string[]]$Recipient,
-        [switch]$Force
+        [switch]$Force,
+        [switch]$Yes
     )
 
     if (-not $Path) { $Path = (Get-Location).ProviderPath }
@@ -53,7 +54,23 @@ function Initialize-CredProject {
             -Message "'$root' already has a credential store." `
             -Next @("Add a credential:  cred add $Project/<key>",
                     "See what is there: cred list $Project",
-                    "Start over:        cred init --force"))
+                    "If it was renamed or cloned: cred doctor",
+                    "Start over (erases it): cred init --force"))
+    }
+
+    # -Force means "overwrite", and overwriting an empty store is cheap. It is
+    # only a real decision when there is something to lose, so that is the only
+    # time it refuses -- and it names the number, because the whole failure mode
+    # is someone reaching for --force to fix a stale path after a rename.
+    if ((Test-Path -LiteralPath $configPath) -and $Force -and -not $Yes) {
+        $losing = Get-CredExistingCredentialCount -Path $root
+        if ($losing -gt 0) {
+            throw (New-CredErrorRecord -Code 'Usage' -Target $configPath `
+                -Message "cred init --force will erase $losing credential(s) in '$root'." `
+                -Next @("Nothing has been changed.",
+                        "If this folder was renamed or cloned, --force is not the fix: run 'cred doctor' here instead.",
+                        "To start over anyway: cred init --force --yes"))
+        }
     }
 
     if (-not $PSCmdlet.ShouldProcess($root, 'Initialize credential store')) { return }
