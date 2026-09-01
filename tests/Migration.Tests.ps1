@@ -10,6 +10,8 @@
 BeforeDiscovery {
     $script:HasAge = [bool](Get-Command age -ErrorAction SilentlyContinue) -or
                      (Test-Path "$env:LOCALAPPDATA\Microsoft\WinGet\Links\age.exe")
+    $script:OnWindows = ($PSVersionTable.PSEdition -eq 'Desktop') -or
+                        [bool](Get-Variable -Name IsWindows -ValueOnly -ErrorAction SilentlyContinue)
 }
 
 BeforeAll {
@@ -182,7 +184,11 @@ Describe 'Import-Cred' -Skip:(-not $script:HasAge) {
     }
 }
 
-Describe 'Export-Cred' -Skip:(-not $script:HasAge) {
+# Export-Clixml only protects a SecureString on Windows, so off Windows
+# Export-Cred refuses rather than writing a file that looks encrypted and is
+# not. These three assert the Windows shape and can only run there; the
+# refusal itself is covered below, on the platform that does the refusing.
+Describe 'Export-Cred' -Skip:(-not ($script:HasAge -and $script:OnWindows)) {
 
     It 'writes files PowerShell can read straight back as PSCredentials' {
         $p = New-TestProject
@@ -215,5 +221,38 @@ Describe 'Export-Cred' -Skip:(-not $script:HasAge) {
         $dest = Join-Path $script:Sandbox "warn-$($p.Name)"
         $null = Export-Cred -Path $dest -Project $p.Name -Confirm:$false -WarningVariable w -WarningAction SilentlyContinue
         "$w" | Should -Match 'Delete them once the migration is done'
+    }
+}
+
+Describe 'Export-Cred off Windows' -Skip:(-not ($script:HasAge -and -not $script:OnWindows)) {
+
+    It 'refuses rather than writing a file that only looks protected' {
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/db" -User 'svc' -Secret 'p@ss'
+        $dest = Join-Path $script:Sandbox "refuse-$($p.Name)"
+
+        { Export-Cred -Path $dest -Project $p.Name -Confirm:$false } |
+            Should -Throw -ExpectedMessage '*plain text*'
+
+        # The refusal must come before any work: a directory of half-written
+        # plaintext would be the exact thing it is refusing to produce.
+        Test-Path -LiteralPath $dest | Should -BeFalse
+    }
+
+    It 'still exports when the caller says -Force, and says what that cost' {
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/db" -User 'svc' -Secret 'p@ss ünï ☃'
+        $dest = Join-Path $script:Sandbox "forced-$($p.Name)"
+
+        $rows = @(Export-Cred -Path $dest -Project $p.Name -Force -Confirm:$false `
+                              -WarningVariable w -WarningAction SilentlyContinue)
+        $rows.Count | Should -Be 1
+        "$w" | Should -Match 'Delete them once the migration is done'
+
+        # Import-Clixml round-trips it here too -- the difference is that the
+        # file it read is plaintext, which is why -Force had to be asked for.
+        $back = Import-Clixml -LiteralPath $rows[0].File
+        $back.UserName | Should -Be 'svc'
+        $back.GetNetworkCredential().Password | Should -BeExactly 'p@ss ünï ☃'
     }
 }
