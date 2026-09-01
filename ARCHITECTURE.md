@@ -397,8 +397,12 @@ By default the age key is a file, protected by its ACL (or mode 600). That is
 the floor, not the ceiling: anything running as you can read it, and so can
 anyone who takes the disk.
 
-`cred key protect` wraps it with DPAPI, bound to the current Windows account.
-The mechanism is worth understanding because it is the reason the store stays
+`cred key protect` wraps it with whatever this machine's OS keystore is: DPAPI
+on Windows, `systemd-creds` on Linux. Both bind the result to the current
+account on the current machine, and neither prompts -- a keystore that asks a
+question is useless to a script, which is where credentials are needed.
+
+The shape is worth understanding because it is the reason the store stays
 portable:
 
 - Only the **key** is OS-bound. The **store** is untouched and stays plain age,
@@ -416,12 +420,36 @@ portable:
   not merely that a byte array in memory was.
 
 Wrapping is detected by file content, not by filename, so renaming a key cannot
-misrepresent it. Both implementations wrap and unwrap -- Python through `ctypes`
-against `CryptProtectData`/`CryptUnprotectData` -- so a wrapped key never ties
-you to one of them.
+misrepresent it. The wrapped file names its own mechanism in a `protection`
+field, which is what lets more than one exist: `identity_text` dispatches on
+what the file says rather than on what the platform is, so a key wrapped on
+another machine gets a refusal that explains itself instead of a decryption
+failure.
 
-The trade is stated at the point of use and again here: a DPAPI-wrapped key does
-not survive a new machine, a reinstall, or a changed account. `cred key protect`
+The two mechanisms:
+
+- **DPAPI** (Windows), through `ctypes` against
+  `CryptProtectData`/`CryptUnprotectData`, and through
+  `System.Security.Cryptography.ProtectedData` in PowerShell.
+- **`systemd-creds`** (Linux, systemd 256+), scoped to the calling user. This
+  is not a permission check: the uid, the username and the machine-id are
+  folded into the encryption key, and the uid comes from `SO_PEERCRED` on the
+  socket rather than from anything the caller claims. A blob belonging to
+  another account is not refused, it is undecryptable. Python speaks Varlink to
+  `/run/systemd/io.systemd.Credentials` directly -- NUL-terminated JSON over a
+  unix socket, a dozen lines of stdlib -- which keeps the blob off a command
+  line, the same rule age is held to. Availability is settled by a probe round
+  trip, never by parsing a version out of `/etc/os-release`: that gets Ubuntu
+  24.04 and Debian 12 wrong, and they are two of the most widely deployed bases
+  there are. See `docs/os-keystores.md` for why the obvious alternatives
+  (Secret Service, the kernel keyring, TPM2 directly) all fail.
+
+The PowerShell edition wraps and unwraps DPAPI only. A `systemd-creds-user` key
+is therefore readable by `cred` but not yet by `cred-ps`, which reports it as a
+mechanism it cannot open rather than failing obscurely.
+
+The trade is stated at the point of use and again here: a wrapped key does not
+survive a new machine, a reinstall, or a changed account. `cred key protect`
 takes `--backup` and warns when you do not use it.
 
 ## The PSCredential boundary
@@ -477,8 +505,8 @@ src/Cred/
     CommandLine.ps1     argv parsing, callable so it can be tested
 python/
   cred.py         the CLI: argv, output, exit codes. No behaviour.
-  cred_store.py   the store as a library: providers, formats, locking, DPAPI,
-                  Clixml
+  cred_store.py   the store as a library: providers, formats, locking,
+                  keystores, Clixml
 tests/
   Unit.Tests.ps1         pure functions, file plumbing, provider contract
   Integration.Tests.ps1  real age, three access paths, encoding

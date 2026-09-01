@@ -197,6 +197,20 @@ def identity_path(config: Optional[Dict[str, Any]] = None) -> Path:
     return cred_home() / "identity.txt"
 
 
+def identity_protection(path: Path) -> str:
+    """The mechanism a wrapped key names, or 'file-permissions' if it is plain.
+
+    Read from the file rather than derived from the platform: a key wrapped on
+    another machine is precisely the case worth being able to see.
+    """
+    if not identity_is_wrapped(path):
+        return "file-permissions"
+    try:
+        return str(json.loads(read_text(path)).get("protection") or "unknown")
+    except Exception:
+        return "unknown"
+
+
 def identity_is_wrapped(path: Path) -> bool:
     if not path.is_file():
         return False
@@ -266,13 +280,8 @@ def identity_text(path: Path) -> str:
         return read_text(path)
 
     meta = json.loads(read_text(path))
-    if meta.get("protection") != "dpapi-currentuser":
-        raise CredError(
-            f"'{path}' is wrapped with '{meta.get('protection')}', "
-            "which this machine cannot open.",
-            ["Open it where it was wrapped, then: cred key unprotect"],
-            EXIT_KEY)
-    return _dpapi_unprotect(base64.b64decode(meta["data"])).decode("utf-8")
+    return keystore_unprotect(base64.b64decode(meta["data"]),
+                              str(meta.get("protection") or "")).decode("utf-8")
 
 
 # ------------------------------------------------------------------- crypto ---
@@ -366,6 +375,17 @@ def age_decrypt(cipher: bytes, cipher_path: Optional[Path],
                 staged.unlink(missing_ok=True)
 
     if rc != 0:
+        # age distinguishes "could not open your key" from "could not open the
+        # store", and so must we: telling someone whose key needs a passphrase
+        # to git checkout their store is both wrong and alarming.
+        if "identity file" in err or "passphrase" in err or "/dev/tty" in err:
+            raise CredError(
+                f"age could not open your key at '{ident}': {err}",
+                ["A passphrase-protected key can only be opened from a terminal.",
+                 "cred cannot supply it, and age will not read it from a pipe.",
+                 "For unattended use, wrap the key with the OS keystore instead:",
+                 "  cred key protect"],
+                EXIT_KEY)
         if "no identity matched" in err or "no identities" in err:
             steps = ["Your key is not a recipient of this store.",
                      "Ask someone who can already read it to run: "
@@ -512,15 +532,28 @@ def get_provider(name: str) -> Dict[str, Any]:
     return prov
 
 
-# ------------------------------------------------------------ DPAPI wrap ----
+# --------------------------------------------------------------- keystore ---
+# One wrapped-identity format, more than one mechanism that can wrap it. The
+# `protection` field in identity.wrapped.json names the mechanism, so a key
+# says what can open it instead of the reader inferring it from the platform.
+# `data` is always base64 of the opaque blob that mechanism returned, whatever
+# shape the mechanism hands it back in.
+#
+# What counts as a keystore here: it takes arbitrary bytes, it binds the result
+# to this account on this machine, and it never prompts. The last one is the
+# point. A keystore that asks a question cannot be used from a script, and a
+# script is where credentials are actually needed.
+
+KEYSTORE_DPAPI = "dpapi-currentuser"
+KEYSTORE_SYSTEMD = "systemd-creds-user"
+
 
 def dpapi_protect(data: bytes) -> bytes:
     """Wrap bytes with DPAPI, bound to the current Windows account."""
     if not is_windows():
         raise CredError(
-            "No OS keystore is available on this platform.",
-            ["On Windows this uses DPAPI and needs nothing installed.",
-             "Elsewhere, protect the key file itself: age -p identity.txt"],
+            "DPAPI is a Windows facility and is not available here.",
+            ["This machine's keystore, if it has one, is: " + keystore_name()],
             EXIT_BACKEND)
 
     import ctypes
@@ -548,17 +581,259 @@ def dpapi_protect(data: bytes) -> bytes:
         kernel32.LocalFree(out.pbData)
 
 
-def keystore_available() -> bool:
-    if not is_windows():
+# ------------------------------------------------------- systemd-creds -----
+# The Linux answer, and the only mechanism off Windows that meets the bar
+# above. `systemd-creds` encrypts a named blob with a key held in
+# /var/lib/systemd/credential.secret and/or the TPM; since systemd 256 it can
+# additionally bind that key to one user. It is not a permission check: the
+# uid, the username and the machine-id are folded into the encryption key, and
+# the uid comes from SO_PEERCRED on the socket rather than from anything the
+# caller says. A blob belonging to another account is not refused, it is
+# undecryptable.
+#
+# We speak Varlink to it directly rather than shelling out. Varlink is
+# NUL-terminated JSON over an AF_UNIX socket, which is a dozen lines of stdlib
+# and keeps the blob off a command line -- the same rule age is held to here.
+
+SYSTEMD_CREDENTIALS_SOCKET = "/run/systemd/io.systemd.Credentials"
+
+# Authenticated by systemd, and checked on the way back out: it exists so that
+# a credential cannot be quietly re-purposed as a different one.
+SYSTEMD_CREDENTIAL_NAME = "cred-identity"
+
+# The service reports failures as dotted identifiers rather than prose, so the
+# cases we can say something useful about are matched exactly, not by substring.
+_SYSTEMD_ERRORS = {
+    "io.systemd.Credentials.NameMismatch":
+        "This blob was not written by cred, or was written under another name.",
+    "io.systemd.Credentials.BadScope":
+        "This blob is bound to a different user, or to the system rather than "
+        "to an account.",
+    "io.systemd.Credentials.BadFormat":
+        "This blob is not a systemd credential, or it is damaged.",
+    # systemd cannot tell these two apart, and neither can we: a damaged blob
+    # and a foreign TPM both surface as one failed integrity check.
+    "io.systemd.Credentials.KeyBelongsToOtherTPM":
+        "The integrity check failed: either this key was sealed by another "
+        "machine's TPM, or the blob is damaged.",
+    "io.systemd.Credentials.TPMInDictionaryLockout":
+        "The TPM is in lockout and will not answer.",
+    "io.systemd.InteractiveAuthenticationRequired":
+        "The system refused to act without an interactive prompt.",
+}
+
+_systemd_probe: Optional[bool] = None
+
+
+def _varlink_call(method: str, params: Dict[str, Any],
+                  timeout: float = 15.0) -> Dict[str, Any]:
+    """One Varlink round trip: NUL-terminated JSON in, NUL-terminated JSON out."""
+    import socket
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        try:
+            sock.connect(SYSTEMD_CREDENTIALS_SOCKET)
+        except OSError as exc:
+            raise CredError(
+                f"Could not reach systemd's credential service: {exc}",
+                ["This needs systemd 256 or newer, running as PID 1.",
+                 "Check it is there: systemd-creds --version"],
+                EXIT_BACKEND) from exc
+
+        request = json.dumps({"method": method, "parameters": params})
+        sock.sendall(request.encode("utf-8") + b"\0")
+
+        chunks: List[bytes] = []
+        while not (chunks and chunks[-1].endswith(b"\0")):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        sock.close()
+
+    raw = b"".join(chunks).rstrip(b"\0")
+    if not raw:
+        raise CredError("systemd's credential service closed the connection "
+                        "without answering.",
+                        ["Check the service: systemctl status systemd-creds.socket"],
+                        EXIT_BACKEND)
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
+        raise CredError("systemd's credential service sent a reply that is "
+                        "not valid JSON.", [], EXIT_BACKEND) from exc
+
+
+def _systemd_creds_call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    reply = _varlink_call("io.systemd.Credentials." + method, params)
+    error = reply.get("error")
+    if error:
+        detail = _SYSTEMD_ERRORS.get(str(error), f"systemd reported {error}.")
+        raise CredError(
+            f"systemd-creds could not {method.lower()} the key. {detail}",
+            ["A wrapped key only opens for the account and the machine that "
+             "wrapped it.",
+             "If you have moved either, restore your backup and re-wrap:",
+             "  cred keygen --protect"],
+            EXIT_KEY)
+    return reply.get("parameters") or {}
+
+
+def systemd_creds_protect(data: bytes) -> bytes:
+    """Wrap bytes for this uid on this machine. Returns the raw blob.
+
+    `withKey` is deliberately left unset, so systemd picks the same default its
+    own CLI does: host key and TPM where there is one, host key alone where
+    there is not. It does not bind to PCRs, so a kernel update does not cost
+    you the key.
+    """
+    params = {"name": SYSTEMD_CREDENTIAL_NAME,
+              "scope": "user",
+              "data": base64.b64encode(data).decode("ascii")}
+    blob = _systemd_creds_call("Encrypt", params)["blob"]
+    return base64.b64decode(blob)
+
+
+def systemd_creds_unprotect(blob: bytes) -> bytes:
+    params = {"name": SYSTEMD_CREDENTIAL_NAME,
+              "scope": "user",
+              "blob": base64.b64encode(blob).decode("ascii")}
+    data = _systemd_creds_call("Decrypt", params)["data"]
+    return base64.b64decode(data)
+
+
+def systemd_creds_available() -> bool:
+    """Can this machine wrap a key with systemd-creds, for this user?
+
+    Answered by doing it: encrypt a probe and open it again. Nothing else is
+    honest, because the answer turns on the systemd version, on the socket
+    being reachable, and on /var/lib/systemd being writable and persistent --
+    and version-sniffing /etc/os-release gets Ubuntu 24.04 and Debian 12 wrong,
+    which are two of the most widely deployed bases there are.
+    """
+    global _systemd_probe
+    if _systemd_probe is not None:
+        return _systemd_probe
+    _systemd_probe = False
+    if is_windows():
         return False
     try:
-        return dpapi_protect(b"probe") is not None
+        import stat
+        mode = os.stat(SYSTEMD_CREDENTIALS_SOCKET).st_mode
+        if not stat.S_ISSOCK(mode):
+            return False
+        probe = b"cred keystore probe"
+        _systemd_probe = systemd_creds_unprotect(systemd_creds_protect(probe)) == probe
     except Exception:
-        return False
+        _systemd_probe = False
+    return _systemd_probe
 
+
+def systemd_version() -> Optional[int]:
+    """The running systemd's major version, for a message that has to explain
+    why the keystore is missing. None if systemd is not here at all."""
+    if is_windows():
+        return None
+    try:
+        rc, out, _ = _run(["systemctl", "--version"], timeout=10)
+    except Exception:
+        return None
+    if rc != 0:
+        return None
+    # "systemd 261 (261.2-1-arch)"
+    for word in out.decode("utf-8", "replace").split():
+        if word.isdigit():
+            return int(word)
+    return None
+
+
+# ------------------------------------------------------- keystore, chosen ---
 
 def keystore_name() -> str:
-    return "dpapi-currentuser" if is_windows() else "none"
+    """The mechanism this machine would wrap a key with, or 'none'."""
+    if is_windows():
+        return KEYSTORE_DPAPI
+    if systemd_creds_available():
+        return KEYSTORE_SYSTEMD
+    return "none"
+
+
+def keystore_available() -> bool:
+    if is_windows():
+        try:
+            return dpapi_protect(b"probe") is not None
+        except Exception:
+            return False
+    return systemd_creds_available()
+
+
+def keystore_unavailable() -> CredError:
+    """Why there is no keystore here, and what to do instead.
+
+    One function rather than a copy of this text at every call site. There were
+    four copies before, and they had already drifted apart.
+    """
+    steps = ["Windows uses DPAPI, and needs nothing installed."]
+    if is_windows():
+        steps.append("DPAPI is here but refused to answer. Run: cred doctor")
+    else:
+        version = systemd_version()
+        line = "Linux uses systemd-creds, and needs systemd 256 or newer."
+        if version is None:
+            line += " This machine is not running systemd."
+        elif version < 256:
+            line += f" This machine has systemd {version}."
+        else:
+            # New enough, so the version is not the problem. Say what is,
+            # rather than repeating a requirement this machine already meets.
+            line += (f" This machine has systemd {version}, but "
+                     f"{SYSTEMD_CREDENTIALS_SOCKET} did not answer.")
+        steps.append(line)
+    steps += [
+        "Otherwise, put a passphrase on the key file itself:",
+        "  age -p -a -o identity.age identity.txt",
+        f"  mv identity.age '{cred_home() / 'identity.txt'}'",
+        "age will then ask for that passphrase on every cred command, and "
+        "cred will not work without a terminal.",
+    ]
+    return CredError("No OS keystore is available here.", steps, EXIT_BACKEND)
+
+
+def keystore_protect(data: bytes) -> bytes:
+    """Wrap bytes with whatever keystore this machine has."""
+    name = keystore_name()
+    if name == KEYSTORE_DPAPI:
+        return dpapi_protect(data)
+    if name == KEYSTORE_SYSTEMD:
+        return systemd_creds_protect(data)
+    raise keystore_unavailable()
+
+
+def keystore_unprotect(blob: bytes, protection: str) -> bytes:
+    """Unwrap a blob that says which mechanism sealed it.
+
+    A key wrapped elsewhere is a clear refusal rather than a decryption
+    failure, because the two have completely different remedies.
+    """
+    if protection == KEYSTORE_DPAPI:
+        return _dpapi_unprotect(blob)
+    if protection == KEYSTORE_SYSTEMD:
+        if not systemd_creds_available():
+            raise CredError(
+                "This key is wrapped with systemd-creds and cannot be opened here.",
+                ["It opens on the Linux account and machine that wrapped it.",
+                 "Unwrap it there with 'cred key unprotect', then copy the "
+                 "resulting identity.txt to this machine."],
+                EXIT_KEY)
+        return systemd_creds_unprotect(blob)
+    raise CredError(
+        f"This key is wrapped with '{protection or 'an unnamed mechanism'}', "
+        "which this machine cannot open.",
+        ["Open it where it was wrapped, then: cred key unprotect"],
+        EXIT_KEY)
 
 
 def wrap_identity(text: str) -> str:
@@ -569,7 +844,7 @@ def wrap_identity(text: str) -> str:
         "protection": keystore_name(),
         "note": "Wrapped by the OS keystore. Only the account that wrapped it "
                 "can open it. Keep a separate backup of the unwrapped key.",
-        "data": base64.b64encode(dpapi_protect(text.encode("utf-8"))).decode("ascii"),
+        "data": base64.b64encode(keystore_protect(text.encode("utf-8"))).decode("ascii"),
     })
 
 
