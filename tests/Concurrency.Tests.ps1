@@ -85,8 +85,17 @@ Describe 'Concurrent writes' -Skip:(-not $script:HasAge) {
     It 'leaves an empty lock file that git ignores' {
         # The lock file persists on purpose -- see Lock-CredStore -- so the
         # thing to verify is that it is empty and excluded from the repo.
+        #
+        # -Force is load-bearing off Windows: PowerShell treats a dotfile as
+        # hidden, so Get-Item cannot see '.lock' without it. That failure is
+        # non-terminating, and the expression then yields 0, which is exactly
+        # what this asserts -- so without -Force the check passed on Linux
+        # while looking at nothing at all. Assert existence separately so a
+        # lookup that finds nothing can never read as an empty file again.
         $creds = Join-Path (Join-Path $script:Sandbox 'race') '.creds'
-        (Get-Item (Join-Path $creds '.lock')).Length | Should -Be 0
+        $lock  = Get-Item (Join-Path $creds '.lock') -Force
+        $lock          | Should -Not -BeNullOrEmpty
+        $lock.Length   | Should -Be 0
         (Get-Content (Join-Path $creds '.gitignore') -Raw) | Should -Match '\.lock'
     }
 
