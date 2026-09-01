@@ -12,6 +12,7 @@ failure, so a single Pester assertion can wrap the lot.
 
     python tests/pyunit.py
 """
+import json
 import sys
 from pathlib import Path
 
@@ -28,6 +29,22 @@ def check(label, got, want):
         print(f"FAIL  {label}")
     else:
         print(f"ok    {label}")
+
+
+def _error_code(call):
+    """The exit code a CredError carries, or what came back instead of one."""
+    try:
+        return call()
+    except cs.CredError as exc:
+        return exc.code
+
+
+def _error_text(call):
+    try:
+        call()
+        return ""
+    except cs.CredError as exc:
+        return exc.render()
 
 
 # ------------------------------------------------------------------ argv ---
@@ -118,6 +135,50 @@ check("resolve_entry: the encoding marker never becomes a variable",
       (view["kind"], view["env_vars"]), ("file", {}))
 check("resolve_entry: a present-but-null encoding is still the file marker",
       cs.entry_kind({"secret": "x", "encoding": None}, None), "file")
+
+
+# -------------------------------------------------------------- keystore ---
+# The dispatch is testable everywhere; the systemd-creds backend can only be
+# tested where it exists, so it is probed rather than assumed. A machine
+# without it still runs everything above.
+
+check("keystore_unprotect: a blob from another mechanism is refused by name",
+      _error_code(lambda: cs.keystore_unprotect(b"x", "macos-keychain")),
+      cs.EXIT_KEY)
+
+check("keystore_unprotect: a DPAPI blob off Windows names Windows",
+      "DPAPI" in _error_text(lambda: cs.keystore_unprotect(b"x", cs.KEYSTORE_DPAPI))
+      or cs.is_windows(), True)
+
+check("identity_protection: a plain key file reports file-permissions",
+      cs.identity_protection(Path(__file__)), "file-permissions")
+
+if cs.systemd_creds_available():
+    check("keystore_name: systemd-creds where it is available",
+          cs.keystore_name(), cs.KEYSTORE_SYSTEMD)
+
+    # The property that matters is that arbitrary bytes survive: an age
+    # identity is ASCII, but nothing in the format promises that, and a
+    # keystore that quietly mangles a NUL would corrupt a key silently.
+    awkward = b"a\x00b\xff\xfe AGE-SECRET-KEY-1EXAMPLE\n"
+    check("systemd-creds: round-trips arbitrary bytes exactly",
+          cs.systemd_creds_unprotect(cs.systemd_creds_protect(awkward)), awkward)
+
+    wrapped = cs.wrap_identity("AGE-SECRET-KEY-1EXAMPLE")
+    meta = json.loads(wrapped)
+    check("wrap_identity: names the mechanism that sealed it",
+          (meta["format"], meta["protection"]),
+          (cs.IDENTITY_FORMAT, cs.KEYSTORE_SYSTEMD))
+    check("wrap_identity: keeps no key material in the file",
+          "AGE-SECRET-KEY-1EXAMPLE" in wrapped, False)
+
+    # A damaged blob must fail loudly rather than return plausible bytes.
+    torn = bytearray(cs.systemd_creds_protect(b"secret"))
+    torn[len(torn) // 2] ^= 0xFF
+    check("systemd-creds: a damaged blob is refused, not silently decoded",
+          _error_code(lambda: cs.systemd_creds_unprotect(bytes(torn))), cs.EXIT_KEY)
+else:
+    print("skip  systemd-creds backend (not available on this machine)")
 
 print()
 if FAILURES:

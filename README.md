@@ -198,7 +198,7 @@ $v = Read-CredValue acme-api/ssl-key            # .Bytes with .Kind and .IsBinar
 | `cred recipients rm <key>` | Revoke access and re-encrypt |
 | `cred keygen` | Create your key; `--show` prints the public half |
 | `cred key` | Where your key is and how it is protected |
-| `cred key protect` | Wrap the key with the OS keystore (DPAPI) |
+| `cred key protect` | Wrap the key with the OS keystore |
 | `cred key unprotect` | Unwrap it, before moving machine or account |
 | `cred import <path>` | Bring existing PSCredential files into a store |
 | `cred export <folder>` | Write credentials back out as PSCredential files |
@@ -333,14 +333,27 @@ In PowerShell the same two operations are `Set-Cred -File` and
 ## Protecting the key itself
 
 By default your age key is a file whose only protection is its permissions.
-On Windows you can wrap it with DPAPI, which binds it to your account on that
-machine:
+You can wrap it with the OS keystore instead, which binds it to your account
+on that machine:
 
 ```powershell
-cred key protect --backup D:\safege-key.txt
+cred key protect --backup D:\safe\age-key.txt
 ```
 
-After that the file on disk contains no key material — cred unwraps it in
+The mechanism depends on the platform, and `cred key` names the one in use:
+
+| | Mechanism | Needs |
+| --- | --- | --- |
+| Windows | DPAPI | nothing installed |
+| Linux | `systemd-creds`, scoped to your user | systemd 256 or newer |
+| macOS | none yet | -- |
+
+Neither mechanism asks a question, which is the point: a keystore that prompts
+cannot be used from a script, and a script is where credentials are actually
+needed. Where there is no keystore, `cred key protect` says so and says what to
+do instead.
+
+After wrapping, the file on disk contains no key material — cred unwraps it in
 memory and pipes it to age, so the plaintext key is never a file again. Back it
 up first: a wrapped key does not survive a new machine, a reinstall, or a
 changed account. Before you move, run `cred key unprotect`.

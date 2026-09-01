@@ -74,7 +74,7 @@ COMMANDS
   keygen                           Create this machine's key (--show, --force)
 
   key                              Show where your key is and how it is held
-  key protect                      Wrap it with the OS keystore (DPAPI)
+  key protect                      Wrap it with the OS keystore
       --backup <file>              Save the unwrapped key first (do this)
   key unprotect                    Unwrap it, before moving machine or account
       --provider <name>            Which backend's key (default: age)
@@ -660,11 +660,10 @@ def cmd_key(rest: List[str]) -> int:
     if sub in ("unprotect", "unwrap"):
         return _key_unprotect(path)
 
-    wrapped = cs.identity_is_wrapped(path)
     out(f"path        {path}")
     out(f"exists      {path.is_file()}")
-    out(f"protection  {cs.keystore_name() if wrapped else 'file-permissions'}")
-    out(f"keystore    {'available' if cs.keystore_available() else 'not available on this platform'}")
+    out(f"protection  {cs.identity_protection(path)}")
+    out(f"keystore    {cs.keystore_name() if cs.keystore_available() else 'none available here'}")
     if path.is_file():
         try:
             out(f"public key  {prov['recipient'](None)}")
@@ -680,11 +679,7 @@ def _key_protect(path, opts) -> int:
     still travels with the code and still opens on Linux.
     """
     if not cs.keystore_available():
-        raise cs.CredError(
-            "No OS keystore is available on this platform.",
-            ["On Windows this uses DPAPI and needs nothing installed.",
-             "Elsewhere, protect the key file itself: age -p identity.txt"],
-            cs.EXIT_BACKEND)
+        raise cs.keystore_unavailable()
     if not path.is_file():
         raise cs.CredError(f"No key at '{path}' to wrap.",
                            ["Create one first: cred keygen"], cs.EXIT_KEY)
@@ -788,9 +783,15 @@ def cmd_doctor(rest: List[str]) -> int:
         ident = cs.provider_identity_path(None)
         if ident.is_file():
             row("identity", "Ok", str(ident))
+            # From the file, not from the platform: a key wrapped on another
+            # machine is exactly the case worth being able to see here.
             row("identity protection", "Ok",
-                "dpapi-currentuser" if cs.identity_is_wrapped(ident)
+                cs.identity_protection(ident) if cs.identity_is_wrapped(ident)
                 else "file-permissions")
+            keystore = cs.keystore_name()
+            row("keystore", "Ok" if keystore != "none" else "Warn",
+                keystore if keystore != "none" else "none available here",
+                "Run: cred key protect")
         else:
             row("identity", "Warn", f"No key at '{ident}'.", "Run: cred keygen")
     except cs.CredError:
