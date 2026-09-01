@@ -53,6 +53,20 @@ cred exec acme-api -- psql -h db01                   # inject DB_USER / DB_PASSW
 cred list acme-api                                   # names only, no decryption needed
 ```
 
+The same on Linux or macOS -- only step 0 and the path in step 2 change:
+
+```bash
+# 0. one-off: runtime, encryption backend, PATH
+sudo apt install python3 age          # or: brew install python age / pacman -S python age
+export PATH="$HOME/tools/cred/bin:$PATH"
+
+# 2. a repository is just a path
+cd ~/work/acme-api
+```
+
+Steps 1 and 3 through 5 are the same commands, character for character. So is
+the store they produce: it is committed encrypted and opens on either platform.
+
 From then on, from anywhere on the machine:
 
 ```powershell
@@ -441,6 +455,8 @@ What it does not:
 
 ## Installing
 
+### Windows
+
 ```powershell
 git clone <this repo> C:\tools\cred
 $env:PATH += ";C:\tools\cred\bin"   # cred (Python), cred-ps (PowerShell)
@@ -455,6 +471,33 @@ Make the PATH change permanent:
 [Environment]::SetEnvironmentVariable('PATH',
     [Environment]::GetEnvironmentVariable('PATH','User') + ';C:\tools\cred\bin', 'User')
 ```
+
+### Linux and macOS
+
+```bash
+git clone <this repo> ~/tools/cred
+export PATH="$HOME/tools/cred/bin:$PATH"   # cred (Python), cred-ps (PowerShell)
+```
+
+Make the PATH change permanent by putting that line in `~/.bashrc` or
+`~/.zshrc`. If your dotfiles are a repo shared across machines, put it in
+whatever per-machine override file they source instead -- where you cloned to
+is a property of this machine, not of the dotfiles.
+
+`cred` is the one to reach for here. It needs Python 3.8+ and nothing from
+PyPI, which almost every distribution already satisfies. `cred-ps` is on your
+PATH too and speaks the same commands, but it needs PowerShell 7+ installed
+separately; the store it reads is byte-for-byte the same either way.
+
+For the module -- `Get-Credential`-shaped objects inside PowerShell scripts --
+from a `pwsh` session:
+
+```powershell
+Import-Module ~/tools/cred/src/Cred/Cred.psd1
+```
+
+If `cred` is found on your PATH but the shell refuses to run it, the clone
+predates the launchers being marked executable: `chmod +x bin/cred bin/cred-ps`.
 
 ## Testing
 
