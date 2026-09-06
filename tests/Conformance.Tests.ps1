@@ -29,6 +29,9 @@ BeforeDiscovery {
     $py = Get-Command python -ErrorAction SilentlyContinue
     if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
     $script:HasPython = [bool]$py
+    # -Skip is evaluated during discovery, so this has to be resolved here.
+    $IsWindowsHost = ($PSVersionTable.PSEdition -eq 'Desktop') -or
+                     [bool](Get-Variable -Name IsWindows -ValueOnly -ErrorAction SilentlyContinue)
 }
 
 BeforeAll {
@@ -78,6 +81,9 @@ BeforeAll {
     $script:PyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
     if (-not $script:PyExe) { $script:PyExe = (Get-Command python3 -ErrorAction SilentlyContinue).Source }
     $script:Harness = Join-Path $PSScriptRoot 'conformance.py'
+    $script:PyCli   = Join-Path $script:RepoRoot 'python\cred.py'
+    $script:M       = Get-Module Cred
+    function InModule { param([scriptblock]$Block, [object[]]$Argument) & $script:M $Block @Argument }
 
 
     function Get-FixtureJson {
@@ -120,6 +126,44 @@ BeforeAll {
         $proc.WaitForExit()
         if ($proc.ExitCode -ne 0) { throw "conformance.py $Mode failed: $err" }
         return $out
+    }
+
+    function Invoke-PyCli {
+        <#
+            The shipped Python CLI, not the harness: what a registry write
+            actually produces is only a contract if the real command produces
+            it. Exit code included, because the codes are part of the contract.
+        #>
+        param([string[]]$CliArgs, [hashtable]$WithEnv = @{})
+
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $script:PyExe
+        $psi.UseShellExecute        = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        $psi.StandardErrorEncoding  = [System.Text.UTF8Encoding]::new($false)
+        $psi.EnvironmentVariables['PYTHONIOENCODING']   = 'utf-8'
+        $psi.EnvironmentVariables['CRED_IDENTITY_FILE'] = $env:CRED_IDENTITY_FILE
+        $psi.EnvironmentVariables.Remove('CRED_PROJECT') | Out-Null
+        foreach ($k in $WithEnv.Keys) { $psi.EnvironmentVariables[$k] = $WithEnv[$k] }
+
+        $quoted = @($script:PyCli) + $CliArgs |
+                  ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }
+        $psi.Arguments = $quoted -join ' '
+
+        $p    = [System.Diagnostics.Process]::Start($psi)
+        $out  = $p.StandardOutput.ReadToEnd()
+        $err  = $p.StandardError.ReadToEnd()
+        $p.WaitForExit()
+        $code = $p.ExitCode
+        $p.Dispose()
+        [pscustomobject]@{ StdOut = $out; StdErr = $err; ExitCode = $code }
+    }
+
+    function Get-Utf8Text {
+        param([string]$Path)
+        return [System.IO.File]::ReadAllText($Path, [System.Text.UTF8Encoding]::new($false))
     }
 
 }
@@ -209,5 +253,167 @@ Describe 'Both implementations agree with the fixture' -Skip:(-not ($script:HasA
         $got = Invoke-Harness -Mode 'store-name' -Fixture (Join-Path $script:Sandbox 'custom-store-name') |
                ConvertFrom-Json
         $got.store | Should -BeExactly 'vault.age'
+    }
+}
+
+Describe 'The project registry is a fixed contract' -Skip:(-not ($script:HasAge -and $script:HasPython)) {
+    <#
+        projects.json is written by both implementations and read by both, so
+        its bytes are as much a contract as the store's. Nothing was holding
+        them to it: PowerShell wrote CRLF and Python wrote LF for the same
+        registry, and the same serialiser writes .creds/config.json, which is
+        tracked -- so alternating editions rewrote every line of a committed
+        file.
+    #>
+
+    BeforeAll {
+        $script:RegRoot = Join-Path $script:Sandbox 'registry'
+        $paths = @{}
+        foreach ($edition in 'ps', 'py') {
+            $paths[$edition] = [pscustomobject]@{
+                Home    = Join-Path $script:RegRoot "$edition\home"
+                Project = Join-Path $script:RegRoot "$edition\demo"
+            }
+            $null = New-Item -ItemType Directory -Force -Path $paths[$edition].Home
+            $null = New-Item -ItemType Directory -Force -Path $paths[$edition].Project
+        }
+
+        $saved = $env:CRED_HOME
+        try {
+            $env:CRED_HOME = $paths['ps'].Home
+            $null = Initialize-CredProject -Project 'demo' -Path $paths['ps'].Project
+        }
+        finally { $env:CRED_HOME = $saved }
+
+        $r = Invoke-PyCli -CliArgs @('init', 'demo', '--path', $paths['py'].Project) `
+                          -WithEnv @{ CRED_HOME = $paths['py'].Home }
+        if ($r.ExitCode -ne 0) { throw "python init failed: $($r.StdErr)" }
+
+        # Fold out the one part that legitimately differs -- the absolute path,
+        # JSON-escaped as it appears in the file -- and compare everything else.
+        function ConvertTo-Placeholder {
+            param([string]$Text, [string]$ProjectPath)
+            $escaped = $ProjectPath -replace '\\', '\\'
+            return ($Text -replace [regex]::Escape($escaped), '<PATH>')
+        }
+
+        $script:PsRegistry = Get-Utf8Text (Join-Path $paths['ps'].Home 'projects.json')
+        $script:PyRegistry = Get-Utf8Text (Join-Path $paths['py'].Home 'projects.json')
+        $script:PsNormal   = ConvertTo-Placeholder $script:PsRegistry (Resolve-Path $paths['ps'].Project).ProviderPath
+        $script:PyNormal   = ConvertTo-Placeholder $script:PyRegistry (Resolve-Path $paths['py'].Project).ProviderPath
+        $script:WantReg    = (Get-Utf8Text (Join-Path $script:Fixtures 'registry\expected-projects.json')) -replace "`r`n", "`n"
+    }
+
+    It 'PowerShell writes the registry the fixture declares' {
+        $script:PsNormal.TrimEnd("`n") | Should -BeExactly $script:WantReg.TrimEnd("`n")
+    }
+
+    It 'Python writes the registry the fixture declares' {
+        $script:PyNormal.TrimEnd("`n") | Should -BeExactly $script:WantReg.TrimEnd("`n")
+    }
+
+    It 'both write it byte for byte the same, line endings included' {
+        # Not covered by the two above: TrimEnd there would hide a disagreement
+        # about the trailing newline, and neither would catch a shared CR.
+        $script:PsNormal | Should -BeExactly $script:PyNormal
+        $script:PsRegistry | Should -Not -Match "`r"
+        $script:PyRegistry | Should -Not -Match "`r"
+    }
+
+    It 'both report a malformed registry as malformed, with the same exit code' {
+        $home2 = Join-Path $script:RegRoot 'broken'
+        $null  = New-Item -ItemType Directory -Force -Path $home2
+        [System.IO.File]::WriteAllText((Join-Path $home2 'projects.json'), 'not json at all')
+
+        $saved = $env:CRED_HOME
+        $ps = try {
+            $env:CRED_HOME = $home2
+            $null = Get-CredProject
+            [pscustomobject]@{ Code = 0; Message = '' }
+        }
+        catch { [pscustomobject]@{ Code = (Get-CredExitCode -ErrorRecord $_); Message = $_.Exception.Message } }
+        finally { $env:CRED_HOME = $saved }
+
+        $py = Invoke-PyCli -CliArgs @('project', 'list') -WithEnv @{ CRED_HOME = $home2 }
+
+        $ps.Code | Should -Be 6 -Because 'a corrupt store is exit 6 on both sides'
+        $py.ExitCode | Should -Be $ps.Code
+        $ps.Message  | Should -Match 'not valid JSON'
+        $py.StdErr   | Should -Match 'not valid JSON'
+    }
+
+    It 'neither reports an unreadable registry as a malformed one' -Skip:(-not $IsWindowsHost) {
+        # The regression this pins: the read used to sit inside the try that
+        # caught a parse failure, so an access-denied arrived as "not valid
+        # JSON" and told the user to delete a perfectly good file.
+        $home2 = Join-Path $script:RegRoot 'denied'
+        $null  = New-Item -ItemType Directory -Force -Path $home2
+        $reg   = Join-Path $home2 'projects.json'
+        [System.IO.File]::WriteAllText($reg, '{"version":1,"projects":{}}')
+
+        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $null = & icacls $reg /deny "*${sid}:(R)" 2>&1
+        if ($LASTEXITCODE -ne 0) { Set-ItResult -Skipped -Because 'could not deny read on this filesystem' }
+
+        try {
+            $saved = $env:CRED_HOME
+            $ps = try {
+                $env:CRED_HOME = $home2
+                $null = Get-CredProject
+                [pscustomobject]@{ Code = 0; Message = '' }
+            }
+            catch { [pscustomobject]@{ Code = (Get-CredExitCode -ErrorRecord $_); Message = $_.Exception.Message } }
+            finally { $env:CRED_HOME = $saved }
+
+            $py = Invoke-PyCli -CliArgs @('project', 'list') -WithEnv @{ CRED_HOME = $home2 }
+
+            $ps.Code     | Should -Be 1
+            $py.ExitCode | Should -Be $ps.Code
+            $ps.Message  | Should -Not -Match 'not valid JSON'
+            $py.StdErr   | Should -Not -Match 'not valid JSON'
+            $ps.Message  | Should -Match 'Cannot read'
+            $py.StdErr   | Should -Match 'Cannot read'
+        }
+        finally { $null = & icacls $reg /remove:d "*${sid}" 2>&1 }
+    }
+}
+
+Describe 'Both implementations restrict a path the same way' -Skip:(-not ($script:HasPython -and $IsWindowsHost)) {
+    <#
+        Permissions are a contract too, and this one was being broken quietly
+        by both sides at once -- Python's icacls call removed only inherited
+        ACEs, and PowerShell's Set-Acl route failed on a file whose DACL was
+        already protected. Both reported success.
+    #>
+
+    It 'produces the same DACL, from the same starting ACL' {
+        $dir = Join-Path $script:Sandbox 'restrict'
+        $null = New-Item -ItemType Directory -Force -Path $dir
+
+        $subjects = @{}
+        foreach ($edition in 'ps', 'py') {
+            $p = Join-Path $dir "$edition.bin"
+            [System.IO.File]::WriteAllText($p, 'x')
+            # An extra explicit ACE, the shape a file written by another logon
+            # session carries. Removing it is the whole job.
+            $null = & icacls $p /grant "*S-1-5-5-2-608175707:(RX)" 2>&1
+            $subjects[$edition] = $p
+        }
+
+        InModule { param($p) $null = Protect-CredPath -Path $p } @($subjects['ps'])
+        $got = Invoke-Harness -Mode 'restrict' -Fixture $subjects['py'] | ConvertFrom-Json
+        [bool]$got.ok | Should -BeTrue -Because 'the Python side reports whether it worked'
+
+        $sddl = @{}
+        foreach ($edition in 'ps', 'py') {
+            $sddl[$edition] = [System.Security.AccessControl.FileSecurity]::new(
+                                  $subjects[$edition], 'Access').GetSecurityDescriptorSddlForm('Access')
+        }
+        $sddl['ps'] | Should -BeExactly $sddl['py']
+
+        # And it is the right DACL, not merely the same one: protected, and
+        # naming this user and nobody else.
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $sddl['ps'] | Should -BeExactly "D:PAI(A;;FA;;;$me)"
     }
 }

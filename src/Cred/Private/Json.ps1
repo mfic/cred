@@ -309,5 +309,10 @@ function ConvertTo-CredJson {
     [CmdletBinding()]
     [OutputType([string])]
     param([Parameter(Mandatory)][object]$InputObject, [switch]$Compress)
-    return ($InputObject | ConvertTo-Json -Depth 20 -Compress:$Compress)
+    # LF, not the CRLF ConvertTo-Json emits on Windows. .creds/config.json is
+    # meant to be committed, and json.dumps on the Python side writes LF, so
+    # leaving this alone made every switch between the two editions rewrite
+    # each line of a tracked file. A CR inside a string value is escaped as
+    # \r by ConvertTo-Json, so only the pretty-printer's separators match here.
+    return (($InputObject | ConvertTo-Json -Depth 20 -Compress:$Compress) -replace "`r`n", "`n")
 }
