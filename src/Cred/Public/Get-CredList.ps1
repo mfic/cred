@@ -88,6 +88,40 @@ function Get-CredProject {
     }
 }
 
+function Register-CredProject {
+    <#
+        .SYNOPSIS
+        Add an existing store to the registry, so it can be reached by name.
+
+        .DESCRIPTION
+        The counterpart to Unregister-CredProject, and the way back from an
+        `init` whose registry write failed after the store was already on disk.
+        Reads the name from the project's own config.json rather than guessing
+        from the folder, so the registry agrees with the store about what the
+        project is called. Touches nothing inside the repository.
+
+        .EXAMPLE
+        Register-CredProject
+        Register the project containing the current directory.
+
+        .EXAMPLE
+        Register-CredProject -Path ~
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject])]
+    param([Parameter(Position = 0)][string]$Path)
+
+    # Always a directory, never $env:CRED_PROJECT: "register what is here" is
+    # the whole point, and the Python peer resolves the cwd the same way.
+    if (-not $Path) { $Path = (Get-Location).ProviderPath }
+    $ctx = Resolve-CredProject -Path $Path
+    if ($PSCmdlet.ShouldProcess($ctx.Root, 'Register project')) {
+        $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
+        Register-CredProjectPath -Name $ctx.Name -Path $ctx.Root
+    }
+    return [pscustomobject]@{ Name = $ctx.Name; Path = $ctx.Root; Available = $true }
+}
+
 function Unregister-CredProject {
     <#
         .SYNOPSIS

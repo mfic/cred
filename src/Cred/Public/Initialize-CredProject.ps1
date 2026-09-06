@@ -105,7 +105,17 @@ function Initialize-CredProject {
 *.tmp*
 "@
 
-    Register-CredProjectPath -Name $Project -Path $root
+    # The store is already on disk by now, so a registry failure must not throw
+    # away a successful init. Report it and say how to finish the job -- the
+    # alternative stranded a working store that `cred project list` denied.
+    $registered = $true
+    try { Register-CredProjectPath -Name $Project -Path $root }
+    catch {
+        $registered = $false
+        Write-Warning ("The store was created, but '$Project' could not be added to the " +
+                       "project registry: $($_.Exception.Message.Split([Environment]::NewLine)[0])")
+        Write-Warning "Fix that, then register it with: cred project add '$root'"
+    }
 
     Write-Verbose "Initialized '$Project' at '$root'."
     return [pscustomobject]@{
@@ -114,5 +124,6 @@ function Initialize-CredProject {
         Provider   = $Provider
         Store      = $ctx.StorePath
         Recipients = $recipients
+        Registered = $registered
     }
 }

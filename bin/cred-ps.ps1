@@ -201,6 +201,7 @@ COMMANDS
       --yes                        Skip the confirmation
 
   project list                     Registered projects on this machine
+  project add [path]               Register an existing store (default: here)
   project rm <name>                Forget a project mapping
 
   providers                        Encryption backends and their status
@@ -504,6 +505,12 @@ function Invoke-CredCli {
                 if ($rest.Count -lt 2) { throw (UsageError 'cred project rm <name>') }
                 Unregister-CredProject -Name $rest[1] -Confirm:$false
                 Write-Line "Forgot $($rest[1]). Its .creds directory was left alone."
+                return 0
+            }
+            if ($sub -eq 'add') {
+                $target = if ($rest.Count -gt 1) { [string]$rest[1] } else { $null }
+                $added  = Register-CredProject -Path $target -Confirm:$false
+                Write-Line "Registered $($added.Name) at $($added.Path)."
                 return 0
             }
             $rows = @(Get-CredProject)

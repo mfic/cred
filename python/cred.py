@@ -90,9 +90,11 @@ COMMANDS
       --yes                        Skip the confirmation
 
   project list                     Registered projects on this machine
+  project add [path]               Register an existing store (default: here)
   project rm <name>                Forget a project mapping
   providers                        Encryption backends and their status
   doctor [project]                 Check the setup and say how to fix it
+      --repair                     Re-apply restrictive permissions
 
   claude [project]                 Markdown brief for a Claude Code session
       --write                      Write it into the repo's CLAUDE.md
@@ -267,7 +269,14 @@ def cmd_init(rest: List[str]) -> int:
                          "# Managed by cred. The encrypted store and the config are meant to be\n"
                          "# committed; only these transient files are not.\n"
                          ".lock\n*.tmp*\n")
-    cs.register_project(name, root)
+    # The store is already on disk by now, so a registry failure must not throw
+    # away a successful init. Report it and say how to finish the job -- the
+    # alternative stranded a working store that `cred project list` denied.
+    registry_error: Optional[cs.CredError] = None
+    try:
+        cs.register_project(name, root)
+    except cs.CredError as exc:
+        registry_error = exc
 
     out(f"Created {name} in {root}")
     out(f"  store      {project.store_path}")
@@ -275,6 +284,13 @@ def cmd_init(rest: List[str]) -> int:
     out(f"  recipient  {', '.join(recipients)}")
     out("")
     out(f"Commit .creds/ -- it is encrypted. Then: cred add {name}/<key>")
+
+    if registry_error is not None:
+        note("")
+        note(f"Warning: the store was created, but '{name}' could not be added "
+             f"to the project registry:")
+        note(f"  {registry_error.message}")
+        note(f"Fix that, then register it with: cred project add '{root}'")
     return cs.EXIT_OK
 
 
@@ -736,6 +752,21 @@ def _key_unprotect(path) -> int:
 
 def cmd_project(rest: List[str]) -> int:
     sub = rest[0].lower() if rest else "list"
+    if sub == "add":
+        # The way back from an init whose registry write failed after the store
+        # was already written. The name comes from the project's own config,
+        # not from the folder, so the registry agrees with the store.
+        target = Path(rest[1]).expanduser().resolve() if len(rest) > 1 else Path.cwd()
+        root = cs.find_project_root(target) or target
+        if not (root / cs.CREDS_DIR / cs.CONFIG_NAME).is_file():
+            raise cs.CredError(f"'{root}' has no .creds/config.json.",
+                               [f"Create one with: cd '{root}'; cred init"],
+                               cs.EXIT_NOT_FOUND)
+        project = cs.Project(root)
+        cs.register_project(project.name, root)
+        out(f"Registered {project.name} at {root}.")
+        return cs.EXIT_OK
+
     reg = cs.read_registry()
     if sub in ("rm", "remove"):
         if len(rest) < 2:
@@ -762,8 +793,19 @@ def cmd_project(rest: List[str]) -> int:
 
 
 def cmd_doctor(rest: List[str]) -> int:
-    opts, pos = read_options(rest)
+    opts, pos = read_options(rest, switches=("repair",))
     rows = []
+
+    if opts.get("repair"):
+        # Peer of Repair-CredHealth: re-apply restrictive permissions to the
+        # cred home and everything in it, then report as usual.
+        home = cs.cred_home()
+        home.mkdir(parents=True, exist_ok=True)
+        cs.restrict_path(home)
+        for child in sorted(home.iterdir()):
+            if child.is_file():
+                cs.restrict_path(child)
+        note(f"Re-applied permissions under {home}")
 
     def row(check, status, detail, fix=""):
         rows.append({"Check": check, "Status": status, "Detail": detail,
@@ -807,6 +849,25 @@ def cmd_doctor(rest: List[str]) -> int:
         return cs.EXIT_OK
 
     row("project", "Ok", f"{project.name} at {project.root}")
+
+    # A project resolves by walking up from the cwd, so a healthy store can be
+    # entirely absent from the registry -- fine from inside the directory,
+    # invisible by name from anywhere else. Doctor used to report that as Ok.
+    try:
+        entry = cs.read_registry()["projects"].get(project.name)
+    except cs.CredError:
+        entry = None
+    if entry and Path(entry["path"]) == project.root:
+        row("registry", "Ok", f"Registered as '{project.name}'.")
+    elif entry:
+        row("registry", "Warn",
+            f"'{project.name}' is registered at '{entry['path']}', not here.",
+            f"Point it here: cred project add '{project.root}'")
+    else:
+        row("registry", "Warn",
+            f"'{project.name}' is not registered, so 'cred {project.name}/<key>' "
+            "only works from inside this directory.",
+            f"Register it: cred project add '{project.root}'")
     if project.store_path.is_file():
         row("store", "Ok", str(project.store_path))
         try:
