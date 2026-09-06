@@ -237,13 +237,15 @@ function Write-CredPrivateFile {
 
     $tmp = New-CredStagedFile -Path $Path -Bytes $Bytes
     try {
-        Protect-CredPath -Path $tmp
-        if (Test-Path -LiteralPath $Path -PathType Leaf) { Protect-CredPath -Path $Path }
+        # -Quiet on the two attempts before the swap: the one after it is the
+        # published file, and that is the only one worth warning about.
+        $null = Protect-CredPath -Path $tmp -Quiet
+        if (Test-Path -LiteralPath $Path -PathType Leaf) { $null = Protect-CredPath -Path $Path -Quiet }
         Move-CredTempIntoPlace -Temp $tmp -Destination $Path
 
-        # Protect-CredPath is best effort by design. If it quietly failed on the
-        # staged file, this is the published file's second chance.
-        Protect-CredPath -Path $Path
+        # Protect-CredPath is best effort by design. If it failed on the staged
+        # file, this is the published file's second chance.
+        $null = Protect-CredPath -Path $Path
     }
     finally {
         if (Test-Path -LiteralPath $tmp -PathType Leaf) {

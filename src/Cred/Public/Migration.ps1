@@ -242,7 +242,7 @@ function Export-Cred {
             $cred = [System.Management.Automation.PSCredential]::new(
                         $user, (ConvertTo-CredSecureString -PlainText ([string]$entry['secret'])))
             $cred | Export-Clixml -LiteralPath $file
-            Protect-CredPath -Path $file
+            $null = Protect-CredPath -Path $file
             $out.Add([pscustomobject]@{ Key = $key; UserName = $user; File = $file })
         }
     }

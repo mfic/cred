@@ -801,11 +801,16 @@ def cmd_doctor(rest: List[str]) -> int:
         # cred home and everything in it, then report as usual.
         home = cs.cred_home()
         home.mkdir(parents=True, exist_ok=True)
-        cs.restrict_path(home)
-        for child in sorted(home.iterdir()):
-            if child.is_file():
-                cs.restrict_path(child)
-        note(f"Re-applied permissions under {home}")
+        targets = [home] + [c for c in sorted(home.iterdir()) if c.is_file()]
+        # Say what could not be fixed. restrict_path used to return nothing, so
+        # --repair reported success no matter what it achieved.
+        failed = [t for t in targets if not cs.restrict_path(t)]
+        if failed:
+            note(f"Could not tighten permissions on {len(failed)} path(s):")
+            for t in failed:
+                note(f"  {t}")
+        else:
+            note(f"Re-applied permissions under {home}")
 
     def row(check, status, detail, fix=""):
         rows.append({"Check": check, "Status": status, "Detail": detail,

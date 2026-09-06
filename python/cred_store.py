@@ -88,21 +88,126 @@ def cred_home() -> Path:
     return Path(base) / "cred"
 
 
-def restrict_path(path: Path) -> None:
-    """Best effort: make a file or directory readable only by this user."""
+def current_user_sid() -> Optional[str]:
+    """This process's user SID, as a string. Windows only.
+
+    Via ctypes rather than `whoami /user`: Git Bash and other POSIX layers put
+    their own whoami ahead of System32 on PATH, and only the Windows one knows
+    what a SID is. It is also exactly what the PowerShell peer restricts to --
+    WindowsIdentity.GetCurrent().User -- so both editions name the same
+    principal rather than one naming a SID and the other a localised,
+    possibly ambiguous account name.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    TOKEN_QUERY = 0x0008
+    TOKEN_USER_INFO = 1
+
+    try:
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except OSError:
+        return None
+
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                          ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                             ctypes.c_void_p, wintypes.DWORD,
+                                             ctypes.POINTER(wintypes.DWORD)]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p,
+                                                ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(),
+                                     TOKEN_QUERY, ctypes.byref(token)):
+        return None
+    try:
+        size = wintypes.DWORD()
+        advapi32.GetTokenInformation(token, TOKEN_USER_INFO, None, 0,
+                                     ctypes.byref(size))
+        if not size.value:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if not advapi32.GetTokenInformation(token, TOKEN_USER_INFO, buf,
+                                            size.value, ctypes.byref(size)):
+            return None
+        # TOKEN_USER is a SID_AND_ATTRIBUTES: { PSID Sid; DWORD Attributes }.
+        psid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p)).contents
+        out = ctypes.c_void_p()
+        if not advapi32.ConvertSidToStringSidW(psid, ctypes.byref(out)):
+            return None
+        try:
+            return ctypes.wstring_at(out.value)
+        finally:
+            kernel32.LocalFree(out)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _icacls(*args: str) -> bool:
+    try:
+        cp = subprocess.run(["icacls", *args], stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, check=False)
+    except OSError:
+        return False
+    return cp.returncode == 0
+
+
+def _windows_restrict(path: Path) -> bool:
+    """Give a path a protected DACL naming only this user's SID.
+
+    Two icacls calls, because no single one does this:
+
+        /reset                     drop every explicit ACE, back to inherited
+        /inheritance:r /grant:r    drop the inherited ones, name our SID
+
+    The old single call was `/inheritance:r /grant:r "%USERNAME%:(F)"`, which
+    removes only *inherited* ACEs -- and the default DACL Windows puts on a new
+    file is entirely explicit, so every other principal survived. icacls
+    exited 0 having changed nothing, which is how the identity key kept its
+    day-one permissions while `cred doctor` printed a warning and
+    `cred doctor --repair` claimed to have fixed it.
+
+    Between the two calls the path carries its parent's inheritable ACEs. For
+    the directories cred owns that is narrower than what it replaces, and a
+    staged file is not published yet, so this does not widen anything.
+    """
+    sid = current_user_sid()
+    if not sid:
+        return False
+    # A directory has to hand the same single ACE to whatever is created in it.
+    rights = "(OI)(CI)F" if path.is_dir() else "(F)"
+    if not _icacls(str(path), "/reset"):
+        return False
+    return _icacls(str(path), "/inheritance:r", "/grant:r", f"*{sid}:{rights}")
+
+
+def restrict_path(path: Path) -> bool:
+    """Make a file or directory readable only by this user. True if it worked.
+
+    Never raises -- being unable to tighten permissions must not stop someone
+    managing their secrets. But it no longer fails silently either: callers
+    that can say something about it now can, because a total no-op used to be
+    indistinguishable from success.
+
+    Peer of Protect-CredPath in the PowerShell module.
+    """
     try:
         if is_windows():
-            # icacls is the only thing that works without pywin32. Failure here
-            # must never block credential work, so it stays advisory.
-            user = os.environ.get("USERNAME") or ""
-            if user:
-                subprocess.run(
-                    ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:(F)"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        else:
-            os.chmod(path, 0o700 if path.is_dir() else 0o600)
+            return _windows_restrict(path)
+        os.chmod(path, 0o700 if path.is_dir() else 0o600)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def find_executable(name: str, override_env: Optional[str] = None) -> Optional[str]:

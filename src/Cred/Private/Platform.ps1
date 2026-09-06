@@ -61,7 +61,7 @@ function New-CredDirectory {
             $null = New-Item -ItemType Directory -Path $Path -Force -Confirm:$false
         }
     }
-    Protect-CredPath -Path $Path
+    $null = Protect-CredPath -Path $Path
     return $Path
 }
 
@@ -175,19 +175,59 @@ function Get-CredAcl {
     return $item.GetAccessControl()
 }
 
-function Set-CredAcl {
+function Invoke-CredIcacls {
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][object]$Acl
-    )
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][string[]]$Arguments)
 
-    if (Get-Command -Name Set-Acl -ErrorAction SilentlyContinue) {
-        Set-Acl -LiteralPath $Path -AclObject $Acl -ErrorAction Stop
-        return
+    try {
+        $null = & icacls @Arguments 2>&1
+        return ($LASTEXITCODE -eq 0)
     }
-    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-    $item.SetAccessControl($Acl)
+    catch { return $false }
+}
+
+function Set-CredPrivateDacl {
+    <#
+        .SYNOPSIS
+        Give a path a protected DACL naming only the current user's SID.
+        Returns $true when it worked.
+
+        .DESCRIPTION
+        Two icacls calls, because no single one does this -- icacls rejects
+        /reset and /inheritance:r in the same invocation:
+
+            /reset                     drop every explicit ACE, back to inherited
+            /inheritance:r /grant:r    drop the inherited ones, name our SID
+
+        This replaces Set-CredAcl, which built a fresh descriptor and handed it
+        to Set-Acl. That works on a file whose DACL is not yet protected, and
+        fails with SeSecurityPrivilege -- a privilege an unelevated user does
+        not hold -- on one that is. Since protecting a file is precisely what
+        this function does, the second call on any given path failed: writing
+        over an existing store, keygen on an existing key, and `doctor --repair`
+        run twice all hit it. Measured across four cases (fresh file in a plain
+        directory, fresh file in a protected directory, already-protected file,
+        file carrying extra explicit ACEs), icacls handled all four and the
+        .NET route handled three.
+
+        Between the two calls the path carries its parent's inheritable ACEs.
+        For the directories cred owns that is narrower than what it replaces,
+        and a staged file is not published yet, so this does not widen
+        anything.
+
+        Peer of _windows_restrict in cred_store.py.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][string]$Path)
+
+    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    # A directory has to hand the same single ACE to whatever is created in it.
+    $rights = if ((Get-Item -LiteralPath $Path -Force).PSIsContainer) { '(OI)(CI)F' } else { '(F)' }
+
+    if (-not (Invoke-CredIcacls -Arguments @($Path, '/reset'))) { return $false }
+    return (Invoke-CredIcacls -Arguments @($Path, '/inheritance:r', '/grant:r', "*${sid}:$rights"))
 }
 
 function Protect-CredPath {
@@ -195,57 +235,50 @@ function Protect-CredPath {
         .SYNOPSIS
         Restrict a file or directory to the current user only.
 
-        Windows: disable ACL inheritance and grant FullControl to the current
-                 SID exclusively.
+        Windows: a protected DACL naming only the current user's SID.
         Unix   : chmod 600 (files) / 700 (directories).
 
-        Best effort by design -- an unusual ACL or a filesystem without
-        permission support must not stop the user from managing secrets, so
-        failures are reported as verbose output rather than thrown.
+        Returns $true when the path is now restricted. A failure never throws
+        -- an unusual ACL or a filesystem without permission support must not
+        stop someone managing their secrets -- but it is reported with
+        Write-Warning rather than Write-Verbose, and -Quiet is for the callers
+        that will report it themselves. Verbose-only meant a failure was
+        indistinguishable from success, so `cred doctor --repair` printed a
+        clean table having changed nothing at all -- which is how both editions
+        hid a broken permission write for as long as they did.
+
+        Peer of restrict_path in cred_store.py.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path)
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$Quiet
+    )
 
-    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
 
+    $ok     = $false
+    $reason = $null
     try {
         if (Test-CredIsWindows) {
-            $item = Get-Item -LiteralPath $Path -Force
-            $me   = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-
-            # Build a fresh security descriptor rather than editing the existing
-            # one. Set-Acl then applies only the sections we touched -- the DACL
-            # -- so we never attempt an owner change, which needs a privilege we
-            # may not hold and would fail the whole call.
-            $acl = if ($item.PSIsContainer) {
-                [System.Security.AccessControl.DirectorySecurity]::new()
-            } else {
-                [System.Security.AccessControl.FileSecurity]::new()
-            }
-            $acl.SetAccessRuleProtection($true, $false)   # protected, drop inherited ACEs
-
-            $inherit = if ($item.PSIsContainer) {
-                [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-            } else {
-                [System.Security.AccessControl.InheritanceFlags]::None
-            }
-            $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
-                $me,
-                [System.Security.AccessControl.FileSystemRights]::FullControl,
-                $inherit,
-                [System.Security.AccessControl.PropagationFlags]::None,
-                [System.Security.AccessControl.AccessControlType]::Allow))
-
-            Set-CredAcl -Path $Path -Acl $acl
+            $ok = Set-CredPrivateDacl -Path $Path
         }
         else {
             $mode = if ((Get-Item -LiteralPath $Path -Force).PSIsContainer) { '700' } else { '600' }
             & /bin/chmod $mode $Path 2>$null
+            $ok = ($LASTEXITCODE -eq 0)
         }
     }
     catch {
-        Write-Verbose "Could not tighten permissions on '$Path': $($_.Exception.Message)"
+        $reason = $_.Exception.Message
     }
+
+    if (-not $ok -and -not $Quiet) {
+        $suffix = if ($reason) { ": $reason" } else { '.' }
+        Write-Warning "Could not tighten permissions on '$Path'$suffix"
+    }
+    return $ok
 }
 
 function Test-CredPathIsPrivate {
