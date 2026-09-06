@@ -528,3 +528,21 @@ interoperability between the Python and PowerShell implementations.
 Note that `tests/` is Pester, so running it needs PowerShell even though the
 CLI under test is Python. That is deliberate: the same harness drives both
 implementations, which is what keeps them honest about each other.
+
+Pester 5 is required, and Windows PowerShell 5.1 does not have it: it ships
+with Pester 3, and Pester 6 is PowerShell 7 only. Without this the 5.1 leg
+cannot start, and half of what this project claims to support goes untested:
+
+```powershell
+# from Windows PowerShell 5.1
+Install-Module Pester -Scope CurrentUser -MinimumVersion 5.0 -MaximumVersion 5.99.99 `
+               -Force -SkipPublisherCheck
+```
+
+`Invoke-Tests.ps1` hands the 5.1 leg a clean `PSModulePath`. PowerShell 7 puts
+its own module directories on `PSModulePath` and children inherit them, so a
+5.1 process launched from a 7 session finds 7's builds of
+`Microsoft.PowerShell.Security`, `PowerShellGet` and `PackageManagement`, fails
+to load any of them, and loses `Get-Acl`, `Set-Acl` and `Install-Module`. If
+you invoke Pester against 5.1 by hand rather than through the script, set
+`PSModulePath` yourself or you will be testing 5.1 wearing 7's modules.

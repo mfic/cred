@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "project": "acme-api",
+  "recipients": [
+    "age1abc",
+    "age1def"
+  ],
+  "empty_map": {},
+  "empty_list": [],
+  "credentials": {
+    "db": {
+      "type": "userpass",
+      "description": "Grüße — ünïcode ✓",
+      "env": {
+        "DB_USER": "DB_USER",
+        "DB_PASSWORD": "DB_PASSWORD"
+      },
+      "flag": true,
+      "nothing": null
+    }
+  },
+  "escapes": "tab\there\"quote\" back\\slash"
+}
