@@ -182,7 +182,7 @@ Describe 'JSON and file plumbing' {
         $f = Join-Path $script:Tmp 'private-acl.bin'
         InModule { param($p) Write-CredPrivateFile -Path $p -Bytes ([byte[]](1)) } @($f)
         # The .NET type, not Get-Acl: Microsoft.PowerShell.Security is not
-        # always loadable on 5.1, which is why Set-CredAcl has a fallback too.
+        # always loadable on 5.1, which is why Get-CredAcl has a fallback too.
         $acl = [System.Security.AccessControl.FileSecurity]::new($f, 'Access')
         $acl.AreAccessRulesProtected | Should -BeTrue
         $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User

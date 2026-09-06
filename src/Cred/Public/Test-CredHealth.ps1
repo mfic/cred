@@ -147,8 +147,15 @@ function Repair-CredHealth {
     if ($PSCmdlet.ShouldProcess($credHome, 'Restrict permissions')) {
         $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
         $null = New-CredDirectory -Path $credHome
+        # Say what could not be fixed. Protect-CredPath used to swallow every
+        # failure, so --repair reported success no matter what it achieved.
+        $failed = [System.Collections.Generic.List[string]]::new()
+        if (-not (Protect-CredPath -Path $credHome)) { $failed.Add($credHome) }
         foreach ($f in @(Get-ChildItem -LiteralPath $credHome -File -ErrorAction SilentlyContinue)) {
-            Protect-CredPath -Path $f.FullName
+            if (-not (Protect-CredPath -Path $f.FullName)) { $failed.Add($f.FullName) }
+        }
+        if ($failed.Count -gt 0) {
+            Write-Warning "Could not tighten permissions on $($failed.Count) path(s) under '$credHome'."
         }
     }
     return (Test-CredHealth)

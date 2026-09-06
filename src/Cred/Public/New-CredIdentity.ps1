@@ -48,7 +48,7 @@ function New-CredIdentity {
 
     if ($exists -and -not $Force) {
         Write-Verbose "Identity already exists at '$Path'."
-        Protect-CredPath -Path $Path
+        $null = Protect-CredPath -Path $Path
         return [pscustomobject]@{
             Provider  = $Provider
             Path      = $Path
@@ -62,7 +62,7 @@ function New-CredIdentity {
         if ($PSCmdlet.ShouldProcess($Path, "Back up to '$backup' and replace")) {
             $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
             Move-Item -LiteralPath $Path -Destination $backup -Force -Confirm:$false
-            Protect-CredPath -Path $backup
+            $null = Protect-CredPath -Path $backup
             Write-Warning "Existing key moved to '$backup'. Stores encrypted only to the old key can no longer be read with the new one."
         }
     }
