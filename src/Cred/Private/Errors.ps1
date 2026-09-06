@@ -11,6 +11,9 @@
 $script:CredExitCodes = @{
     'Ok'              = 0
     'General'         = 1
+    # A distinct code so the message can be distinct, but it exits 1: a file we
+    # cannot open is not a file we know to be malformed.
+    'Unreadable'      = 1
     'Usage'           = 2
     'NoProject'       = 3
     'NoCredential'    = 3

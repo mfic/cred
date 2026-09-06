@@ -56,6 +56,7 @@ $exported = @(
     'Protect-CredIdentity'
     'Read-CredOptions'
     'Read-CredValue'
+    'Register-CredProject'
     'Register-CredProvider'
     'Remove-Cred'
     'Remove-CredRecipient'

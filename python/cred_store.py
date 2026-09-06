@@ -142,6 +142,46 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8-sig")
 
 
+def unreadable_next_steps(path: Path) -> List[str]:
+    """What to tell someone whose own config file will not open for them.
+
+    Nearly always an ownership accident rather than damage: a file written by
+    an elevated shell gets the admin token's descriptor -- owner
+    BUILTIN\\Administrators, no ACE for the human -- and from then on the
+    unelevated user cannot read it, or even read its ACL.
+    """
+    if is_windows():
+        me = os.environ.get("USERNAME") or "<you>"
+        return [f'See who owns it: icacls "{path}"',
+                f'Take it back:    takeown /f "{path}" && '
+                f'icacls "{path}" /inheritance:r /grant:r "{me}:(F)"',
+                "A file written by an elevated shell belongs to Administrators, "
+                "not to you."]
+    return [f"See the mode:  ls -l '{path}'",
+            f"Take it back:  chown \"$USER\" '{path}' && chmod 600 '{path}'"]
+
+
+def read_text_checked(path: Path, what: str) -> str:
+    """read_text(), but an I/O failure reports itself as one.
+
+    Every caller parses JSON out of the result. Leaving the read inside the
+    caller's try meant an access-denied arrived as "not valid JSON", whose
+    advice is to delete the file -- so the cure for a permission bit was to
+    destroy a perfectly good registry. FileNotFoundError is rethrown untouched;
+    callers have their own words for that.
+
+    Peer of Read-CredTextFile in the PowerShell module.
+    """
+    try:
+        return read_text(path)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        detail = exc.strerror or str(exc)
+        raise CredError(f"Cannot read the {what} at '{path}': {detail}.",
+                        unreadable_next_steps(path), EXIT_GENERAL) from exc
+
+
 def write_bytes_atomic(path: Path, data: bytes) -> None:
     tmp = stage_bytes(path, data)
     commit_staged(tmp, path)
@@ -947,8 +987,10 @@ def read_registry() -> Dict[str, Any]:
     p = registry_path()
     if not p.is_file():
         return {"version": CONFIG_VERSION, "projects": {}}
+    # Read outside the try: only a parse failure means "not valid JSON".
+    text = read_text_checked(p, "project registry")
     try:
-        reg = json.loads(read_text(p))
+        reg = json.loads(text)
     except Exception as exc:
         raise CredError(f"The project registry at '{p}' is not valid JSON.",
                         ["Inspect it, or delete it and re-run 'cred init' "
@@ -995,11 +1037,13 @@ class Project:
 
 def read_config(path: Path) -> Dict[str, Any]:
     try:
-        cfg = json.loads(read_text(path))
+        text = read_text_checked(path, "project config")
     except FileNotFoundError:
         raise CredError(f"'{path.parent.parent}' has no .creds/config.json.",
                         [f"Create one with: cd '{path.parent.parent}'; cred init"],
                         EXIT_NOT_FOUND)
+    try:
+        cfg = json.loads(text)
     except Exception as exc:
         raise CredError(f"'{path}' is not valid JSON.",
                         ["Fix the syntax, or restore it: "

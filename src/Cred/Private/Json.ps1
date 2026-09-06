@@ -50,6 +50,69 @@ function Get-CredFileText {
     return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
 }
 
+function Get-CredUnreadableNext {
+    <#
+        .SYNOPSIS
+        What to tell someone whose own config file will not open for them.
+
+        Nearly always an ownership accident rather than damage: a file written
+        by an elevated shell gets the admin token's descriptor -- owner
+        BUILTIN\Administrators, no ACE for the human -- and from then on the
+        unelevated user cannot read it, or even read its ACL.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (Test-CredIsWindows) {
+        $me = if ($env:USERNAME) { $env:USERNAME } else { '<you>' }
+        return @(
+            "See who owns it: icacls `"$Path`""
+            "Take it back:    takeown /f `"$Path`"; icacls `"$Path`" /inheritance:r /grant:r `"${me}:(F)`""
+            "A file written by an elevated shell belongs to Administrators, not to you."
+        )
+    }
+    return @(
+        "See the mode:  ls -l '$Path'"
+        "Take it back:  chown `"`$USER`" '$Path'; chmod 600 '$Path'"
+    )
+}
+
+function Read-CredTextFile {
+    <#
+        .SYNOPSIS
+        Get-CredFileText, but an I/O failure reports itself as one.
+
+        Every caller parses JSON out of the result. Leaving the read inside the
+        caller's try meant an access-denied arrived as "not valid JSON", whose
+        advice is to delete the file -- so the cure for a permission bit was to
+        destroy a perfectly good registry. A missing file is rethrown untouched;
+        callers have their own words for that.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$What
+    )
+
+    try { return Get-CredFileText -Path $Path }
+    catch {
+        # A .NET method throws through PowerShell wrapped in a
+        # MethodInvocationException; the real cause is underneath.
+        $ex = $_.Exception
+        while ($ex -is [System.Management.Automation.MethodInvocationException] -and $ex.InnerException) {
+            $ex = $ex.InnerException
+        }
+        if ($ex -is [System.IO.FileNotFoundException] -or $ex -is [System.IO.DirectoryNotFoundException]) {
+            throw
+        }
+        throw (New-CredErrorRecord -Code 'Unreadable' -Category PermissionDenied -Target $Path `
+            -Message "Cannot read the $What at '$Path': $($ex.Message)" `
+            -Next (Get-CredUnreadableNext -Path $Path) -InnerException $ex)
+    }
+}
+
 function Set-CredFileText {
     <#
         .SYNOPSIS

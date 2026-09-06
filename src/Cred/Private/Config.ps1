@@ -32,13 +32,15 @@ function Read-CredRegistry {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         return [ordered]@{ version = $script:CredConfigVersion; projects = [ordered]@{} }
     }
+    # Read outside the try: only a parse failure means "not valid JSON".
+    $text = Read-CredTextFile -Path $path -What 'project registry'
     try {
-        $reg = ConvertFrom-CredJson (Get-CredFileText -Path $path)
+        $reg = ConvertFrom-CredJson $text
         if (-not $reg.projects) { $reg.projects = [ordered]@{} }
         return $reg
     }
     catch {
-        throw (New-CredErrorRecord -Code 'StoreCorrupt' `
+        throw (New-CredErrorRecord -Code 'StoreCorrupt' -Target $path `
             -Message "The project registry at '$path' is not valid JSON." `
             -Next @("Inspect it, or delete it and re-run 'cred init' in each project.") `
             -InnerException $_.Exception)
@@ -227,7 +229,8 @@ function Read-CredConfig {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
 
-    try { $cfg = ConvertFrom-CredJson (Get-CredFileText -Path $Path) }
+    $text = Read-CredTextFile -Path $Path -What 'project config'
+    try { $cfg = ConvertFrom-CredJson $text }
     catch {
         throw (New-CredErrorRecord -Code 'StoreCorrupt' -Target $Path `
             -Message "'$Path' is not valid JSON." `
