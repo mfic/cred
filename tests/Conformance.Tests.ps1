@@ -378,6 +378,35 @@ Describe 'The project registry is a fixed contract' -Skip:(-not ($script:HasAge 
     }
 }
 
+Describe 'Serialised JSON is canonical on every edition' -Skip:(-not $script:HasPython) {
+    <#
+        The registry test above catches this only for the shapes a registry
+        happens to contain. .creds/config.json is the tracked file and it
+        carries the awkward ones: an array, an empty map, an empty list, a
+        null, a bool, non-ASCII, and backslash and quote escapes. Both
+        implementations format the same committed input, so neither is being
+        compared against its own transcription of it.
+    #>
+
+    BeforeAll {
+        $script:CanonDir = Join-Path $script:Fixtures 'canonical-json'
+        $script:CanonIn  = Join-Path $script:CanonDir 'input.json'
+        $script:CanonWant = (Get-Utf8Text (Join-Path $script:CanonDir 'expected.json')) -replace "`r`n", "`n"
+    }
+
+    It 'PowerShell reproduces the declared canonical form' {
+        $compact = Get-Utf8Text $script:CanonIn
+        $got = InModule { param($c) ConvertTo-CredJson -InputObject (ConvertFrom-CredJson $c) } @($compact)
+        $got.TrimEnd("`n") | Should -BeExactly $script:CanonWant.TrimEnd("`n")
+        $got | Should -Not -Match "`r" -Because 'json.dumps writes LF and this file is committed'
+    }
+
+    It 'Python reproduces the declared canonical form' {
+        $got = Invoke-Harness -Mode 'canonical' -Fixture $script:CanonIn
+        $got.TrimEnd("`n") | Should -BeExactly $script:CanonWant.TrimEnd("`n")
+    }
+}
+
 Describe 'Both implementations restrict a path the same way' -Skip:(-not ($script:HasPython -and $IsWindowsHost)) {
     <#
         Permissions are a contract too, and this one was being broken quietly

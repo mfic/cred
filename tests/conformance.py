@@ -9,6 +9,7 @@ same way, which is how four format divergences survived undetected.
     python tests/conformance.py environment <fixture-dir>
     python tests/conformance.py store-name  <fixture-dir>
     python tests/conformance.py restrict    <path>
+    python tests/conformance.py canonical   <compact-json-file>
 """
 import base64
 import json
@@ -39,6 +40,16 @@ def main(argv):
     # Not a project layout: a bare path whose permissions are the subject.
     if mode == "restrict":
         emit({"ok": cs.restrict_path(fixture)})
+        return 0
+
+    # Re-serialise a compact document into the canonical form. The document
+    # lives in the fixture rather than in this file so that both implementations
+    # format the same input rather than each formatting its own transcription.
+    if mode == "canonical":
+        with open(fixture, "rb") as fh:
+            doc = json.loads(fh.read().decode("utf-8"))
+        sys.stdout.buffer.write(cs.dump_json(doc).encode("utf-8"))
+        sys.stdout.buffer.flush()
         return 0
 
     # Every fixture is a real project layout, so nothing here needs to know
