@@ -8,6 +8,7 @@ same way, which is how four format divergences survived undetected.
     python tests/conformance.py entries     <fixture-dir>
     python tests/conformance.py environment <fixture-dir>
     python tests/conformance.py store-name  <fixture-dir>
+    python tests/conformance.py restrict    <path>
 """
 import base64
 import json
@@ -34,6 +35,11 @@ def main(argv):
     if len(argv) < 2:
         raise SystemExit(__doc__)
     mode, fixture = argv[0], Path(argv[1]).resolve()
+
+    # Not a project layout: a bare path whose permissions are the subject.
+    if mode == "restrict":
+        emit({"ok": cs.restrict_path(fixture)})
+        return 0
 
     # Every fixture is a real project layout, so nothing here needs to know
     # more about the on-disk shape than the implementation does.
