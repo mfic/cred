@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 
 function Get-Cred {
     <#
@@ -197,15 +197,206 @@ function ConvertTo-CredValueStat {
 
     # Per-character .NET classification, not an ASCII regex, so this agrees
     # with Python's str.isupper()/islower()/isdigit()/isspace() on Unicode
-    # input too -- see the interop test for 'pässwörd☃日本語end'.
+    # input too -- see the interop test that stats a non-ASCII password.
+    #
+    # One (predicate, label) list rather than five near-identical pipelines:
+    # adding a class is a row, and the order the labels come out in is the
+    # order they are written here, which is the order value_stat uses.
+    $tests = @(
+        @{ Label = 'upper';      Test = { param($c) [char]::IsUpper($c) } }
+        @{ Label = 'lower';      Test = { param($c) [char]::IsLower($c) } }
+        @{ Label = 'digit';      Test = { param($c) [char]::IsDigit($c) } }
+        @{ Label = 'whitespace'; Test = { param($c) [char]::IsWhiteSpace($c) } }
+        @{ Label = 'symbol';     Test = { param($c) -not [char]::IsLetterOrDigit($c) -and -not [char]::IsWhiteSpace($c) } }
+    )
     $chars   = $Text.ToCharArray()
     $classes = [System.Collections.Generic.List[string]]::new()
-    if ($chars | Where-Object { [char]::IsUpper($_) } | Select-Object -First 1) { $classes.Add('upper') }
-    if ($chars | Where-Object { [char]::IsLower($_) } | Select-Object -First 1) { $classes.Add('lower') }
-    if ($chars | Where-Object { [char]::IsDigit($_) } | Select-Object -First 1) { $classes.Add('digit') }
-    if ($chars | Where-Object { [char]::IsWhiteSpace($_) } | Select-Object -First 1) { $classes.Add('whitespace') }
-    if ($chars | Where-Object { -not [char]::IsLetterOrDigit($_) -and -not [char]::IsWhiteSpace($_) } | Select-Object -First 1) { $classes.Add('symbol') }
+    foreach ($t in $tests) {
+        foreach ($c in $chars) {
+            if (& $t.Test $c) { $classes.Add($t.Label); break }
+        }
+    }
 
     if ($classes.Count -eq 0) { return "$n character$plural" }
-    return "$n character$plural — $($classes -join ', ')"
+    # The separator is an em dash, built from its code point rather than typed
+    # into the source: see "Encoding" in ARCHITECTURE.md. Python's value_stat
+    # emits the same character and the two outputs are compared byte for byte.
+    return "$n character$plural $([char]0x2014) $($classes -join ', ')"
+}
+
+# ----------------------------------------------------------- cred get modes --
+# `cred get` can read a value four ways: whole, as a masked shape, as an
+# equality test, or as metadata about it. Which one was asked for, whether the
+# combination makes sense, whether it means anything for this credential, and
+# what each one prints are all rules about credentials rather than about argv
+# -- so they live here and the CLI calls them, in three steps because the
+# middle one needs the decrypted value and the first one must not wait for it.
+# Peers: resolve_read_mode, assert_read_mode_applies and apply_read_mode in
+# python/cred_store.py.
+
+function Resolve-CredReadMode {
+    <#
+        .SYNOPSIS
+        Which of `cred get`'s mutually exclusive read modes was asked for.
+
+        .DESCRIPTION
+        Always one of 'full', 'partial', 'check', 'stat'. 'full' is the
+        ordinary whole-value path: the bare command falls into it and
+        `-Reveal full` names it explicitly, so both get that path's file
+        handling rather than the refusal in Assert-CredReadModeApplies.
+
+        Throws on an unknown reveal mode, on more than one mode at once, and on
+        any of them beside -Out, which hands back the exact bytes on purpose.
+
+        Peer of resolve_read_mode in python/cred_store.py.
+
+        .EXAMPLE
+        Resolve-CredReadMode -Reveal partial
+        # partial
+
+        .EXAMPLE
+        Resolve-CredReadMode
+        # full -- the ordinary whole-value path
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        # Whatever --reveal carried: a mode name, or $true for a bare flag.
+        [AllowNull()][object]$Reveal,
+        [switch]$Check,
+        [switch]$Stat,
+        # Whether --out was given at all. Its value is not this decision's business.
+        [switch]$Out
+    )
+
+    $revealMode = $null
+    if ($null -ne $Reveal -and $Reveal -isnot [bool]) {
+        $revealMode = ([string]$Reveal).ToLowerInvariant()
+    }
+    elseif ($Reveal -is [bool] -and $Reveal) {
+        $revealMode = ''
+    }
+    if ($null -ne $revealMode -and $revealMode -notin @('partial', 'full')) {
+        throw (New-CredErrorRecord -Code 'Usage' -Category InvalidArgument `
+            -Message "Unknown --reveal mode '$revealMode'." `
+            -Next 'The only modes are: --reveal partial, --reveal full')
+    }
+
+    $asked = @()
+    if ($null -ne $revealMode) { $asked += 'reveal' }
+    if ($Check) { $asked += 'check' }
+    if ($Stat)  { $asked += 'stat' }
+
+    if ($asked.Count -gt 1) {
+        throw (New-CredErrorRecord -Code 'Usage' -Category InvalidArgument `
+            -Message "--$($asked[0]) cannot be combined with --$($asked[1]).")
+    }
+    if ($asked.Count -gt 0 -and $Out) {
+        throw (New-CredErrorRecord -Code 'Usage' -Category InvalidArgument `
+            -Message "--$($asked[0]) cannot be combined with --out." `
+            -Next '--out writes the exact bytes on purpose; none of these give back the working credential.')
+    }
+    if ($asked.Count -eq 0) { return 'full' }
+    if ($asked[0] -eq 'reveal') {
+        return $(if ($revealMode -eq 'partial') { 'partial' } else { 'full' })
+    }
+    return $asked[0]
+}
+
+function Assert-CredReadModeApplies {
+    <#
+        .SYNOPSIS
+        A restrictive read mode has to mean something for this credential.
+
+        .DESCRIPTION
+        Masking, stat and equality-checking a blob of file content do not.
+        Reading it whole does, which is why 'full' is not restrictive and never
+        reaches this refusal.
+
+        Peer of assert_read_mode_applies in python/cred_store.py.
+
+        .EXAMPLE
+        Assert-CredReadModeApplies -Mode stat -Value (Read-CredValue acme-api/ssl-key)
+    #>
+    [CmdletBinding()]
+    [OutputType([void])]
+    param(
+        [Parameter(Mandatory)][string]$Mode,
+        [Parameter(Mandatory)][object]$Value
+    )
+
+    if ($Mode -eq 'full' -or $Value.Kind -ne 'file') { return }
+
+    $flag = if ($Mode -eq 'partial') { 'reveal' } else { $Mode }
+    $next = @("See what it is: cred list $($Value.Project)")
+    if ($flag -eq 'reveal') {
+        $next += "Read it: cred get $($Value.Project)/$($Value.Key) --out <path>"
+    }
+    throw (New-CredErrorRecord -Code 'Usage' -Category InvalidArgument -Target $Value.Key `
+        -Message "'$($Value.Project)/$($Value.Key)' is a file credential; --$flag does not apply to file content." `
+        -Next $next)
+}
+
+function Invoke-CredReadMode {
+    <#
+        .SYNOPSIS
+        The exact bytes a read mode writes, and the exit code it implies.
+
+        .DESCRIPTION
+        Returns Bytes, Newline and ExitCode. Bytes rather than text because
+        'full' has to hand back file content unchanged: piping `cred get` to a
+        file must produce the file that went in. Newline says whether a
+        trailing newline is permitted at all -- never after file content,
+        whatever the caller asked for -- and the caller still decides with -n
+        whether to use the permission.
+
+        -Candidate belongs to 'check' and must have come from stdin, never from
+        argv, which would land it in shell history and process listings and
+        defeat the entire point. -ToTerminal belongs to 'full': the one thing
+        this module cannot know for itself is whether stdout is a terminal, and
+        binary content must not be written to one.
+
+        Peer of apply_read_mode in python/cred_store.py.
+
+        .EXAMPLE
+        $r = Invoke-CredReadMode -Mode stat -Value (Read-CredValue acme-api/db)
+        [Console]::Out.Write($r.Text); exit $r.ExitCode
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][string]$Mode,
+        [Parameter(Mandatory)][object]$Value,
+        [AllowNull()][AllowEmptyString()][string]$Candidate,
+        [switch]$ToTerminal
+    )
+
+    $utf8 = [System.Text.UTF8Encoding]::new($false)
+
+    if ($Mode -eq 'full') {
+        if ($Value.Kind -eq 'file') {
+            if ($Value.IsBinary -and $ToTerminal) {
+                throw (New-CredBinaryTerminalError -ProjectName $Value.Project -Key $Value.Key)
+            }
+            return [pscustomobject]@{ Bytes = $Value.Bytes; Newline = $false; ExitCode = 0 }
+        }
+        return [pscustomobject]@{ Bytes = $Value.Bytes; Newline = $true; ExitCode = 0 }
+    }
+
+    $text = $utf8.GetString($Value.Bytes)
+    $readout = {
+        param($Out, $Code)
+        [pscustomobject]@{ Bytes = $utf8.GetBytes($Out); Newline = $true; ExitCode = $Code }
+    }
+
+    switch ($Mode) {
+        'partial' { return (& $readout (ConvertTo-CredMaskedValue -Text $text) 0) }
+        'stat'    { return (& $readout (ConvertTo-CredValueStat -Text $text)   0) }
+        'check'   {
+            $matched = [string]::Equals($Candidate, $text, [System.StringComparison]::Ordinal)
+            return (& $readout $(if ($matched) { 'match' } else { 'no match' }) $(if ($matched) { 0 } else { 1 }))
+        }
+    }
+    throw (New-CredErrorRecord -Code 'Usage' -Category InvalidArgument `
+        -Message "Unknown read mode '$Mode'.")
 }

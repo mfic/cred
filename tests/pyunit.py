@@ -13,12 +13,16 @@ failure, so a single Pester assertion can wrap the lot.
     python tests/pyunit.py
 """
 import json
+import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 import cred        # noqa: E402
 import cred_store as cs  # noqa: E402
+
+_CRED_SRC = (Path(__file__).resolve().parent.parent
+             / "python" / "cred.py").read_text(encoding="utf-8")
 
 FAILURES = []
 
@@ -170,6 +174,193 @@ check("value_stat: the empty string is its own case, not '0 characters -- '",
       cs.value_stat(""), "0 characters")
 check("value_stat: never echoes the input",
       "Tr0ub4dor&3" in cs.value_stat("Tr0ub4dor&3"), False)
+
+
+# -------------------------------------------------------------- commands ---
+# The table of what each verb accepts. `known` used to be passed at one of
+# fifteen read_options call sites, so a mistyped flag was silently ignored on
+# the other fourteen. Mirrored in tests/Unit.Tests.ps1 against
+# Get-CredCommandSpec / Read-CredCommandOptions.
+
+check("command_spec: known covers the switches",
+      [v for v in cred.COMMANDS
+       if not set(cred.command_spec(v)["switches"]) <= set(cred.command_spec(v)["known"])],
+      [])
+check("command_spec: every project-bearing verb takes --project and --path",
+      [v for v in ("init", "add", "get", "list", "exec", "rm", "env",
+                   "recipients", "doctor", "claude", "import", "export")
+       if not {"project", "path"} <= set(cred.command_spec(v)["known"])],
+      [])
+check("command_spec: a verb with no project takes neither",
+      [v for v in ("keygen", "key", "project", "providers")
+       if "project" in cred.command_spec(v)["known"]],
+      [])
+check("command_spec: aliases resolve to the canonical verb",
+      [cred.command_spec(a)["known"] == cred.command_spec(c)["known"]
+       for a, c in cred.ALIASES.items()],
+      [True] * len(cred.ALIASES))
+check("command_spec: an unknown verb is an empty spec, not an error",
+      cred.command_spec("nonsense")["known"], ())
+
+check("parse_command: refuses an option the verb does not take",
+      _error_code(lambda: cred.parse_command("list", ["--verfiy"])), cs.EXIT_USAGE)
+check("parse_command: accepts the options it does take",
+      cred.parse_command("list", ["acme", "--verify", "--json"]),
+      ({"verify": True, "json": True}, ["acme"]))
+check("parse_command: short forms still work",
+      cred.parse_command("rm", ["acme/k", "-y"])[0], {"yes": True})
+check("parse_command: --reveal partial survives the spec",
+      cred.parse_command("get", ["acme/k", "--reveal", "partial"])[0],
+      {"reveal": "partial"})
+
+# Every verb the dispatcher accepts must have a spec, or its options go
+# unchecked -- which is the hole this table was added to close.
+_dispatch = set(re.findall(r'"([a-z-]+)":', re.search(
+    r"handlers = \{(.*?)\n    \}", _CRED_SRC, re.S).group(1)))
+check("command_spec: every dispatched verb has a spec",
+      sorted(v for v in _dispatch
+             if v not in cred.COMMANDS and v not in cred.ALIASES), [])
+
+# The usage text is the other copy of this table, and it was never checked.
+for _verb in sorted(cred.COMMANDS):
+    for _opt in sorted(cred.command_spec(_verb)["known"]):
+        if _opt in ("project", "path"):
+            continue   # universal, documented once under ENVIRONMENT
+        check(f"usage documents --{_opt} (accepted by {_verb})",
+              bool(re.search(r"--%s\b" % re.escape(_opt), cred.USAGE)), True)
+
+
+# ------------------------------------------------------------ read modes ---
+# resolve_read_mode / assert_read_mode_applies / apply_read_mode: the rules
+# `cred get` used to carry inline in both CLIs, where the only way to reach
+# them was to run a process. Mirrored in tests/Unit.Tests.ps1 against
+# Resolve-CredReadMode / Assert-CredReadModeApplies / Invoke-CredReadMode.
+
+check("resolve_read_mode: no flags is the ordinary whole-value path",
+      cs.resolve_read_mode(), "full")
+check("resolve_read_mode: --reveal partial",
+      cs.resolve_read_mode(reveal="partial"), "partial")
+check("resolve_read_mode: --reveal full is that same path, named explicitly",
+      cs.resolve_read_mode(reveal="full"), "full")
+check("resolve_read_mode: a reveal mode is case-insensitive",
+      cs.resolve_read_mode(reveal="PARTIAL"), "partial")
+check("resolve_read_mode: --check", cs.resolve_read_mode(check=True), "check")
+check("resolve_read_mode: --stat", cs.resolve_read_mode(stat=True), "stat")
+check("resolve_read_mode: --out alone is not a read mode",
+      cs.resolve_read_mode(out=True), "full")
+check("resolve_read_mode: always answers with one of READ_MODES",
+      cs.resolve_read_mode() in cs.READ_MODES, True)
+check("resolve_read_mode: a bare --reveal names no mode and is refused",
+      _error_code(lambda: cs.resolve_read_mode(reveal=True)), cs.EXIT_USAGE)
+check("resolve_read_mode: an unknown reveal mode is refused",
+      _error_code(lambda: cs.resolve_read_mode(reveal="bogus")), cs.EXIT_USAGE)
+check("resolve_read_mode: two modes at once are refused",
+      _error_code(lambda: cs.resolve_read_mode(reveal="partial", stat=True)),
+      cs.EXIT_USAGE)
+check("resolve_read_mode: a mode beside --out is refused",
+      _error_code(lambda: cs.resolve_read_mode(stat=True, out=True)), cs.EXIT_USAGE)
+check("resolve_read_mode: --reveal full beside --out is refused too",
+      _error_code(lambda: cs.resolve_read_mode(reveal="full", out=True)),
+      cs.EXIT_USAGE)
+
+_SECRET = {"project": "p", "key": "k", "kind": "secret", "is_binary": False,
+           "bytes": b"Tr0ub4dor&3"}
+_FILE = {"project": "p", "key": "pem", "kind": "file", "is_binary": False,
+         "bytes": b"-----BEGIN CERTIFICATE-----\n"}
+_BINARY = {"project": "p", "key": "blob", "kind": "file", "is_binary": True,
+           "bytes": b"\x00\x01\x02"}
+
+check("assert_read_mode_applies: full passes even a file credential",
+      cs.assert_read_mode_applies("full", _FILE), None)
+check("assert_read_mode_applies: a mode passes an ordinary secret",
+      cs.assert_read_mode_applies("stat", _SECRET), None)
+check("assert_read_mode_applies: stat is refused on file content",
+      _error_code(lambda: cs.assert_read_mode_applies("stat", _FILE)),
+      cs.EXIT_USAGE)
+check("assert_read_mode_applies: partial is refused under its flag name",
+      "--reveal does not apply to file content"
+      in _error_text(lambda: cs.assert_read_mode_applies("partial", _FILE)), True)
+
+check("apply_read_mode: partial masks, and never returns the value",
+      cs.apply_read_mode("partial", _SECRET),
+      {"bytes": b"********r&3 (11 characters)", "newline": True,
+       "exit_code": cs.EXIT_OK})
+check("apply_read_mode: stat describes the composition",
+      cs.apply_read_mode("stat", _SECRET)["bytes"].decode("utf-8"),
+      "11 characters — upper, lower, digit, symbol")
+check("apply_read_mode: a matching candidate exits 0",
+      cs.apply_read_mode("check", _SECRET, candidate="Tr0ub4dor&3"),
+      {"bytes": b"match", "newline": True, "exit_code": cs.EXIT_OK})
+check("apply_read_mode: a mismatching candidate exits 1",
+      cs.apply_read_mode("check", _SECRET, candidate="wrong"),
+      {"bytes": b"no match", "newline": True, "exit_code": cs.EXIT_GENERAL})
+check("apply_read_mode: no candidate at all is a mismatch, never a match",
+      cs.apply_read_mode("check", _SECRET)["exit_code"], cs.EXIT_GENERAL)
+check("apply_read_mode: check compares exactly, not case-insensitively",
+      cs.apply_read_mode("check", _SECRET, candidate="tr0ub4dor&3")["bytes"],
+      b"no match")
+
+# The fourth arm. It sat in both CLIs until now, where the only way to reach it
+# was to run a process -- and the binary-to-terminal refusal went with it.
+
+check("apply_read_mode: full hands back a secret's exact bytes, newline allowed",
+      cs.apply_read_mode("full", _SECRET),
+      {"bytes": b"Tr0ub4dor&3", "newline": True, "exit_code": cs.EXIT_OK})
+check("apply_read_mode: full never permits a newline after file content",
+      cs.apply_read_mode("full", _FILE),
+      {"bytes": b"-----BEGIN CERTIFICATE-----\n", "newline": False,
+       "exit_code": cs.EXIT_OK})
+check("apply_read_mode: binary content is refused at a terminal",
+      _error_code(lambda: cs.apply_read_mode("full", _BINARY, to_terminal=True)),
+      cs.EXIT_USAGE)
+check("apply_read_mode: that refusal says how to get the bytes out",
+      "--out <path>"
+      in _error_text(lambda: cs.apply_read_mode("full", _BINARY, to_terminal=True)),
+      True)
+check("apply_read_mode: binary content is fine when stdout is redirected",
+      cs.apply_read_mode("full", _BINARY, to_terminal=False)["bytes"],
+      b"\x00\x01\x02")
+check("apply_read_mode: text file content is not refused at a terminal",
+      cs.apply_read_mode("full", _FILE, to_terminal=True)["newline"], False)
+
+
+# ---------------------------------------------------------------- doctor ---
+# health_rows: the row set is the interop contract, and until it moved out of
+# cmd_doctor the only way to reach it was to run a process. These need no
+# project and no key -- everything before the project rows always reports.
+
+_rows = cs.health_rows()
+_checks = [r["Check"] for r in _rows]
+
+check("health_rows: names the implementation first",
+      _checks[0], "python")
+check("health_rows: reports the providers, then the home directory",
+      _checks[1:3], ["provider:age", "cred home"])
+check("health_rows: every row carries the four contract fields",
+      sorted(set(k for r in _rows for k in r)),
+      ["Check", "Detail", "Fix", "Status"])
+check("health_rows: every status is one of Ok, Warn, Fail",
+      sorted(set(r["Status"] for r in _rows)) and
+      all(r["Status"] in ("Ok", "Warn", "Fail") for r in _rows), True)
+check("health_rows: an Ok row never carries advice",
+      [r for r in _rows if r["Status"] == "Ok" and r["Fix"]], [])
+check("health_rows: check names are unique",
+      len(_checks) == len(set(_checks)), True)
+check("health_rows: reports rather than raising when there is no project",
+      "project" in _checks, True)
+check("health_rows: a missing project is a Warn, not a Fail",
+      [r["Status"] for r in _rows if r["Check"] == "project"] in
+      ([], ["Warn"], ["Ok"]), True)
+
+# The keystore row existed only in Python for a while, and the identity
+# protection row only in PowerShell before that. Both are in the contract now.
+_identity_rows = [c for c in _checks if c.startswith("identity") or c == "keystore"]
+check("health_rows: the identity rows keep their contract order",
+      [c for c in _identity_rows
+       if c in ("identity", "identity permissions", "identity protection", "keystore")],
+      _identity_rows if not _identity_rows else
+      [c for c in ("identity", "identity permissions", "identity protection",
+                   "keystore") if c in _identity_rows])
 
 
 # -------------------------------------------------------------- keystore ---

@@ -203,7 +203,7 @@ function Export-Cred {
         [switch]$Force
     )
 
-    if (-not (Test-CredIsWindows) -and -not $Force) {
+    if (-not (Test-CredClixmlProtectsSecrets) -and -not $Force) {
         throw (New-CredErrorRecord -Code 'Usage' `
             -Message 'Off Windows, Export-Clixml writes secrets in plain text.' `
             -Next @("Use Get-CredCredential in-process instead, or",

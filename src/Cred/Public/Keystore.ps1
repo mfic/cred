@@ -75,7 +75,7 @@ function Protect-CredIdentity {
     if (-not $PSCmdlet.ShouldProcess($Path, "Wrap with $(Get-CredKeystoreName)")) { return }
     $ConfirmPreference = 'None'   # our gate is answered; don't leak -Confirm downstream
 
-    Write-CredPrivateFileText -Path $target -Text (New-CredWrappedIdentityJson -IdentityText $text)
+    $null = Write-CredIdentityFile -Path $target -Text $text -Wrap -Confirm:$false
 
     # Prove the wrapped copy opens before removing the original.
     $check = Get-CredIdentityText -Path $target
@@ -125,11 +125,39 @@ function Unprotect-CredIdentity {
     $text   = Get-CredIdentityText -Path $Path
     $target = Join-Path (Split-Path -Parent $Path) 'identity.txt'
 
-    Write-CredPrivateFileText -Path $target -Text $text
+    $null = Write-CredIdentityFile -Path $target -Text $text -Confirm:$false
     Remove-Item -LiteralPath $Path -Force -Confirm:$false
 
     Write-Warning "'$target' is now a plaintext key, protected only by file permissions."
     return [pscustomobject]@{ Path = $target; Protection = 'none'; Changed = $true }
+}
+
+function Get-CredIdentityProtection {
+    <#
+        .SYNOPSIS
+        The mechanism a wrapped key names, or 'file-permissions' if it is
+        plain.
+
+        .DESCRIPTION
+        Read from the file rather than derived from the platform, for the same
+        reason identity_text dispatches on what the file says: a key wrapped on
+        another machine is precisely the case worth being able to see. Both
+        `cred key` and `cred doctor` ask this, and the doctor used to answer it
+        by naming DPAPI for any wrapped key at all -- which labelled a
+        systemd-creds key as DPAPI on the one report meant to tell you the
+        truth about your key.
+
+        Peer of identity_protection in python/cred_store.py.
+
+        .EXAMPLE
+        Get-CredIdentityProtection -Path $env:APPDATA\cred\identity.wrapped.json
+        # dpapi-currentuser
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][string]$Path)
+
+    return (Read-CredIdentityFile -Path $Path).Protection
 }
 
 function Get-CredIdentityInfo {
@@ -145,13 +173,12 @@ function Get-CredIdentityInfo {
     param([string]$Path, [string]$Provider = 'age')
 
     if (-not $Path) { $Path = Get-CredIdentityPath -Config $null -ProviderName $Provider }
-    $exists  = Test-Path -LiteralPath $Path -PathType Leaf
-    $wrapped = $exists -and (Test-CredIdentityIsWrapped -Path $Path)
+    $exists = Test-Path -LiteralPath $Path -PathType Leaf
 
     [pscustomobject]@{
         Path             = $Path
         Exists           = $exists
-        Protection       = if ($wrapped) { (ConvertFrom-CredJson (Get-CredFileText -Path $Path)).protection } else { 'file-permissions' }
+        Protection       = if ($exists) { Get-CredIdentityProtection -Path $Path } else { 'file-permissions' }
         Private          = if ($exists) { Test-CredPathIsPrivate -Path $Path } else { $false }
         KeystoreAvailable = (Test-CredKeystoreAvailable)
         Recipient        = if ($exists) { try { & (Get-CredProviderInternal -Name $Provider).GetRecipient $null } catch { $null } } else { $null }

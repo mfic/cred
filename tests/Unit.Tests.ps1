@@ -480,3 +480,263 @@ Describe 'Partial reveal and value stat' {
         (ConvertTo-CredValueStat -Text 'Tr0ub4dor&3') | Should -Not -Match 'Tr0ub4dor'
     }
 }
+
+Describe 'cred get read modes' {
+    # Mirrored in tests/pyunit.py against resolve_read_mode /
+    # assert_read_mode_applies / apply_read_mode. These rules used to sit
+    # inline in bin/cred-ps.ps1 and python/cred.py, where the only way to
+    # reach them was to run a process.
+
+    BeforeAll {
+        function New-ReadValue {
+            param([string]$Kind, [byte[]]$Bytes, [switch]$IsBinary, [string]$Key = 'k')
+            [pscustomobject]@{
+                Project = 'p'; Key = $Key; Kind = $Kind
+                IsBinary = [bool]$IsBinary; Bytes = $Bytes
+            }
+        }
+        $utf8 = [System.Text.UTF8Encoding]::new($false)
+        $script:SecretValue = New-ReadValue -Kind 'secret' -Bytes $utf8.GetBytes('Tr0ub4dor&3')
+        $script:FileValue   = New-ReadValue -Kind 'file' -Key 'pem' `
+                                            -Bytes $utf8.GetBytes("-----BEGIN CERTIFICATE-----`n")
+        $script:BinaryValue = New-ReadValue -Kind 'file' -Key 'blob' -IsBinary `
+                                            -Bytes ([byte[]](0, 1, 2))
+    }
+
+    It 'resolves no flags to the ordinary whole-value path' {
+        Resolve-CredReadMode | Should -BeExactly 'full'
+    }
+
+    It 'resolves --reveal partial' {
+        Resolve-CredReadMode -Reveal 'partial' | Should -BeExactly 'partial'
+    }
+
+    It 'resolves --reveal full to that same path, named explicitly' {
+        Resolve-CredReadMode -Reveal 'full' | Should -BeExactly 'full'
+    }
+
+    It 'takes a reveal mode case-insensitively' {
+        Resolve-CredReadMode -Reveal 'PARTIAL' | Should -BeExactly 'partial'
+    }
+
+    It 'resolves --check and --stat' {
+        Resolve-CredReadMode -Check | Should -BeExactly 'check'
+        Resolve-CredReadMode -Stat  | Should -BeExactly 'stat'
+    }
+
+    It 'does not treat --out on its own as a read mode' {
+        Resolve-CredReadMode -Out | Should -BeExactly 'full'
+    }
+
+    It 'refuses a bare --reveal, which names no mode' {
+        { Resolve-CredReadMode -Reveal $true } | Should -Throw -ExpectedMessage '*Unknown --reveal mode*'
+    }
+
+    It 'refuses an unknown reveal mode' {
+        { Resolve-CredReadMode -Reveal 'bogus' } | Should -Throw -ExpectedMessage "*Unknown --reveal mode 'bogus'*"
+    }
+
+    It 'refuses two modes at once' {
+        { Resolve-CredReadMode -Reveal 'partial' -Stat } |
+            Should -Throw -ExpectedMessage '*--reveal cannot be combined with --stat*'
+    }
+
+    It 'refuses a mode beside --out' {
+        { Resolve-CredReadMode -Stat -Out } |
+            Should -Throw -ExpectedMessage '*--stat cannot be combined with --out*'
+    }
+
+    It 'refuses --reveal full beside --out too' {
+        { Resolve-CredReadMode -Reveal 'full' -Out } |
+            Should -Throw -ExpectedMessage '*cannot be combined with --out*'
+    }
+
+    It 'lets full through even for a file credential' {
+        { Assert-CredReadModeApplies -Mode 'full' -Value $script:FileValue } | Should -Not -Throw
+    }
+
+    It 'lets an ordinary secret through' {
+        { Assert-CredReadModeApplies -Mode 'stat' -Value $script:SecretValue } | Should -Not -Throw
+    }
+
+    It 'refuses a restrictive mode on file content' {
+        { Assert-CredReadModeApplies -Mode 'stat' -Value $script:FileValue } |
+            Should -Throw -ExpectedMessage '*--stat does not apply to file content*'
+    }
+
+    It 'refuses partial under its flag name, --reveal' {
+        { Assert-CredReadModeApplies -Mode 'partial' -Value $script:FileValue } |
+            Should -Throw -ExpectedMessage '*--reveal does not apply to file content*'
+    }
+
+    It 'masks for partial and never returns the value' {
+        $r = Invoke-CredReadMode -Mode 'partial' -Value $script:SecretValue
+        [System.Text.UTF8Encoding]::new($false).GetString($r.Bytes) |
+            Should -BeExactly '********r&3 (11 characters)'
+        $r.Newline  | Should -BeTrue
+        $r.ExitCode | Should -Be 0
+    }
+
+    It 'describes the composition for stat' {
+        $r = Invoke-CredReadMode -Mode 'stat' -Value $script:SecretValue
+        [System.Text.UTF8Encoding]::new($false).GetString($r.Bytes) |
+            Should -BeExactly '11 characters — upper, lower, digit, symbol'
+        $r.ExitCode | Should -Be 0
+    }
+
+    It 'exits 0 on a matching candidate' {
+        $r = Invoke-CredReadMode -Mode 'check' -Value $script:SecretValue -Candidate 'Tr0ub4dor&3'
+        [System.Text.UTF8Encoding]::new($false).GetString($r.Bytes) | Should -BeExactly 'match'
+        $r.ExitCode | Should -Be 0
+    }
+
+    It 'exits 1 on a mismatching candidate' {
+        $r = Invoke-CredReadMode -Mode 'check' -Value $script:SecretValue -Candidate 'wrong'
+        [System.Text.UTF8Encoding]::new($false).GetString($r.Bytes) | Should -BeExactly 'no match'
+        $r.ExitCode | Should -Be 1
+    }
+
+    It 'treats no candidate at all as a mismatch, never a match' {
+        (Invoke-CredReadMode -Mode 'check' -Value $script:SecretValue -Candidate $null).ExitCode |
+            Should -Be 1
+    }
+
+    It 'compares a candidate exactly, not case-insensitively' {
+        $r = Invoke-CredReadMode -Mode 'check' -Value $script:SecretValue -Candidate 'tr0ub4dor&3'
+        [System.Text.UTF8Encoding]::new($false).GetString($r.Bytes) | Should -BeExactly 'no match'
+    }
+
+    # The fourth arm. It sat in the CLI until now, and the binary-to-terminal
+    # refusal went with it.
+
+    It 'hands back a secret''s exact bytes for full, newline allowed' {
+        $r = Invoke-CredReadMode -Mode 'full' -Value $script:SecretValue
+        $r.Bytes    | Should -Be $script:SecretValue.Bytes
+        $r.Newline  | Should -BeTrue
+        $r.ExitCode | Should -Be 0
+    }
+
+    It 'never permits a newline after file content' {
+        $r = Invoke-CredReadMode -Mode 'full' -Value $script:FileValue
+        $r.Bytes   | Should -Be $script:FileValue.Bytes
+        $r.Newline | Should -BeFalse
+    }
+
+    It 'refuses binary content at a terminal, and says how to get it out' {
+        { Invoke-CredReadMode -Mode 'full' -Value $script:BinaryValue -ToTerminal } |
+            Should -Throw -ExpectedMessage '*holds binary content*'
+        { Invoke-CredReadMode -Mode 'full' -Value $script:BinaryValue -ToTerminal } |
+            Should -Throw -ExpectedMessage '*--out <path>*'
+    }
+
+    It 'writes binary content when stdout is redirected' {
+        (Invoke-CredReadMode -Mode 'full' -Value $script:BinaryValue).Bytes |
+            Should -Be ([byte[]](0, 1, 2))
+    }
+
+    It 'does not refuse text file content at a terminal' {
+        (Invoke-CredReadMode -Mode 'full' -Value $script:FileValue -ToTerminal).Newline |
+            Should -BeFalse
+    }
+}
+
+Describe 'Command specs' {
+    # The table that says what each verb accepts. It was transcribed at every
+    # dispatch arm in bin/cred-ps.ps1, where nothing could assert against it,
+    # and -Known reached only one of seventeen parsers -- so a mistyped flag
+    # was silently ignored on the other sixteen.
+
+    BeforeAll {
+        $script:Verbs = @('init', 'add', 'get', 'list', 'exec', 'rm', 'env',
+                          'recipients', 'keygen', 'key', 'project', 'providers',
+                          'doctor', 'claude', 'import', 'export')
+        $script:UsageText = Get-Content -Raw -LiteralPath (
+            Join-Path $script:RepoRoot 'bin\cred-ps.ps1')
+    }
+
+    It 'gives every verb a spec whose Known covers its switches' {
+        foreach ($v in $script:Verbs) {
+            $spec = Get-CredCommandSpec -Verb $v
+            $spec.Verb | Should -BeExactly $v
+            foreach ($sw in $spec.Switch) {
+                $spec.Known | Should -Contain $sw -Because "$v declares switch --$sw"
+            }
+        }
+    }
+
+    It 'resolves every alias to its canonical verb' {
+        foreach ($pair in @(@{a='set';c='add'}, @{a='remove';c='rm'},
+                            @{a='delete';c='rm'}, @{a='check';c='doctor'},
+                            @{a='agent';c='claude'}, @{a='brief';c='claude'},
+                            @{a='provider';c='providers'}, @{a='newkey';c='keygen'})) {
+            (Get-CredCommandSpec -Verb $pair.a).Verb | Should -BeExactly $pair.c
+        }
+    }
+
+    It 'gives every project-bearing verb --project and --path' {
+        foreach ($v in @('init', 'add', 'get', 'list', 'exec', 'rm', 'env',
+                         'recipients', 'doctor', 'claude', 'import', 'export')) {
+            $known = (Get-CredCommandSpec -Verb $v).Known
+            $known | Should -Contain 'project' -Because "$v works on a project"
+            $known | Should -Contain 'path'    -Because "$v works on a project"
+        }
+    }
+
+    It 'refuses an unknown option on <verb>' -ForEach @(
+        @{ verb = 'list' }, @{ verb = 'doctor' }, @{ verb = 'env' }
+        @{ verb = 'add' },  @{ verb = 'import' }, @{ verb = 'export' }
+    ) {
+        { Read-CredCommandOptions -Verb $verb -Argv @('--definitely-not-a-flag') } |
+            Should -Throw -ExpectedMessage "*Unknown option '--definitely-not-a-flag'*"
+    }
+
+    It 'still parses the real options of <verb>' -ForEach @(
+        @{ verb = 'list';   argv = @('acme', '--verify', '--json') }
+        @{ verb = 'get';    argv = @('acme/k', '--reveal', 'partial') }
+        @{ verb = 'add';    argv = @('acme/k', '--user', 'svc', '--stdin') }
+        @{ verb = 'doctor'; argv = @('--repair', '--path', 'C:\x') }
+        @{ verb = 'export'; argv = @('out', '--only', 'a,b', '--yes') }
+    ) {
+        { Read-CredCommandOptions -Verb $verb -Argv $argv } | Should -Not -Throw
+    }
+
+    It 'documents every option it accepts, and accepts every one it documents' {
+        # The usage heredoc was a second, unchecked copy of the same table.
+        foreach ($v in $script:Verbs) {
+            foreach ($opt in (Get-CredCommandSpec -Verb $v).Known) {
+                # --project and --path are universal and deliberately listed
+                # once under ENVIRONMENT rather than under every verb.
+                if ($opt -in @('project', 'path')) { continue }
+                $script:UsageText | Should -Match "--$opt\b" `
+                    -Because "$v accepts --$opt, so the usage text should name it"
+            }
+        }
+    }
+
+    It 'agrees with the Python command table' {
+        # ARCHITECTURE: one CLI, two implementations. The accepted surface is
+        # part of that contract, and nothing compared the two tables before.
+        $py = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $py) { Set-ItResult -Skipped -Because 'Python is not installed'; return }
+
+        $script = @'
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import cred
+print(json.dumps({v: sorted(cred.command_spec(v)["known"]) for v in cred.COMMANDS}))
+'@
+        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "credspec-$([guid]::NewGuid().ToString('N')).py"
+        Set-Content -LiteralPath $tmp -Value $script -Encoding Ascii
+        try {
+            $json = & $py.Source $tmp (Join-Path $script:RepoRoot 'python')
+            $table = $json | ConvertFrom-Json
+            foreach ($v in $table.PSObject.Properties.Name) {
+                $psKnown = @((Get-CredCommandSpec -Verb $v).Known | Sort-Object)
+                $pyKnown = @($table.$v | Sort-Object)
+                ($psKnown -join ',') | Should -BeExactly ($pyKnown -join ',') `
+                    -Because "both CLIs must accept the same options for '$v'"
+            }
+        }
+        finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+}

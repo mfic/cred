@@ -62,10 +62,13 @@ function New-CredBinaryContentError {
         The refusal every text-shaped read path gives for a binary credential.
 
         .DESCRIPTION
-        Three callers ask the same question -- Get-Cred, Get-CredCredential and
-        the CLI's 'get' -- and the answer has to name the same two escape
-        hatches every time, or the user learns one of them and not the other.
-        Noun is what the caller was about to pretend the bytes were.
+        Two callers ask the same question -- Get-Cred and Get-CredCredential --
+        and the answer has to name the same two escape hatches every time, or
+        the user learns one of them and not the other. Noun is what the caller
+        was about to pretend the bytes were.
+
+        `cred get` writing to a terminal is a different question and has its
+        own refusal: see New-CredBinaryTerminalError.
     #>
     [CmdletBinding()]
     [OutputType([System.Management.Automation.ErrorRecord])]
@@ -79,6 +82,34 @@ function New-CredBinaryContentError {
         -Message "'$ProjectName/$Key' holds binary content, which is not $Noun." `
         -Next @("Write it to a file: Export-CredFile $ProjectName/$Key -OutFile <path>",
                 "Or from the CLI:    cred get $ProjectName/$Key --out <path>"))
+}
+
+function New-CredBinaryTerminalError {
+    <#
+        .SYNOPSIS
+        The refusal for writing binary file content to a terminal.
+
+        .DESCRIPTION
+        Distinct from New-CredBinaryContentError, which is about handing bytes
+        back as a string or a password. Here the bytes are exactly what was
+        asked for; the terminal is the problem.
+
+        This wording is the contract: bin/cred-ps.ps1 used to compose its own
+        version, on one line and naming the reference as typed rather than the
+        resolved project and key, so the two CLIs refused the same thing
+        differently. Peer of the refusal in apply_read_mode, python/cred_store.py.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Management.Automation.ErrorRecord])]
+    param(
+        [Parameter(Mandatory)][string]$ProjectName,
+        [Parameter(Mandatory)][string]$Key
+    )
+
+    return (New-CredErrorRecord -Code 'Usage' -Category InvalidArgument -Target $Key `
+        -Message "'$ProjectName/$Key' holds binary content." `
+        -Next @('Writing it to a terminal would corrupt it.',
+                "Write it to a file: cred get $ProjectName/$Key --out <path>"))
 }
 
 function Get-CredExitCode {

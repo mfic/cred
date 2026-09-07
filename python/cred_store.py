@@ -88,6 +88,34 @@ def cred_home() -> Path:
     return Path(base) / "cred"
 
 
+def _sid_to_string(sid_ptr: int) -> Optional[str]:
+    """A PSID as its 'S-1-5-...' text, or None if it cannot be converted.
+
+    Every SID this module reports -- the current user's, and each one on a
+    DACL -- comes back through here, so there is one answer to what a SID
+    looks like as a string.
+    """
+    import ctypes
+    try:
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except OSError:
+        return None
+
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p,
+                                                ctypes.POINTER(ctypes.c_wchar_p)]
+    advapi32.ConvertSidToStringSidW.restype = ctypes.c_int
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+
+    out = ctypes.c_wchar_p()
+    if not advapi32.ConvertSidToStringSidW(ctypes.c_void_p(sid_ptr), ctypes.byref(out)):
+        return None
+    try:
+        return out.value
+    finally:
+        kernel32.LocalFree(ctypes.cast(out, ctypes.c_void_p))
+
+
 def current_user_sid() -> Optional[str]:
     """This process's user SID, as a string. Windows only.
 
@@ -97,6 +125,10 @@ def current_user_sid() -> Optional[str]:
     WindowsIdentity.GetCurrent().User -- so both editions name the same
     principal rather than one naming a SID and the other a localised,
     possibly ambiguous account name.
+
+    Both writing permissions (`_windows_restrict`) and reading them back
+    (`path_is_private`) ask this, and they must name the same principal or
+    `cred doctor` reports a finding against permissions cred itself just set.
     """
     import ctypes
     from ctypes import wintypes
@@ -113,8 +145,6 @@ def current_user_sid() -> Optional[str]:
     kernel32.GetCurrentProcess.argtypes = []
     kernel32.GetCurrentProcess.restype = wintypes.HANDLE
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
     advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
                                           ctypes.POINTER(wintypes.HANDLE)]
     advapi32.OpenProcessToken.restype = wintypes.BOOL
@@ -122,9 +152,6 @@ def current_user_sid() -> Optional[str]:
                                              ctypes.c_void_p, wintypes.DWORD,
                                              ctypes.POINTER(wintypes.DWORD)]
     advapi32.GetTokenInformation.restype = wintypes.BOOL
-    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p,
-                                                ctypes.POINTER(ctypes.c_void_p)]
-    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
 
     token = wintypes.HANDLE()
     if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(),
@@ -140,15 +167,9 @@ def current_user_sid() -> Optional[str]:
         if not advapi32.GetTokenInformation(token, TOKEN_USER_INFO, buf,
                                             size.value, ctypes.byref(size)):
             return None
-        # TOKEN_USER is a SID_AND_ATTRIBUTES: { PSID Sid; DWORD Attributes }.
-        psid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p)).contents
-        out = ctypes.c_void_p()
-        if not advapi32.ConvertSidToStringSidW(psid, ctypes.byref(out)):
-            return None
-        try:
-            return ctypes.wstring_at(out.value)
-        finally:
-            kernel32.LocalFree(out)
+        # TOKEN_USER opens with a SID_AND_ATTRIBUTES whose first member is the
+        # PSID, so the pointer we want is the first machine word of the buffer.
+        return _sid_to_string(ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0])
     finally:
         kernel32.CloseHandle(token)
 
@@ -219,59 +240,6 @@ def restrict_path(path: Path) -> bool:
 
 _SID_LOCAL_SYSTEM = "S-1-5-18"
 _SID_ADMINISTRATORS = "S-1-5-32-544"
-
-
-def _sid_to_string(sid_ptr: int) -> Optional[str]:
-    import ctypes
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p,
-                                                ctypes.POINTER(ctypes.c_wchar_p)]
-    advapi32.ConvertSidToStringSidW.restype = ctypes.c_int
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-
-    out = ctypes.c_wchar_p()
-    if not advapi32.ConvertSidToStringSidW(ctypes.c_void_p(sid_ptr), ctypes.byref(out)):
-        return None
-    try:
-        return out.value
-    finally:
-        kernel32.LocalFree(ctypes.cast(out, ctypes.c_void_p))
-
-
-def _current_user_sid() -> Optional[str]:
-    import ctypes
-    from ctypes import wintypes
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
-                                          ctypes.POINTER(wintypes.HANDLE)]
-    advapi32.OpenProcessToken.restype = wintypes.BOOL
-    advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
-                                             ctypes.c_void_p, wintypes.DWORD,
-                                             ctypes.POINTER(wintypes.DWORD)]
-    advapi32.GetTokenInformation.restype = wintypes.BOOL
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-
-    TOKEN_QUERY, TOKEN_USER_CLASS = 0x0008, 1
-    token = wintypes.HANDLE()
-    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY,
-                                     ctypes.byref(token)):
-        return None
-    try:
-        size = wintypes.DWORD(0)
-        advapi32.GetTokenInformation(token, TOKEN_USER_CLASS, None, 0,
-                                     ctypes.byref(size))
-        buf = ctypes.create_string_buffer(size.value)
-        if not advapi32.GetTokenInformation(token, TOKEN_USER_CLASS, buf,
-                                            size.value, ctypes.byref(size)):
-            return None
-        # TOKEN_USER opens with a SID_AND_ATTRIBUTES whose first member is the
-        # PSID, so the pointer we want is the first machine word of the buffer.
-        return _sid_to_string(ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0])
-    finally:
-        kernel32.CloseHandle(token)
 
 
 def _dacl_allow_sids(path: Path) -> Optional[List[str]]:
@@ -348,7 +316,7 @@ def path_is_private(path: Path) -> bool:
             return False
     try:
         sids = _dacl_allow_sids(path)
-        me = _current_user_sid()
+        me = current_user_sid()
     except Exception:
         return False
     if sids is None or me is None:
@@ -371,21 +339,17 @@ def drop_foreign_access(path: Path) -> None:
     """
     if not is_windows():
         return
-    me = _current_user_sid()
+    me = current_user_sid()
     if not me:
         return
     foreign = [s for s in (_dacl_allow_sids(path) or [])
                if s not in (me, _SID_LOCAL_SYSTEM, _SID_ADMINISTRATORS)]
     if not foreign:
         return
-    argv = ["icacls", str(path)]
+    args = [str(path)]
     for sid in foreign:
-        argv += ["/remove:g", f"*{sid}"]
-    try:
-        subprocess.run(argv, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, check=False)
-    except Exception:
-        pass
+        args += ["/remove:g", f"*{sid}"]
+    _icacls(*args)
 
 
 def repair_permissions() -> Tuple[Path, List[Path]]:
@@ -1651,6 +1615,70 @@ def update_store(project: Project, mutate) -> None:
         write_config(project)
 
 
+def set_credential(project: Project, key: str, secret: str,
+                   user: Optional[str] = None, is_file: bool = False,
+                   filename: str = "", encoding: Optional[str] = None,
+                   env_secret: Optional[str] = None,
+                   env_user: Optional[str] = None,
+                   description: Optional[str] = None) -> Dict[str, Any]:
+    """Write one credential: its store entry and its plaintext declaration.
+
+    The single answer to what a credential looks like once written -- its
+    kind, the entry that holds it, and the declaration that has to stay in
+    step with the entry. `cred add` and `cred import` both come through here.
+
+    They did not always. When `cred import` carried its own copy it stopped
+    clearing `filename`, so importing over a file credential left the name of
+    a file that was no longer there in a committed, readable config -- exactly
+    the lie the `kind == "file"` branch below exists to prevent. The
+    PowerShell peer never had that bug because `Import-Cred` calls `Set-Cred`,
+    which is the one writer on that side too.
+
+    Returns {"created": bool, "kind": str}. Peer of Set-Cred.
+    """
+    result: Dict[str, Any] = {"created": False, "kind": "secret"}
+
+    def mutate(values, proj):
+        existing = values.get(key)
+        result["created"] = existing is None
+        # A file is declared by the caller; otherwise a username -- given now
+        # or already in the store -- is what makes it a pair.
+        kind = "file" if is_file else (
+            "userpass" if (user or (existing and "user" in existing)) else "secret")
+        result["kind"] = kind
+
+        entry: Dict[str, str] = {}
+        if kind == "userpass":
+            entry["user"] = user or (existing or {}).get("user", "")
+        entry["secret"] = secret
+        if encoding:
+            entry["encoding"] = encoding
+        values[key] = entry
+
+        defs = proj.config.setdefault("credentials", {})
+        d = defs.setdefault(key, {})
+        d["type"] = kind
+        d.setdefault("env", env_names(key, kind))
+        if kind == "file":
+            # A file has no environment representation, and the leftovers of a
+            # previous type would be a lie in a committed, readable file.
+            d["env"] = {}
+            d["filename"] = filename
+        else:
+            d.pop("filename", None)
+            if kind == "userpass" and "user" not in d["env"]:
+                d["env"]["user"] = env_names(key, kind)["user"]
+            if env_secret:
+                d["env"]["secret"] = str(env_secret)
+            if env_user:
+                d["env"]["user"] = str(env_user)
+        if description:
+            d["description"] = str(description)
+
+    update_store(project, mutate)
+    return result
+
+
 def env_names(key: str, kind: str = "secret",
               env: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     """The environment variable names a credential maps to.
@@ -1904,6 +1932,129 @@ def value_stat(text: str) -> str:
     return f"{n} character{plural} — {', '.join(classes)}"
 
 
+# --------------------------------------------------------- cred get modes ---
+# `cred get` can read a value four ways: whole, as a masked shape, as an
+# equality test, or as metadata about it. Which one was asked for, whether the
+# combination makes sense, whether it means anything for this credential, and
+# what each one prints are all rules about credentials rather than about argv
+# -- so they live here and both CLIs call them, in three steps because the
+# middle one needs the decrypted value and the first one must not wait for it.
+# Peers: Resolve-CredReadMode, Assert-CredReadModeApplies and Invoke-CredReadMode
+# in src/Cred/Public/Get-Cred.ps1.
+
+
+READ_MODES = ("full", "partial", "check", "stat")
+
+
+def resolve_read_mode(reveal: Any = None, check: bool = False,
+                      stat: bool = False, out: bool = False) -> str:
+    """Which of `cred get`'s mutually exclusive read modes was asked for.
+
+    Always one of READ_MODES. 'full' is the ordinary whole-value path: the
+    bare command falls into it and `--reveal full` names it explicitly, so
+    both get that path's file handling rather than the refusal in
+    assert_read_mode_applies.
+
+    Raises on an unknown --reveal mode, on more than one mode at once, and on
+    any of them beside --out, which hands back the exact bytes on purpose.
+    """
+    reveal_mode = None
+    if reveal is not None and reveal is not False:
+        reveal_mode = "" if reveal is True else str(reveal).lower()
+        if reveal_mode not in ("partial", "full"):
+            raise CredError(f"Unknown --reveal mode '{reveal_mode}'.",
+                            ["The only modes are: --reveal partial, --reveal full"],
+                            EXIT_USAGE)
+
+    asked = [name for name, on in (("reveal", reveal_mode is not None),
+                                   ("check", bool(check)),
+                                   ("stat", bool(stat))) if on]
+    if len(asked) > 1:
+        raise CredError(f"--{asked[0]} cannot be combined with --{asked[1]}.",
+                        [], EXIT_USAGE)
+    if asked and out:
+        raise CredError(f"--{asked[0]} cannot be combined with --out.",
+                        ["--out writes the exact bytes on purpose; none of "
+                         "these give back the working credential."],
+                        EXIT_USAGE)
+    if not asked:
+        return "full"
+    if asked[0] == "reveal":
+        return "partial" if reveal_mode == "partial" else "full"
+    return asked[0]
+
+
+def assert_read_mode_applies(mode: str, value: Dict[str, Any]) -> None:
+    """A restrictive read mode has to mean something for this credential.
+
+    Masking, stat and equality-checking a blob of file content do not. Reading
+    it whole does, which is why 'full' is not restrictive and never reaches
+    this refusal.
+    """
+    if mode == "full" or value["kind"] != "file":
+        return
+    flag = "reveal" if mode == "partial" else mode
+    steps = [f"See what it is: cred list {value['project']}"]
+    if flag == "reveal":
+        steps.append(f"Read it: cred get {value['project']}/{value['key']} "
+                     "--out <path>")
+    raise CredError(
+        f"'{value['project']}/{value['key']}' is a file credential; "
+        f"--{flag} does not apply to file content.",
+        steps, EXIT_USAGE)
+
+
+def apply_read_mode(mode: str, value: Dict[str, Any],
+                    candidate: Optional[str] = None,
+                    to_terminal: bool = False) -> Dict[str, Any]:
+    """The exact bytes a read mode writes, and the exit code it implies.
+
+    Returns {"bytes", "newline", "exit_code"}. Bytes rather than text because
+    'full' has to hand back file content unchanged: `cred get x > k.pem` must
+    produce the file that went in. `newline` says whether a trailing newline is
+    permitted at all -- never after file content, whatever the caller asked
+    for -- and the caller still decides with -n whether to use the permission.
+
+    `candidate` belongs to 'check' and must have come from stdin, never from
+    argv, which would land it in shell history and process listings and defeat
+    the entire point. `to_terminal` belongs to 'full': the one thing this
+    module cannot know for itself is whether stdout is a terminal, and binary
+    content must not be written to one.
+    """
+    if mode == "full":
+        if value["kind"] == "file":
+            if value["is_binary"] and to_terminal:
+                raise CredError(
+                    f"'{value['project']}/{value['key']}' holds binary content.",
+                    ["Writing it to a terminal would corrupt it.",
+                     f"Write it to a file: cred get "
+                     f"{value['project']}/{value['key']} --out <path>"],
+                    EXIT_USAGE)
+            return {"bytes": value["bytes"], "newline": False,
+                    "exit_code": EXIT_OK}
+        return {"bytes": value["bytes"], "newline": True, "exit_code": EXIT_OK}
+
+    text = value["bytes"].decode("utf-8")
+    if mode == "partial":
+        return _readout(mask_value(text), EXIT_OK)
+    if mode == "stat":
+        return _readout(value_stat(text), EXIT_OK)
+    if mode == "check":
+        # A missing candidate is the empty string, not None: PowerShell cannot
+        # hold a null in a [string] parameter, and the two must agree about an
+        # empty secret compared against nothing.
+        matched = (candidate or "") == text
+        return _readout("match" if matched else "no match",
+                        EXIT_OK if matched else EXIT_GENERAL)
+    raise CredError(f"Unknown read mode '{mode}'.", [], EXIT_USAGE)
+
+
+def _readout(text: str, exit_code: int) -> Dict[str, Any]:
+    """A text readout as the bytes that go to stdout."""
+    return {"bytes": text.encode("utf-8"), "newline": True,
+            "exit_code": exit_code}
+
+
 def read_import_file(spec: str, force: bool = False) -> bytes:
     """The exact bytes of a file being imported as a credential.
 
@@ -2014,3 +2165,124 @@ def _nearest(key: str, candidates: List[str]) -> Optional[str]:
     if not match:
         return None
     return next(c for c in candidates if c.lower() == match[0])
+
+
+# ------------------------------------------------------------------ doctor ---
+
+def health_rows(project: Optional[str] = None,
+                path: Optional[str] = None) -> List[Dict[str, str]]:
+    """Every `cred doctor` check, in order, as rows.
+
+    The row set and its order *are* the interop contract: `cred doctor` and
+    `cred-ps doctor` must report the same checks in the same order and differ
+    only in the first row, which names the implementation. That contract had
+    no interface on this side -- it was 114 lines inside the CLI, reachable
+    only by running a process, and it drifted twice before anything compared
+    the two. Peer of Test-CredHealth.
+
+    Each row is {"Check", "Status", "Detail", "Fix"}, where Status is Ok, Warn
+    or Fail and a Fix is only advice when something is actually wrong. Deciding
+    what to do about a Fail belongs to the caller: this never raises for a
+    finding and never picks an exit code.
+    """
+    rows: List[Dict[str, str]] = []
+
+    def row(check: str, status: str, detail: str, fix: str = "") -> None:
+        rows.append({"Check": check, "Status": status, "Detail": detail,
+                     "Fix": "" if status == "Ok" else fix})
+
+    row("python", "Ok", f"{sys.version.split()[0]} ({sys.platform})")
+
+    for name in sorted(PROVIDERS):
+        available, detail = PROVIDERS[name]["test"]()
+        row(f"provider:{name}", "Ok" if available else "Warn", detail,
+            PROVIDERS[name]["install_hint"])
+
+    home = cred_home()
+    row("cred home", "Ok" if home.is_dir() else "Warn", str(home), "Run: cred init")
+
+    try:
+        ident = provider_identity_path(None)
+        if ident.is_file():
+            row("identity", "Ok", str(ident))
+            if path_is_private(ident):
+                row("identity permissions", "Ok", "Readable only by you.")
+            else:
+                row("identity permissions", "Warn",
+                    "Other principals can read your key file.",
+                    "Run: cred doctor --repair")
+            # From the file, not from the platform: a key wrapped on another
+            # machine is exactly the case worth being able to see here.
+            row("identity protection", "Ok", identity_protection(ident))
+            keystore = keystore_name()
+            row("keystore", "Ok" if keystore != "none" else "Warn",
+                keystore if keystore != "none" else "none available here",
+                "Run: cred key protect")
+            # A key inside a repository is one 'git add -A' from being published.
+            if find_project_root(ident.parent):
+                row("identity location", "Fail",
+                    "Your secret key is inside a repository.",
+                    "Move it out of the repo and set CRED_IDENTITY_FILE to "
+                    "the new path.")
+        else:
+            row("identity", "Warn", f"No key at '{ident}'.", "Run: cred keygen")
+    except CredError:
+        # A provider that keeps its own keyring has no key file to report on.
+        row("identity", "Ok", "held by the provider, not by cred")
+
+    try:
+        proj = resolve_project(project, path)
+    except CredError:
+        row("project", "Warn", "Not inside a project (and none named).",
+            "Run: cred init")
+        # Not an early exit any more: the caller gets every row it would have
+        # got, and still sees a Fail found before the project checks -- a key
+        # sitting inside a repository is a finding whether or not you are in one.
+        return rows
+
+    row("project", "Ok", f"{proj.name} at {proj.root}")
+
+    # The registry is a cache of name -> path that only 'cred init' ever wrote,
+    # so a clone or a rename left it stale with no command able to fix it.
+    reg = reconcile_project_registration(proj)
+    row("registry", reg["status"], reg["detail"], reg["fix"])
+
+    if proj.store_path.is_file():
+        row("store", "Ok", str(proj.store_path))
+        try:
+            n = len(read_values(proj))
+            row("decrypt", "Ok", f"{n} credential(s) readable.")
+        except CredError as exc:
+            row("decrypt", "Fail", exc.message.splitlines()[0],
+                "See: cred recipients")
+    else:
+        row("store", "Warn", f"No store at '{proj.store_path}'.",
+            f"Run: cred add {proj.name}/<key>")
+
+    try:
+        mine = provider_for(proj.config)["recipient"](proj.config)
+    except CredError:
+        mine = None
+    recipients = proj.config.get("recipients") or []
+    if mine and mine in recipients:
+        row("recipients", "Ok", f"{len(recipients)} recipient(s); you are one.")
+    elif mine:
+        row("recipients", "Fail", "Your key is not a recipient of this project.",
+            f"Ask a current recipient to run: cred recipients add {mine}")
+    else:
+        row("recipients", "Warn",
+            f"{len(recipients)} recipient(s); could not determine yours.",
+            "Run: cred keygen")
+
+    # Git hygiene: the store and config are meant to be committed. A .gitignore
+    # that swallows them turns the whole design off without saying so.
+    ignored = git_ignores(proj.root, f"{CREDS_DIR}/{CONFIG_NAME}")
+    if ignored is True:
+        row("git", "Warn",
+            ".creds/config.json is gitignored, so it will not travel with the code.",
+            "Remove '.creds' from .gitignore -- the store is encrypted and "
+            "meant to be committed.")
+    elif ignored is False:
+        row("git", "Ok", ".creds is committable.")
+
+    return rows

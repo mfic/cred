@@ -96,6 +96,28 @@ function Test-CredKeystoreAvailable {
     }
 }
 
+function Test-CredClixmlProtectsSecrets {
+    <#
+        .SYNOPSIS
+        Does Export-Clixml encrypt a SecureString on this platform?
+
+        .DESCRIPTION
+        On Windows a SecureString is written as a DPAPI blob, openable only by
+        the account that wrote it. Everywhere else PowerShell has no DPAPI and
+        Export-Clixml writes the secret as plain text -- silently, which is why
+        Export-Cred refuses without -Force there.
+
+        Named rather than asked as `Test-CredIsWindows` at the call site,
+        because the caller's question is about the format, not the platform:
+        rule 3 keeps "what OS is this" in this file.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    return (Test-CredIsWindows)
+}
+
 function Get-CredKeystoreName {
     [CmdletBinding()]
     [OutputType([string])]
@@ -173,6 +195,34 @@ function Get-CredAcl {
     }
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     return $item.GetAccessControl()
+}
+
+function Get-CredUnreadableNext {
+    <#
+        .SYNOPSIS
+        What to tell someone whose own config file will not open for them.
+
+        Nearly always an ownership accident rather than damage: a file written
+        by an elevated shell gets the admin token's descriptor -- owner
+        BUILTIN\Administrators, no ACE for the human -- and from then on the
+        unelevated user cannot read it, or even read its ACL.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (Test-CredIsWindows) {
+        $me = if ($env:USERNAME) { $env:USERNAME } else { '<you>' }
+        return @(
+            "See who owns it: icacls `"$Path`""
+            "Take it back:    takeown /f `"$Path`"; icacls `"$Path`" /inheritance:r /grant:r `"${me}:(F)`""
+            "A file written by an elevated shell belongs to Administrators, not to you."
+        )
+    }
+    return @(
+        "See the mode:  ls -l '$Path'"
+        "Take it back:  chown `"`$USER`" '$Path'; chmod 600 '$Path'"
+    )
 }
 
 function Invoke-CredIcacls {
@@ -362,7 +412,7 @@ function Remove-CredForeignAccess {
 
         $icaclsArgs = @($Path)
         foreach ($sid in $foreign) { $icaclsArgs += @('/remove:g', "*$sid") }
-        & icacls @icaclsArgs 2>&1 | Out-Null
+        $null = Invoke-CredIcacls -Arguments $icaclsArgs
     }
     catch {
         Write-Verbose "Could not drop foreign access on '$Path': $($_.Exception.Message)"

@@ -169,7 +169,7 @@ cred get acme-api/stripe --reveal partial
 ```
 
 ```
-********wxyz (32 characters)
+********xyz (32 characters)
 ```
 
 None of these three ever put the full secret in Claude's context. `cred get`
