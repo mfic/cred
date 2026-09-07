@@ -320,6 +320,35 @@ Describe 'Python CLI migration' -Skip:(-not ($script:HasAge -and $script:HasPyth
             Should -BeExactly 'legacy p@ss ünï'
     }
 
+    It 'clears the file declaration when an import overwrites a file credential' {
+        # cred.py used to carry its own copy of the declaration writer here.
+        # It never popped 'filename', so importing over a file credential left
+        # the name of a file that was no longer there in a committed, readable
+        # config. Both commands now go through cs.set_credential, which is what
+        # Import-Cred -> Set-Cred has always done on the PowerShell side.
+        $dir = Join-Path $script:Sandbox 'overwrite'
+        $null = New-Item -ItemType Directory -Path $dir -Force
+        $null = Invoke-Cred -CliArgs @('init', 'overwrite') -WorkingDirectory $dir
+
+        $pem = Join-Path $script:Sandbox 'legacy.cred.pem'
+        Set-Content -LiteralPath $pem -Value '-----BEGIN CERTIFICATE-----' -Encoding Ascii
+        $null = Invoke-Cred -CliArgs @('add', 'overwrite/legacy', '--file', $pem, '--path', $dir)
+
+        $config = Join-Path $dir '.creds\config.json'
+        $before = (Get-Content -Raw -LiteralPath $config | ConvertFrom-Json).credentials.legacy
+        $before.type     | Should -BeExactly 'file'
+        $before.filename | Should -BeExactly 'legacy.cred.pem'
+
+        $r = Invoke-Cred -CliArgs @('import', $script:Legacy, '--force', '--path', $dir)
+        $r.ExitCode | Should -Be 0 -Because $r.StdErr
+
+        $after = (Get-Content -Raw -LiteralPath $config | ConvertFrom-Json).credentials.legacy
+        $after.type | Should -BeExactly 'userpass'
+        $after.PSObject.Properties.Name | Should -Not -Contain 'filename'
+        (Invoke-Cred -CliArgs @('get', 'overwrite/legacy', '-n', '--path', $dir)).StdOut |
+            Should -BeExactly 'legacy p@ss ünï'
+    }
+
     It 'exports files PowerShell reads back as native PSCredentials' {
         $dest = Join-Path $script:Sandbox 'exported'
         $r = Invoke-Cred -CliArgs @('export', $dest, '--project', 'pyproj',

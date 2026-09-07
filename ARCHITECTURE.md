@@ -22,6 +22,35 @@ Four rules hold the design together:
    Even the argv parser lives in the module (`Read-CredOptions`,
    `Split-CredArgv`): inside a script its only interface is a process, so the
    fiddliest code in the repository had no direct test.
+
+   The rule is easiest to break where a command has *modes*. `cred get` has
+   four ways to read a value, and deciding between them — which flag was
+   given, whether the combination is legal, whether it means anything for this
+   credential, what it prints and what it exits with — is a rule about
+   credentials, not about argv. It lived inline in both scripts, in the two
+   places nothing could test. It is now `resolve_read_mode`,
+   `assert_read_mode_applies` and `apply_read_mode` (`Resolve-CredReadMode`,
+   `Assert-CredReadModeApplies`, `Invoke-CredReadMode`), three calls because
+   the middle one needs the decrypted value and the first must not wait for
+   it. All four modes are behind that interface, including the plain one:
+   `apply_read_mode` returns bytes rather than text precisely so the
+   whole-value mode can hand back file content unchanged, and it owns the
+   binary-to-terminal refusal. What is left in each CLI is the I/O between
+   them: read stdin, write stdout, return the code.
+
+   Three more things moved out for the same reason, each of which had drifted
+   while it sat in a script:
+
+   - **What each verb accepts.** `COMMANDS` in `python/cred.py`,
+     `Get-CredCommandSpec` in the module. It was transcribed at every dispatch
+     arm, and the `known` list that rejects a mistyped flag reached one arm of
+     fifteen — so `cred list --verfiy` quietly did not verify. One table now
+     answers it, aliases included, and `ConvertTo-CredCallArguments` turns a
+     parsed command into the arguments its module function is splatted with.
+   - **What `cred doctor` reports.** `health_rows` / `Test-CredHealth`. See
+     "One CLI, two implementations".
+   - **What a credential looks like once written.** `set_credential` /
+     `Set-Cred`. See "Data model".
 2. **All crypto is behind the provider contract.** Nothing above
    `Providers.ps1` knows what encryption is. Swapping backends is one file.
 3. **All OS knowledge lives in `Platform.ps1` and `Process.ps1`.** Nothing else
@@ -157,6 +186,15 @@ A file credential adds one key to its store entry and two to its declaration:
 ```
 
 Three decisions worth not rediscovering:
+
+One function writes a credential: `set_credential` in `python/cred_store.py`,
+`Set-Cred` in the module, and `cred add` and `cred import` both go through it.
+They did not always. Python's `cred import` carried its own copy of the
+declaration writer, and that copy never cleared `filename`, so importing over a
+file credential left the name of a file that no longer existed in a committed,
+readable config — the exact lie the `file` branch exists to prevent. The
+PowerShell side never had the bug, because `Import-Cred` has always called
+`Set-Cred`.
 
 - **`encoding` lives in the store, not the config.** It describes the stored
   bytes, so a store that has outlived its `config.json` still decodes
@@ -304,6 +342,12 @@ Three decisions follow:
   decrypt still cannot be erased by accident, while losing your key does not
   also cost you the ability to start over. `--force --yes` is how you mean it.
 
+  One counter answers it everywhere: `existing_credential_count` /
+  `Get-CredExistingCredentialCount`, asked by the CLI that phrases the prompt
+  and by the module that refuses. `bin/cred-ps.ps1` briefly had a second rule
+  of its own — `Get-CredList -Verify` — so the number in the question could
+  disagree with the number in the refusal about the same directory.
+
 ## Encoding
 
 Everything internal is bytes. Strings become bytes with an explicit
@@ -312,7 +356,7 @@ Everything internal is bytes. Strings become bytes with an explicit
 This is not fussiness. Windows PowerShell 5.1 has three separate traps, all of
 which silently corrupt data rather than failing:
 
-- `Set-Content -Encoding UTF8` writes a byte order mark.
+- `Set-Content -Encoding UTF8` writes a byte order mark into the *data*.
 - `ConvertTo-Json` defaults to `-Depth 2` and truncates deeper structures
   without a word, and there is no `-AsHashtable` on `ConvertFrom-Json`.
 - **`Process.StandardInput` writes the console encoding's preamble into the
@@ -325,6 +369,18 @@ which silently corrupt data rather than failing:
 
 `Json.ps1` exists to make the first two impossible to hit; `Process.ps1` handles
 the third.
+
+A BOM on a `.ps1` **source** file is the opposite rule, and the two are easy to
+confuse. Windows PowerShell 5.1 decodes a BOM-less script as the machine's ANSI
+code page, so a source file containing non-ASCII needs a BOM or its own text is
+silently corrupted on the edition we support least well. The way out is not to
+argue about the BOM but to keep non-ASCII out of the source: where a character
+is part of the *contract* — the em dash `value_stat` and `ConvertTo-CredValueStat`
+both emit, which `tests/Interop.Tests.ps1` compares byte for byte — it is built
+from its code point (`[char]0x2014`) so nothing depends on how the file was
+saved. `Public/AgentBrief.ps1` and the test files keep their BOMs: their
+non-ASCII is prose and fixtures rather than bytes either implementation has to
+match.
 
 ## Not leaking
 
@@ -410,6 +466,26 @@ answering different questions about the same machine. They now report the same
 rows, in the same order, and differ only in the first one — `python` or
 `powershell`.
 
+"Nothing compared the two" was the actual defect, and saying so in this file
+did not fix it: the `keystore` row was added to Python alone and drifted the
+same way again. `tests/Interop.Tests.ps1` now runs both doctors over one
+project and compares the check names, so the rule is enforced by the suite
+rather than by this paragraph.
+
+The row set also has an interface on both sides now. It was 114 lines inside
+`cmd_doctor`, where the only way to reach it was to run a process; it is
+`health_rows` in `python/cred_store.py`, the peer of `Test-CredHealth`, and the
+CLI is left with the table and the exit code. That is why the contract can be
+asserted directly — row order, unique names, no advice on an `Ok` row — instead
+of by grepping stdout.
+
+Each row is also read from the same place by both. `identity protection` names
+what the key file itself says (`identity_protection`,
+`Get-CredIdentityProtection`) rather than what the platform would have used —
+PowerShell used to print `dpapi-currentuser` for any wrapped key at all, which
+labelled a `systemd-creds-user` key as DPAPI on the one report whose job is to
+tell you how your key is held.
+
 `tests/fixtures/` is therefore the contract as an artifact: committed
 stores, and the exact resolution each implementation must produce.
 `tests/Conformance.Tests.ps1` holds both to it. A third implementation in `sh`
@@ -493,6 +569,14 @@ portable:
   anyway: it proves the bytes that are about to become the store are readable,
   not merely that a byte array in memory was.
 
+`Private/Identity.ps1` owns that file — its format, `Read-CredIdentityFile`,
+`Get-CredIdentityText` and `Write-CredIdentityFile`. It used to have no owner:
+the wrapped form was written in `Providers.ps1`, parsed again there, parsed a
+third time in `Keystore.ps1`, and its crypto lived in `Platform.ps1`, so adding
+a reader was a four-file edit and a fourth reader did get added before anyone
+noticed. What a keystore *is* stays in `Platform.ps1`; this file only knows the
+format that names one.
+
 Wrapping is detected by file content, not by filename, so renaming a key cannot
 misrepresent it. The wrapped file names its own mechanism in a `protection`
 field, which is what lets more than one exist: `identity_text` dispatches on
@@ -567,16 +651,20 @@ src/Cred/
   Private/
     Platform.ps1  OS detection, config paths, ACLs, Windows argv quoting
     Errors.ps1    error records with next steps; code → exit code
+    FileIo.ps1    UTF-8 no-BOM reads and writes, staging, atomic replace,
+                  the permission-ordered private writer
     Entry.ps1     what a credential IS: kind, bytes, env names, file content
-    Json.ps1      UTF-8 no-BOM I/O, atomic writes, JSON that behaves on 5.1
+    Json.ps1      JSON that behaves the same on 5.1 and 7
     Process.ps1   child processes: byte pipes in, byte pipes out
     Secrets.ps1   SecureString conversion and prompting
     Providers.ps1 the crypto seam: age, and where a provider keeps its key
+    Identity.ps1  the identity file: its format, reading it, writing it
     Config.ps1    project discovery, registry, config read/write
     Store.ps1     locking, the read spine (store view), the write spine
   Public/         one file per area; every function has help and examples
     Open-CredStore.ps1  one decryption, every entry resolved
-    CommandLine.ps1     argv parsing, callable so it can be tested
+    CommandLine.ps1     argv parsing and the command table, callable so they
+                        can be tested
 python/
   cred.py         the CLI: argv, output, exit codes. No behaviour.
   cred_store.py   the store as a library: providers, formats, locking,

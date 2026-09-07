@@ -72,6 +72,67 @@ BeforeAll {
         [pscustomobject]@{ StdOut = $out; StdErr = $err; ExitCode = $code }
     }
 
+    function Invoke-PsCred {
+        <#
+            Run the PowerShell cred CLI as a separate process, the same way
+            Invoke-PyCred runs the Python one, so the two can be compared as
+            the user meets them rather than as functions.
+        #>
+        param([string[]]$CliArgs, [string]$StdIn)
+
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = (Get-Process -Id $PID).Path
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.RedirectStandardInput  = $true
+        $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        $psi.StandardErrorEncoding  = [System.Text.UTF8Encoding]::new($false)
+        $psi.EnvironmentVariables['CRED_HOME'] = $env:CRED_HOME
+        $psi.EnvironmentVariables.Remove('CRED_PROJECT')       | Out-Null
+        $psi.EnvironmentVariables.Remove('CRED_IDENTITY_FILE') | Out-Null
+
+        $cli    = Join-Path $script:RepoRoot 'bin\cred-ps.ps1'
+        $quoted = @('-NoProfile', '-NonInteractive', '-File', $cli) + $CliArgs |
+                  ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }
+        $psi.Arguments = $quoted -join ' '
+
+        $p = [System.Diagnostics.Process]::Start($psi)
+        if ($StdIn) {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($StdIn)
+            $p.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+            $p.StandardInput.BaseStream.Flush()
+        }
+        $p.StandardInput.Close()
+        $out = $p.StandardOutput.ReadToEnd()
+        $err = $p.StandardError.ReadToEnd()
+        $p.WaitForExit()
+        $code = $p.ExitCode
+        $p.Dispose()
+
+        [pscustomobject]@{ StdOut = $out; StdErr = $err; ExitCode = $code }
+    }
+
+    function Get-DoctorCheckNames {
+        <#
+            The Check column of a `cred doctor` table, in order.
+
+            Anchored on the status word rather than on column positions,
+            because the two editions pad their columns differently -- Python
+            joins with two spaces, Format-Table with one -- and the widest
+            check name would otherwise be indistinguishable from its status.
+        #>
+        param([string]$TableText)
+
+        $names = @()
+        foreach ($line in ($TableText -split "`r?`n")) {
+            if ($line -match '^(?<check>[a-z][a-z0-9 :._-]*?)\s+(Ok|Warn|Fail)(\s|$)') {
+                $names += $Matches['check']
+            }
+        }
+        return @($names)
+    }
+
     function New-TestProject {
         param([string]$Name = "i$([guid]::NewGuid().ToString('N').Substring(0,8))")
         $dir = Join-Path $script:Sandbox $Name
@@ -434,5 +495,45 @@ Describe 'Matching behaviour' -Skip:(-not ($script:HasAge -and $script:HasPython
         $bad = Invoke-PyCred -CliArgs @('get', "$($p.Name)/k", '--check', '-n') -StdIn 'wrong'
         $bad.ExitCode | Should -Be 1
         $bad.StdOut   | Should -BeExactly 'no match'
+    }
+}
+
+Describe 'Both doctors report the same rows' -Skip:(-not ($script:HasAge -and $script:HasPython)) {
+    # ARCHITECTURE.md: "They now report the same rows, in the same order, and
+    # differ only in the first one." Nothing checked that, which is how the
+    # keystore row came to exist only in Python -- the two implementations
+    # were once again answering different questions about the same machine.
+
+    It 'agrees on every check name, and differs only in the first' {
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/k" -Secret 'x'
+
+        $py = Invoke-PyCred -CliArgs @('doctor', '--path', $p.Path)
+        $ps = Invoke-PsCred -CliArgs @('doctor', '--path', $p.Path)
+
+        $pyRows = Get-DoctorCheckNames $py.StdOut
+        $psRows = Get-DoctorCheckNames $ps.StdOut
+
+        $pyRows.Count | Should -BeGreaterThan 5 -Because $py.StdOut
+        $pyRows[0]    | Should -BeExactly 'python'
+        $psRows[0]    | Should -BeExactly 'powershell'
+
+        # Everything after the first row is the contract.
+        (($pyRows | Select-Object -Skip 1) -join ', ') |
+            Should -BeExactly (($psRows | Select-Object -Skip 1) -join ', ') `
+                   -Because "python:`n$($py.StdOut)`npowershell:`n$($ps.StdOut)"
+    }
+
+    It 'reports the key protection from the file rather than the platform' {
+        # Hardcoding DPAPI here labelled a systemd-creds key as DPAPI, on the
+        # one report whose whole job is to say how your key is actually held.
+        Get-CredIdentityProtection -Path (Get-CredIdentityInfo).Path |
+            Should -BeExactly 'file-permissions'
+
+        # Named outside CRED_HOME so it cannot become the identity cred picks.
+        $wrapped = Join-Path $script:Sandbox 'foreign-key.json'
+        Set-Content -LiteralPath $wrapped -Encoding Ascii -Value (
+            '{"format":"cred-identity","protection":"systemd-creds-user","blob":"AA=="}')
+        Get-CredIdentityProtection -Path $wrapped | Should -BeExactly 'systemd-creds-user'
     }
 }

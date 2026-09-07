@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
     cred -- command-line front end for the Cred module.
 
@@ -64,11 +64,28 @@ function Write-CredSecret {
         Writes to the real stdout handle rather than the PowerShell pipeline,
         so the value is not captured by Start-Transcript or by the host's
         output history. Redirection and piping still work normally.
+
+        Takes bytes as well as text, because `cred get` hands back file content
+        that must not make a round trip through a string -- the peer of
+        write_secret in python/cred.py, which takes both for the same reason.
     #>
-    param([AllowEmptyString()][AllowNull()][string]$Value, [switch]$NoNewline)
-    if ($null -eq $Value) { $Value = '' }
-    if ($NoNewline) { [Console]::Out.Write($Value) } else { [Console]::Out.Write($Value + [Environment]::NewLine) }
+    param([AllowEmptyString()][AllowNull()][object]$Value, [switch]$NoNewline)
+
+    $utf8  = [System.Text.UTF8Encoding]::new($false)
+    $bytes = if ($null -eq $Value)        { [byte[]]@() }
+             elseif ($Value -is [byte[]]) { $Value }
+             else                         { $utf8.GetBytes([string]$Value) }
+
+    # Anything already queued on the TextWriter has to land first, or a
+    # Write-Line before this call would arrive after it.
     [Console]::Out.Flush()
+    $stdout = [Console]::OpenStandardOutput()
+    if ($bytes.Length -gt 0) { $stdout.Write($bytes, 0, $bytes.Length) }
+    if (-not $NoNewline) {
+        $nl = $utf8.GetBytes([Environment]::NewLine)
+        $stdout.Write($nl, 0, $nl.Length)
+    }
+    $stdout.Flush()
 }
 
 function Write-CredCliError {
@@ -155,7 +172,8 @@ COMMANDS
       --file <path>                Store a file's exact bytes (PEM, cert, key)
       --filename <name>            Record a different name than the source
       --env <NAME>                 Environment variable name to map it to
-      --desc <text>                What it is for
+      --desc <text>                What it is for (--description too)
+      --env-user <NAME>            Variable name for the username half
       --allow-empty                Permit an empty value
 
   get <project>/<key>              Print a secret
@@ -180,6 +198,7 @@ COMMANDS
 
   rm <project>/<key>               Delete a credential
       --yes                        Skip the confirmation
+      --keep-definition            Remove the value, keep the declaration
 
   env [project]                    Print export lines for the current shell
       --format <powershell|posix>
@@ -258,31 +277,22 @@ function Invoke-CredCli {
         }
 
         'init' {
-            $p = Read-CredOptions -Argv $rest -Switches @('force', 'yes') -Short @{ 'y' = 'yes' }
+            $p = Read-CredCommandOptions -Verb 'init' -Argv $rest
             $o = $p.Options
-            $call = @{}
-            if ($p.Positional.Count -gt 0) { $call.Project = $p.Positional[0] }
-            if (Get-Opt $o 'project')      { $call.Project = Get-Opt $o 'project' }
-            if (Get-Opt $o 'provider')     { $call.Provider = Get-Opt $o 'provider' }
-            if (Get-Opt $o 'recipient')    { $call.Recipient = (Get-Opt $o 'recipient') -split ',' }
-            if (Get-Opt $o 'path')         { $call.Path = Get-Opt $o 'path' }
-            if (Get-Opt $o 'force')        { $call.Force = $true }
+            $call = ConvertTo-CredCallArguments -Spec (Get-CredCommandSpec 'init') `
+                                                -Parsed $p -Positional 'Project'
 
             # The CLI owns the question and hands the module the answer. With
             # nobody to ask it stays silent and lets the module refuse, so the
-            # message and its next steps render exactly as python/cred.py's --
-            # the local UsageError helper formats flat, without a 'Next:' block.
+            # message and its next steps render exactly as python/cred.py's.
             #
-            # Counting goes through the public surface: -Verify unions the
-            # declarations with what is really in the store, and falls back to
-            # the declarations alone when there is no key to decrypt with.
+            # The count comes from the same function Initialize-CredProject
+            # refuses on, and that python/cred.py asks. It used to be a second
+            # rule here (Get-CredList -Verify), so the number in the prompt
+            # could disagree with the number in the refusal.
             if ($call.Force) {
-                $root = if ($call.Path) { $call.Path } else { (Get-Location).ProviderPath }
-                $losing = 0
-                try { $losing = @(Get-CredList -Path $root -Verify).Count }
-                catch {
-                    try { $losing = @(Get-CredList -Path $root).Count } catch { $losing = 0 }
-                }
+                $root   = if ($call.Path) { $call.Path } else { (Get-Location).ProviderPath }
+                $losing = Get-CredExistingCredentialCount -Path $root
                 if ($losing -eq 0 -or (Get-Opt $o 'yes')) {
                     $call.Yes = $true
                 }
@@ -305,25 +315,16 @@ function Invoke-CredCli {
         }
 
         { $_ -in 'add', 'set' } {
-            $p = Read-CredOptions -Argv $rest -Switches @('stdin', 'allow-empty', 'force') -Short @{}
+            $p = Read-CredCommandOptions -Verb 'add' -Argv $rest
             $o = $p.Options
             if ($p.Positional.Count -lt 1) { throw (UsageError 'cred add <project>/<key> [--user <name>]') }
 
-            $call = @{ Name = $p.Positional[0] }
-            if ($p.Positional.Count -gt 1)  { $call.Secret = $p.Positional[1] }
-            if (Get-Opt $o 'value')         { $call.Secret = Get-Opt $o 'value' }
-            if (Get-Opt $o 'file')          { $call.File = Get-Opt $o 'file' }
-            if (Get-Opt $o 'filename')      { $call.FileName = Get-Opt $o 'filename' }
-            if (Get-Opt $o 'force')         { $call.Force = $true }
-            if (Get-Opt $o 'user')          { $call.User = Get-Opt $o 'user' }
-            if (Get-Opt $o 'desc')          { $call.Description = Get-Opt $o 'desc' }
-            if (Get-Opt $o 'description')   { $call.Description = Get-Opt $o 'description' }
-            if (Get-Opt $o 'env')           { $call.Env = @{ secret = Get-Opt $o 'env' } }
-            if (Get-Opt $o 'env-user')      { $call.Env = (Merge-Env $call 'user' (Get-Opt $o 'env-user')) }
-            if (Get-Opt $o 'path')          { $call.Path = Get-Opt $o 'path' }
-            if (Get-Opt $o 'project')       { $call.Project = Get-Opt $o 'project' }
-            if (Get-Opt $o 'stdin')         { $call.FromStdin = $true }
-            if (Get-Opt $o 'allow-empty')   { $call.AllowEmpty = $true }
+            $call = ConvertTo-CredCallArguments -Spec (Get-CredCommandSpec 'add') `
+                                                -Parsed $p -Positional @('Name', 'Secret')
+            # --env and --env-user are the one irregular pair: two options that
+            # become one hashtable, so the table cannot express them.
+            if (Get-Opt $o 'env')      { $call.Env = @{ secret = Get-Opt $o 'env' } }
+            if (Get-Opt $o 'env-user') { $call.Env = (Merge-Env $call 'user' (Get-Opt $o 'env-user')) }
 
             $r = Set-Cred @call
             $what = if ($r.Created) { 'Added' } else { 'Updated' }
@@ -337,42 +338,24 @@ function Invoke-CredCli {
         }
 
         'get' {
-            $p = Read-CredOptions -Argv $rest -Switches @('no-newline', 'force', 'check', 'stat') -Short @{ 'n' = 'no-newline' } `
-                -Known @('no-newline', 'force', 'check', 'stat', 'field', 'out', 'reveal', 'project', 'path')
+            $p = Read-CredCommandOptions -Verb 'get' -Argv $rest
             $o = $p.Options
             if ($p.Positional.Count -lt 1) { throw (UsageError 'cred get <project>/<key>') }
 
-            $reveal = Get-Opt $o 'reveal'
-            $check  = [bool](Get-Opt $o 'check')
-            $stat   = [bool](Get-Opt $o 'stat')
+            # Which of the mutually exclusive read modes this is, and whether
+            # the combination is even legal, is the module's decision -- see
+            # Resolve-CredReadMode. $null means the ordinary whole-value path,
+            # which is what '--reveal full' explicitly names.
+            $mode = Resolve-CredReadMode -Reveal (Get-Opt $o 'reveal') `
+                                         -Check:([bool](Get-Opt $o 'check')) `
+                                         -Stat:([bool](Get-Opt $o 'stat')) `
+                                         -Out:([bool](Get-Opt $o 'out'))
 
-            $revealMode = $null
-            if ($reveal) {
-                $revealMode = if ($reveal -is [string]) { $reveal.ToLowerInvariant() } else { '' }
-                if ($revealMode -notin @('partial', 'full')) {
-                    throw (UsageError "Unknown --reveal mode '$revealMode'." 'The only modes are: --reveal partial, --reveal full')
-                }
-            }
-
-            # --reveal, --check and --stat are four different ways to read a
-            # value -- full cleartext, a masked shape, an equality test, or
-            # metadata -- and only one at a time makes sense. None of them
-            # makes sense alongside --out, which hands back the exact bytes
-            # on purpose.
-            $modes = @()
-            if ($null -ne $revealMode) { $modes += 'reveal' }
-            if ($check)  { $modes += 'check' }
-            if ($stat)   { $modes += 'stat' }
-            if ($modes.Count -gt 1) {
-                throw (UsageError "--$($modes[0]) cannot be combined with --$($modes[1]).")
-            }
-            if ($modes.Count -gt 0 -and (Get-Opt $o 'out')) {
-                throw (UsageError "--$($modes[0]) cannot be combined with --out." '--out writes the exact bytes on purpose; none of these give back the working credential.')
-            }
-
-            $call = @{ Name = $p.Positional[0] }
-            if (Get-Opt $o 'path')    { $call.Path = Get-Opt $o 'path' }
-            if (Get-Opt $o 'project') { $call.Project = Get-Opt $o 'project' }
+            # --force belongs to --out here, not to the read; the read modes and
+            # --out are the CLI's own to arbitrate.
+            $call = ConvertTo-CredCallArguments -Spec (Get-CredCommandSpec 'get') `
+                                                -Parsed $p -Positional 'Name' `
+                                                -Exclude @('field', 'force')
 
             if (Get-Opt $o 'out') {
                 $call.OutFile = Get-Opt $o 'out'
@@ -388,73 +371,26 @@ function Invoke-CredCli {
 
             # One call, one decryption: the bytes and what they are.
             $v = Read-CredValue @call
+            Assert-CredReadModeApplies -Mode $mode -Value $v
 
-            # --reveal full is just an explicit name for the plain, no-flag
-            # behaviour below, so it shares that path's file-kind handling
-            # (including --out) rather than this refusal -- masking, stat and
-            # equality-checking a binary blob don't mean anything, but
-            # reading it whole does.
-            $restrictive = if ($modes.Count -gt 0 -and -not ($modes[0] -eq 'reveal' -and $revealMode -eq 'full')) { $modes[0] } else { $null }
-            if ($restrictive -and $v.Kind -eq 'file') {
-                $next = "See what it is: cred list $($v.Project)"
-                if ($restrictive -eq 'reveal') { $next += "`nRead it: cred get $($v.Project)/$($v.Key) --out <path>" }
-                throw (UsageError "'$($v.Project)/$($v.Key)' is a file credential; --$restrictive does not apply to file content." $next)
-            }
-
-            if ($check) {
-                # Read from stdin only -- never argv, which would land the
-                # candidate in shell history and process listings and defeat
-                # the entire point.
-                $candidate = Read-CredStdinSecret
-                $text    = [System.Text.UTF8Encoding]::new($false).GetString($v.Bytes)
-                $matched = [string]::Equals($candidate, $text, [System.StringComparison]::Ordinal)
-                Write-CredSecret -Value $(if ($matched) { 'match' } else { 'no match' }) -NoNewline:([bool](Get-Opt $o 'no-newline'))
-                return $(if ($matched) { 0 } else { 1 })
-            }
-
-            if ($stat) {
-                $text = [System.Text.UTF8Encoding]::new($false).GetString($v.Bytes)
-                Write-CredSecret -Value (ConvertTo-CredValueStat -Text $text) -NoNewline:([bool](Get-Opt $o 'no-newline'))
-                return 0
-            }
-
-            if ($revealMode -eq 'partial') {
-                $text = [System.Text.UTF8Encoding]::new($false).GetString($v.Bytes)
-                $masked = ConvertTo-CredMaskedValue -Text $text
-                Write-CredSecret -Value $masked -NoNewline:([bool](Get-Opt $o 'no-newline'))
-                return 0
-            }
-
-            # $revealMode -eq 'full', or no mode was given at all: the ordinary path.
-            if ($v.Kind -eq 'file') {
-                # Exact bytes, and no trailing newline of ours: piping this to a
-                # file must produce the file that went in, byte for byte.
-                #
-                # The guard keys off the stored 'encoding' marker, exactly as
-                # python/cred.py does. Sniffing for a NUL byte instead meant a
-                # base64-stored file with no NUL was blocked by one
-                # implementation and printed by the other.
-                if ($v.IsBinary -and -not [Console]::IsOutputRedirected) {
-                    throw (UsageError "'$($p.Positional[0])' holds binary content. Writing it to a terminal would corrupt it. Write it to a file: cred get $($p.Positional[0]) --out <path>")
-                }
-                $stdout = [Console]::OpenStandardOutput()
-                $stdout.Write($v.Bytes, 0, $v.Bytes.Length)
-                $stdout.Flush()
-                return 0
-            }
-
-            $value = [System.Text.UTF8Encoding]::new($false).GetString($v.Bytes)
-            Write-CredSecret -Value $value -NoNewline:([bool](Get-Opt $o 'no-newline'))
-            return 0
+            # The candidate for --check is read from stdin -- never argv, which
+            # would land it in shell history and process listings -- and only
+            # after the refusal above, so a file credential does not first block
+            # on input. Whether stdout is a terminal is the one thing the module
+            # cannot know for itself.
+            $candidate = if ($mode -eq 'check') { Read-CredStdinSecret } else { $null }
+            $readout   = Invoke-CredReadMode -Mode $mode -Value $v -Candidate $candidate `
+                                             -ToTerminal:(-not [Console]::IsOutputRedirected)
+            Write-CredSecret -Value $readout.Bytes `
+                             -NoNewline:(-not $readout.Newline -or [bool](Get-Opt $o 'no-newline'))
+            return $readout.ExitCode
         }
 
         'list' {
-            $p = Read-CredOptions -Argv $rest -Switches @('verify', 'json') -Short @{}
+            $p = Read-CredCommandOptions -Verb 'list' -Argv $rest
             $o = $p.Options
-            $call = @{}
-            if ($p.Positional.Count -gt 0) { $call.Project = $p.Positional[0] }
-            if (Get-Opt $o 'path')         { $call.Path = Get-Opt $o 'path' }
-            if (Get-Opt $o 'verify')       { $call.Verify = $true }
+            $call = ConvertTo-CredCallArguments -Spec (Get-CredCommandSpec 'list') `
+                                                -Parsed $p -Positional 'Project'
 
             $rows = @(Get-CredList @call)
             if (Get-Opt $o 'json') {
@@ -476,30 +412,27 @@ function Invoke-CredCli {
         }
 
         'exec' {
-            $p = Read-CredOptions -Argv $rest -Switches @() -Short @{}
+            $p = Read-CredCommandOptions -Verb 'exec' -Argv $rest
             $o = $p.Options
             if ($tail.Count -eq 0) {
                 throw (UsageError 'cred exec <project> -- <command> [args]')
             }
-            $call = @{ Command = $tail[0] }
-            if ($tail.Count -gt 1) { $call.ArgumentList = $tail[1..($tail.Count - 1)] }
-            if ($p.Positional.Count -gt 0) { $call.Project = $p.Positional[0] }
-            if (Get-Opt $o 'path')   { $call.Path = Get-Opt $o 'path' }
-            if (Get-Opt $o 'only')   { $call.Only = (Get-Opt $o 'only') -split ',' }
-            if (Get-Opt $o 'except') { $call.Exclude = (Get-Opt $o 'except') -split ',' }
-            if (Get-Opt $o 'prefix') { $call.Prefix = Get-Opt $o 'prefix' }
+            $extra = @{ Command = $tail[0] }
+            if ($tail.Count -gt 1) { $extra.ArgumentList = $tail[1..($tail.Count - 1)] }
+            $call = ConvertTo-CredCallArguments -Spec (Get-CredCommandSpec 'exec') `
+                                                -Parsed $p -Positional 'Project' -Extra $extra
 
             return (Invoke-CredCommand @call -PassThru)
         }
 
         { $_ -in 'rm', 'remove', 'delete' } {
-            $p = Read-CredOptions -Argv $rest -Switches @('yes', 'keep-definition') -Short @{ 'y' = 'yes' }
+            $p = Read-CredCommandOptions -Verb 'rm' -Argv $rest
             $o = $p.Options
             if ($p.Positional.Count -lt 1) { throw (UsageError 'cred rm <project>/<key>') }
 
-            $call = @{ Name = $p.Positional[0]; Confirm = $false }
-            if (Get-Opt $o 'path')            { $call.Path = Get-Opt $o 'path' }
-            if (Get-Opt $o 'keep-definition') { $call.KeepDefinition = $true }
+            $call = ConvertTo-CredCallArguments -Spec (Get-CredCommandSpec 'rm') `
+                                                -Parsed $p -Positional 'Name' `
+                                                -Extra @{ Confirm = $false }
 
             $ok = Confirm-CredCliAction -Question "Remove $($p.Positional[0])?" `
                                         -Yes:([bool](Get-Opt $o 'yes')) -RequireTty
@@ -511,14 +444,10 @@ function Invoke-CredCli {
         }
 
         'env' {
-            $p = Read-CredOptions -Argv $rest -Switches @() -Short @{}
+            $p = Read-CredCommandOptions -Verb 'env' -Argv $rest
             $o = $p.Options
-            $call = @{}
-            if ($p.Positional.Count -gt 0) { $call.Project = $p.Positional[0] }
-            if (Get-Opt $o 'path')   { $call.Path = Get-Opt $o 'path' }
-            if (Get-Opt $o 'only')   { $call.Only = (Get-Opt $o 'only') -split ',' }
-            if (Get-Opt $o 'except') { $call.Exclude = (Get-Opt $o 'except') -split ',' }
-            if (Get-Opt $o 'prefix') { $call.Prefix = Get-Opt $o 'prefix' }
+            $call = ConvertTo-CredCallArguments -Spec (Get-CredCommandSpec 'env') `
+                                                -Parsed $p -Positional 'Project'
 
             # One call for both answers, off one decryption.
             $projected = Get-CredEnvironmentReport @call
@@ -544,12 +473,11 @@ function Invoke-CredCli {
             $sub = if ($rest.Count -gt 0) { ([string]$rest[0]).ToLowerInvariant() } else { '' }
             if ($sub -in 'add', 'rm', 'remove') {
                 $subArgv = @(if ($rest.Count -gt 1) { $rest[1..($rest.Count - 1)] } else { @() })
-                $p = Read-CredOptions -Argv $subArgv -Switches @('yes') -Short @{ 'y' = 'yes' }
+                $p = Read-CredCommandOptions -Verb 'recipients' -Argv $subArgv
                 $keys = @($p.Positional)
                 if ($keys.Count -eq 0) { throw (UsageError "cred recipients $sub <public-key> [--project <name>]") }
-                $call = @{ Recipient = $keys }
-                if (Get-Opt $p.Options 'project') { $call.Project = Get-Opt $p.Options 'project' }
-                if (Get-Opt $p.Options 'path')    { $call.Path = Get-Opt $p.Options 'path' }
+                $call = ConvertTo-CredCallArguments -Spec (Get-CredCommandSpec 'recipients') `
+                                                    -Parsed $p -Extra @{ Recipient = $keys }
 
                 if ($sub -eq 'add') {
                     $r = Add-CredRecipient @call
@@ -567,7 +495,7 @@ function Invoke-CredCli {
                 return 0
             }
 
-            $p = Read-CredOptions -Argv $rest -Switches @() -Short @{}
+            $p = Read-CredCommandOptions -Verb 'recipients' -Argv $rest
             $call = @{}
             if ($p.Positional.Count -gt 0) { $call.Project = $p.Positional[0] }
             if (Get-Opt $p.Options 'path') { $call.Path = Get-Opt $p.Options 'path' }
@@ -576,12 +504,9 @@ function Invoke-CredCli {
         }
 
         { $_ -in 'keygen', 'newkey' } {
-            $p = Read-CredOptions -Argv $rest -Switches @('show', 'force', 'protect') -Short @{}
+            $p = Read-CredCommandOptions -Verb 'keygen' -Argv $rest
             $o = $p.Options
-            $call = @{}
-            if (Get-Opt $o 'show')  { $call.Show = $true }
-            if (Get-Opt $o 'force') { $call.Force = $true }
-            if (Get-Opt $o 'path')  { $call.Path = Get-Opt $o 'path' }
+            $call = ConvertTo-CredCallArguments -Spec (Get-CredCommandSpec 'keygen') -Parsed $p
 
             $r = New-CredIdentity @call
             if ((Get-Opt $o 'protect') -and -not (Get-Opt $o 'show')) {
@@ -631,12 +556,14 @@ function Invoke-CredCli {
         }
 
         { $_ -in 'doctor', 'check' } {
-            $p = Read-CredOptions -Argv $rest -Switches @('repair') -Short @{}
-            $call = @{}
-            if ($p.Positional.Count -gt 0) { $call.Project = $p.Positional[0] }
-            if (Get-Opt $p.Options 'path') { $call.Path = Get-Opt $p.Options 'path' }
+            $p = Read-CredCommandOptions -Verb 'doctor' -Argv $rest
+            $call = ConvertTo-CredCallArguments -Spec (Get-CredCommandSpec 'doctor') `
+                                                -Parsed $p -Positional 'Project'
 
-            $rows = if (Get-Opt $p.Options 'repair') { @(Repair-CredHealth -Confirm:$false) } else { @(Test-CredHealth @call) }
+            # @call either way: --repair used to drop it, so `doctor --repair
+            # --path X` reported on the current directory instead of X.
+            $rows = if (Get-Opt $p.Options 'repair') { @(Repair-CredHealth @call -Confirm:$false) }
+                    else                             { @(Test-CredHealth @call) }
             Write-Table -Rows $rows -Property @('Check', 'Status', 'Detail', 'Fix')
 
             if ($rows | Where-Object { $_.Status -eq 'Fail' }) { return 1 }
@@ -644,12 +571,15 @@ function Invoke-CredCli {
         }
 
         { $_ -in 'claude', 'agent', 'brief' } {
-            $p = Read-CredOptions -Argv $rest -Switches @('write') -Short @{}
-            $call = @{}
-            if ($p.Positional.Count -gt 0) { $call.Project = $p.Positional[0] }
-            if (Get-Opt $p.Options 'path') { $call.Path = Get-Opt $p.Options 'path' }
+            $p = Read-CredCommandOptions -Verb 'claude' -Argv $rest
+            # --file only means anything with --write, so it is excluded from the
+            # table and added on that branch.
+            $call = ConvertTo-CredCallArguments -Spec (Get-CredCommandSpec 'claude') `
+                                                -Parsed $p -Positional 'Project' `
+                                                -Exclude 'file'
 
             if (Get-Opt $p.Options 'write') {
+                if (Get-Opt $p.Options 'file') { $call.File = Get-Opt $p.Options 'file' }
                 $r = Update-CredAgentBrief @call
                 Write-Line "Wrote the cred block for $($r.Project) into $($r.File) ($($r.Credentials) credential(s))."
             }
@@ -662,26 +592,34 @@ function Invoke-CredCli {
         'key' {
             $sub = if ($rest.Count -gt 0) { ([string]$rest[0]).ToLowerInvariant() } else { '' }
             $subArgv = @(if ($rest.Count -gt 1) { $rest[1..($rest.Count - 1)] } else { @() })
-            $p = Read-CredOptions -Argv $subArgv -Switches @('force') -Short @{}
+            $p = Read-CredCommandOptions -Verb 'key' -Argv $subArgv
 
             switch ($sub) {
                 'protect' {
                     $call = @{ Confirm = $false }
-                    if (Get-Opt $p.Options 'backup') { $call.Backup = Get-Opt $p.Options 'backup' }
-                    if (Get-Opt $p.Options 'force')  { $call.Force = $true }
+                    if (Get-Opt $p.Options 'backup')   { $call.Backup = Get-Opt $p.Options 'backup' }
+                    if (Get-Opt $p.Options 'force')    { $call.Force = $true }
+                    if (Get-Opt $p.Options 'provider') { $call.Provider = Get-Opt $p.Options 'provider' }
+                    if (Get-Opt $p.Options 'path')     { $call.Path = Get-Opt $p.Options 'path' }
                     $r = Protect-CredIdentity @call
                     if ($r.Changed) { Write-Line "Key wrapped with $($r.Protection) at $($r.Path)" }
                     else            { Write-Line "Key was already wrapped ($($r.Protection))." }
                     return 0
                 }
                 { $_ -in 'unprotect', 'unwrap' } {
-                    $r = Unprotect-CredIdentity -Confirm:$false
+                    $call = @{ Confirm = $false }
+                    if (Get-Opt $p.Options 'provider') { $call.Provider = Get-Opt $p.Options 'provider' }
+                    if (Get-Opt $p.Options 'path')     { $call.Path = Get-Opt $p.Options 'path' }
+                    $r = Unprotect-CredIdentity @call
                     if ($r.Changed) { Write-Line "Key unwrapped to $($r.Path)" }
                     else            { Write-Line 'Key was not wrapped.' }
                     return 0
                 }
                 default {
-                    $i = Get-CredIdentityInfo
+                    $info = @{}
+                    if (Get-Opt $p.Options 'provider') { $info.Provider = Get-Opt $p.Options 'provider' }
+                    if (Get-Opt $p.Options 'path')     { $info.Path = Get-Opt $p.Options 'path' }
+                    $i = Get-CredIdentityInfo @info
                     Write-Line "path        $($i.Path)"
                     Write-Line "exists      $($i.Exists)"
                     Write-Line "protection  $($i.Protection)"
@@ -694,17 +632,16 @@ function Invoke-CredCli {
         }
 
         'import' {
-            $p = Read-CredOptions -Argv $rest -Switches @('force', 'dry-run') -Short @{}
+            $p = Read-CredCommandOptions -Verb 'import' -Argv $rest
             $o = $p.Options
             if ($p.Positional.Count -lt 1) { throw (UsageError 'cred import <file-or-folder> [--name <key>]') }
 
-            $call = @{ Path = $p.Positional[0] }
-            if (Get-Opt $o 'name')    { $call.Name = Get-Opt $o 'name' }
-            if (Get-Opt $o 'desc')    { $call.Description = Get-Opt $o 'desc' }
-            if (Get-Opt $o 'project') { $call.Project = Get-Opt $o 'project' }
-            if (Get-Opt $o 'path')    { $call.ProjectPath = Get-Opt $o 'path' }
-            if (Get-Opt $o 'force')   { $call.Force = $true }
-            if (Get-Opt $o 'dry-run') { $call.WhatIf = $true }
+            # -Path is the folder being imported *from*, so the project's own
+            # --path becomes -ProjectPath and cannot come from the table.
+            $call = ConvertTo-CredCallArguments -Spec (Get-CredCommandSpec 'import') `
+                                                -Parsed $p -Exclude 'path' `
+                                                -Extra @{ Path = $p.Positional[0] }
+            if (Get-Opt $o 'path') { $call.ProjectPath = Get-Opt $o 'path' }
 
             $rows = @(Import-Cred @call)
             if ($rows.Count -eq 0) { Write-Line 'Nothing to import.' }
@@ -713,14 +650,15 @@ function Invoke-CredCli {
         }
 
         'export' {
-            $p = Read-CredOptions -Argv $rest -Switches @('yes', 'force') -Short @{ 'y' = 'yes' }
+            $p = Read-CredCommandOptions -Verb 'export' -Argv $rest
             $o = $p.Options
             if ($p.Positional.Count -lt 1) { throw (UsageError 'cred export <folder> [--only <a,b>]') }
 
-            $call = @{ Path = $p.Positional[0]; Confirm = $false }
-            if (Get-Opt $o 'project') { $call.Project = Get-Opt $o 'project' }
-            if (Get-Opt $o 'only')    { $call.Only = (Get-Opt $o 'only') -split ',' }
-            if (Get-Opt $o 'force')   { $call.Force = $true }
+            # Same as import: -Path is the destination folder.
+            $call = ConvertTo-CredCallArguments -Spec (Get-CredCommandSpec 'export') `
+                                                -Parsed $p -Exclude 'path' `
+                                                -Extra @{ Path = $p.Positional[0]; Confirm = $false }
+            if (Get-Opt $o 'path') { $call.ProjectPath = Get-Opt $o 'path' }
 
             # Export is not destructive to the store, so a redirected stdin is
             # a yes here -- python/cred.py makes the same call.

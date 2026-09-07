@@ -54,11 +54,17 @@ function Test-CredHealth {
             Add-Row 'identity permissions' 'Warn' 'Other principals can read your key file.' `
                     "Run: cred doctor --repair"
         }
-        # The peer of this row existed only in python/cred.py, so the two
-        # doctors disagreed about what they reported.
-        Add-Row 'identity protection' 'Ok' $(
-            if (Test-CredIdentityIsWrapped -Path $identity) { 'dpapi-currentuser' }
-            else { 'file-permissions' })
+        # From the file, not from the platform: a key wrapped on another
+        # machine is exactly the case worth being able to see here. Naming
+        # DPAPI for any wrapped key mislabelled a systemd-creds one.
+        Add-Row 'identity protection' 'Ok' (Get-CredIdentityProtection -Path $identity)
+
+        $keystore = Get-CredKeystoreName
+        Add-Row 'keystore' $(if ($keystore -ne 'none') { 'Ok' } else { 'Warn' }) `
+                $(if ($keystore -ne 'none') { $keystore } else { 'none available here' }) `
+                'Run: cred key protect'
+
+        # A key inside a repository is one 'git add -A' from being published.
         $inRepo = $false
         try {
             $root = Find-CredProjectRoot -StartPath (Split-Path -Parent $identity)
@@ -132,10 +138,24 @@ function Test-CredHealth {
 function Repair-CredHealth {
     <#
         .SYNOPSIS
-        Re-apply restrictive permissions to the cred home directory and key.
+        Re-apply restrictive permissions to the cred home directory and key,
+        then report.
+
+        .DESCRIPTION
+        The permissions being repaired are per-user and not per-project, but
+        the report that follows is the ordinary one, so it takes the same
+        -Project and -Path as Test-CredHealth and hands them straight on.
+        Without them `cred doctor --repair --path X` repaired the key and then
+        reported on the current directory.
+
+        .EXAMPLE
+        Repair-CredHealth -Project acme-api
     #>
     [CmdletBinding(SupportsShouldProcess)]
-    param()
+    param(
+        [Parameter(Position = 0)][string]$Project,
+        [string]$Path
+    )
 
     $credHome = Get-CredHomeDirectory
     if ($PSCmdlet.ShouldProcess($credHome, 'Restrict permissions')) {
@@ -154,5 +174,5 @@ function Repair-CredHealth {
             Write-Warning "Could not tighten permissions on $($failed.Count) path(s) under '$credHome'."
         }
     }
-    return (Test-CredHealth)
+    return (Test-CredHealth -Project $Project -Path $Path)
 }

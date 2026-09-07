@@ -129,3 +129,228 @@ function Read-CredOptions {
     }
     return [pscustomobject]@{ Options = $opts; Positional = @($positional) }
 }
+
+# What each verb accepts, in one table rather than transcribed at every call
+# site in bin/cred-ps.ps1. `Known` is the point of it: Read-CredOptions refuses
+# anything not listed, and it used to be passed at one of seventeen call sites,
+# so a mistyped flag was silently ignored on the other sixteen -- for
+# `cred list --verfiy` that meant quietly not verifying.
+#
+# It lives in the module for the reason at the top of this file: inside a
+# script the table's only interface is a process. Peer of COMMANDS in
+# python/cred.py, and the two must accept the same surface.
+#
+# Value  = options that take a value.  Switch = options that do not.
+# Map    = option name -> the module parameter it becomes. Split marks the
+#          comma-separated ones. Anything irregular stays in the CLI.
+
+$script:CredProjectOptions = @('project', 'path')
+
+$script:CredCommandSpecs = @{
+    init       = @{ Switch = @('force', 'yes'); Short = @{ 'y' = 'yes' }
+                    Value  = @('provider', 'recipient') }
+    add        = @{ Switch = @('stdin', 'allow-empty', 'force')
+                    Value  = @('user', 'value', 'file', 'filename', 'env',
+                               'env-user', 'desc', 'description') }
+    get        = @{ Switch = @('no-newline', 'force', 'check', 'stat')
+                    Short  = @{ 'n' = 'no-newline' }
+                    Value  = @('field', 'out', 'reveal') }
+    list       = @{ Switch = @('json', 'verify') }
+    exec       = @{ Value  = @('only', 'except', 'prefix') }
+    rm         = @{ Switch = @('yes', 'keep-definition'); Short = @{ 'y' = 'yes' } }
+    env        = @{ Value  = @('only', 'except', 'prefix', 'format') }
+    recipients = @{ Switch = @('yes'); Short = @{ 'y' = 'yes' } }
+    keygen     = @{ Switch = @('show', 'force', 'protect')
+                    Value  = @('provider', 'path'); NoProject = $true }
+    key        = @{ Switch = @('force')
+                    Value  = @('backup', 'provider', 'path'); NoProject = $true }
+    project    = @{ NoProject = $true }
+    providers  = @{ NoProject = $true }
+    doctor     = @{ Switch = @('repair') }
+    claude     = @{ Switch = @('write'); Value = @('file') }
+    import     = @{ Switch = @('force', 'dry-run'); Value = @('name', 'desc') }
+    export     = @{ Switch = @('yes', 'force'); Short = @{ 'y' = 'yes' }
+                    Value  = @('only') }
+}
+
+# The spellings that mean the same verb, so `cred set --bogus` is refused by
+# the same table that refuses `cred add --bogus`.
+$script:CredCommandAliases = @{
+    'set' = 'add'; 'remove' = 'rm'; 'delete' = 'rm'; 'check' = 'doctor'
+    'agent' = 'claude'; 'brief' = 'claude'; 'provider' = 'providers'
+    'newkey' = 'keygen'
+}
+
+function Get-CredCommandSpec {
+    <#
+        .SYNOPSIS
+        The switches, short forms and full option set one verb accepts.
+
+        .DESCRIPTION
+        Returns Switch, Short and Known. Known is every option the verb takes,
+        switches and value options together, which is what Read-CredOptions
+        needs to refuse a typo instead of ignoring it.
+
+        Aliases resolve to their canonical verb. An unknown verb returns an
+        empty spec rather than throwing: the dispatcher already has a better
+        error for that, and this must not become a second place that decides
+        what a command is.
+
+        Peer of command_spec in python/cred.py.
+
+        .EXAMPLE
+        (Get-CredCommandSpec -Verb list).Known
+        # json, verify, project, path
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param([Parameter(Mandatory, Position = 0)][string]$Verb)
+
+    $name = $Verb.ToLowerInvariant()
+    if ($script:CredCommandAliases.ContainsKey($name)) {
+        $name = $script:CredCommandAliases[$name]
+    }
+    $spec = if ($script:CredCommandSpecs.ContainsKey($name)) {
+        $script:CredCommandSpecs[$name]
+    } else { @{} }
+
+    $switch = @(if ($spec.ContainsKey('Switch')) { $spec.Switch } else { @() })
+    $value  = @(if ($spec.ContainsKey('Value'))  { $spec.Value }  else { @() })
+    # Every verb that has a project takes --project and --path.
+    if (-not $spec.ContainsKey('NoProject')) { $value += $script:CredProjectOptions }
+
+    return [pscustomobject]@{
+        Verb   = $name
+        Switch = $switch
+        Short  = @(if ($spec.ContainsKey('Short')) { $spec.Short } else { @{} })[0]
+        Known  = @($switch + $value)
+    }
+}
+
+function Read-CredCommandOptions {
+    <#
+        .SYNOPSIS
+        Parse one verb's argv against its spec, refusing unknown options.
+
+        .DESCRIPTION
+        The one call every arm of the CLI dispatch makes. Wrapping
+        Read-CredOptions rather than replacing it keeps the parser itself
+        testable on its own, and keeps the spec out of the parser.
+
+        Peer of parse_command in python/cred.py.
+
+        .EXAMPLE
+        $p = Read-CredCommandOptions -Verb list -Argv @('acme', '--verify')
+        $p.Options.verify   # True
+        $p.Positional[0]    # acme
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$Verb,
+        [Parameter(Position = 1)][AllowEmptyCollection()][string[]]$Argv = @()
+    )
+
+    $spec = Get-CredCommandSpec -Verb $Verb
+    return (Read-CredOptions -Argv $Argv -Switches $spec.Switch `
+                             -Short $spec.Short -Known $spec.Known)
+}
+
+# Option name -> the module parameter it becomes. One table, because the
+# mapping is a naming rule and not per-verb glue: `--except` is -Exclude
+# wherever it appears, and it was written out at every arm that took it.
+#
+# An option absent from here is one the CLI itself consumes -- how to print
+# (--json, --format), which function to call (--repair, --write, --protect),
+# how to read a value (--reveal, --check, --stat, --out, -n), or a question
+# only the CLI may ask (--yes). Those stay in bin/cred-ps.ps1 on purpose:
+# ARCHITECTURE.md keeps confirmation and output shape there.
+$script:CredOptionParameters = @{
+    'path'            = 'Path'
+    'project'         = 'Project'
+    'provider'        = 'Provider'
+    'force'           = 'Force'
+    'value'           = 'Secret'
+    'file'            = 'File'
+    'filename'        = 'FileName'
+    'user'            = 'User'
+    'desc'            = 'Description'
+    'description'     = 'Description'
+    'stdin'           = 'FromStdin'
+    'allow-empty'     = 'AllowEmpty'
+    'verify'          = 'Verify'
+    'only'            = 'Only'
+    'except'          = 'Exclude'
+    'prefix'          = 'Prefix'
+    'recipient'       = 'Recipient'
+    'keep-definition' = 'KeepDefinition'
+    'field'           = 'Field'
+    'show'            = 'Show'
+    'backup'          = 'Backup'
+    'name'            = 'Name'
+    'dry-run'         = 'WhatIf'
+}
+
+# Options whose value is a comma-separated list.
+$script:CredSplitOptions = @('only', 'except', 'recipient')
+
+function ConvertTo-CredCallArguments {
+    <#
+        .SYNOPSIS
+        Turn parsed options into the hashtable a module function is splatted
+        with.
+
+        .DESCRIPTION
+        Applies the one option-to-parameter table to whichever options this
+        verb accepts. A switch becomes $true; a comma-separated option becomes
+        an array; everything else is passed through.
+
+        -Positional names the parameters the bare arguments become, in order,
+        so `cred add acme/db hunter2` fills Name then Secret.
+
+        -Exclude drops options this arm handles itself, and -Extra adds
+        parameters the table cannot know about. Between them, an arm keeps only
+        what is genuinely irregular instead of transcribing the whole map.
+
+        This was 86 lines across the dispatch switch in bin/cred-ps.ps1, where
+        nothing could assert against it. Peer of the same table in
+        python/cred.py, which builds keyword arguments directly.
+
+        .EXAMPLE
+        $spec = Get-CredCommandSpec list
+        $p    = Read-CredCommandOptions -Verb list -Argv @('acme', '--verify')
+        ConvertTo-CredCallArguments -Spec $spec -Parsed $p -Positional 'Project'
+        # @{ Project = 'acme'; Verify = $true }
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)][object]$Spec,
+        [Parameter(Mandatory)][object]$Parsed,
+        [string[]]$Positional = @(),
+        [string[]]$Exclude = @(),
+        [hashtable]$Extra = @{}
+    )
+
+    $call = @{}
+
+    for ($i = 0; $i -lt $Positional.Count; $i++) {
+        if ($Parsed.Positional.Count -gt $i) { $call[$Positional[$i]] = $Parsed.Positional[$i] }
+    }
+
+    foreach ($opt in $Spec.Known) {
+        if ($opt -in $Exclude) { continue }
+        if (-not $script:CredOptionParameters.ContainsKey($opt)) { continue }
+        if (-not $Parsed.Options.ContainsKey($opt)) { continue }
+
+        $value = $Parsed.Options[$opt]
+        $param = $script:CredOptionParameters[$opt]
+
+        if ($opt -in $Spec.Switch) { $call[$param] = $true }
+        elseif ($opt -in $script:CredSplitOptions) { $call[$param] = ([string]$value) -split ',' }
+        else { $call[$param] = $value }
+    }
+
+    foreach ($k in $Extra.Keys) { $call[$k] = $Extra[$k] }
+    return $call
+}
