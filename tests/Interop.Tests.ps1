@@ -390,4 +390,49 @@ Describe 'Matching behaviour' -Skip:(-not ($script:HasAge -and $script:HasPython
         $r.StdOut | Should -Not -Match 'PYTHONCANARY'
         ($r.StdOut + $r.StdErr) | Should -Not -Match 'PYTHONCANARY'
     }
+
+    It 'agrees --reveal full is the cleartext value across editions' {
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/k" -Secret 'pässwörd☃日本語end'
+        $r = Invoke-PyCred -CliArgs @('get', "$($p.Name)/k", '--reveal', 'full', '-n')
+        $r.ExitCode | Should -Be 0
+        $r.StdOut   | Should -BeExactly 'pässwörd☃日本語end'
+    }
+
+    It 'masks --reveal partial identically for <label>' -ForEach @(
+        @{ label = 'long';  value = 'demo-key-abcdefghijklmnopqrstuvwxyz0123456789' }
+        @{ label = 'short'; value = 'ab' }
+        @{ label = 'unicode'; value = 'pässwörd☃日本語end' }
+    ) {
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/k" -Secret $value
+        $expected = ConvertTo-CredMaskedValue -Text $value
+        $r = Invoke-PyCred -CliArgs @('get', "$($p.Name)/k", '--reveal', 'partial', '-n')
+        $r.ExitCode | Should -Be 0
+        $r.StdOut   | Should -BeExactly $expected
+    }
+
+    It 'reports --stat identically for <label>' -ForEach @(
+        @{ label = 'mixed';   value = 'Tr0ub4dor&3' }
+        @{ label = 'empty';   value = '' }
+        @{ label = 'unicode'; value = 'pässwörd☃日本語end' }
+    ) {
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/k" -Secret $value -AllowEmpty
+        $expected = ConvertTo-CredValueStat -Text $value
+        $r = Invoke-PyCred -CliArgs @('get', "$($p.Name)/k", '--stat', '-n')
+        $r.ExitCode | Should -Be 0
+        $r.StdOut   | Should -BeExactly $expected
+    }
+
+    It 'agrees match/no-match for --check across editions' {
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/k" -Secret 'pässwörd☃日本語end'
+        $ok = Invoke-PyCred -CliArgs @('get', "$($p.Name)/k", '--check', '-n') -StdIn 'pässwörd☃日本語end'
+        $ok.ExitCode | Should -Be 0
+        $ok.StdOut   | Should -BeExactly 'match'
+        $bad = Invoke-PyCred -CliArgs @('get', "$($p.Name)/k", '--check', '-n') -StdIn 'wrong'
+        $bad.ExitCode | Should -Be 1
+        $bad.StdOut   | Should -BeExactly 'no match'
+    }
 }

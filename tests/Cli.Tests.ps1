@@ -128,6 +128,109 @@ Describe 'CLI round trip' -Skip:(-not $script:HasAge) {
         (Invoke-Cred -CliArgs @('get', 'cliproj/nl', '-n')).StdOut | Should -BeExactly 'value'
     }
 
+    It 'reveals only a masked shape with --reveal partial' {
+        $null = Invoke-Cred -CliArgs @('add', 'cliproj/revealme', '--stdin') -StdIn 'demo-key-abcdefghijklmno'
+        $r = Invoke-Cred -CliArgs @('get', 'cliproj/revealme', '--reveal', 'partial')
+        $r.ExitCode      | Should -Be 0
+        $r.StdOut.Trim() | Should -BeExactly '********mno (24 characters)'
+    }
+
+    It 'reveals nothing at all for a value at or under twice the boundary width' {
+        $null = Invoke-Cred -CliArgs @('add', 'cliproj/revealshort', '--stdin') -StdIn 'ab'
+        $r = Invoke-Cred -CliArgs @('get', 'cliproj/revealshort', '--reveal', 'partial')
+        $r.StdOut.Trim() | Should -BeExactly '******** (2 characters)'
+    }
+
+    It 'rejects an unknown --reveal mode' {
+        $r = Invoke-Cred -CliArgs @('get', 'cliproj/revealme', '--reveal', 'bogus')
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match "Unknown --reveal mode 'bogus'"
+    }
+
+    It 'refuses to combine --reveal with --out' {
+        $out = Join-Path $script:Sandbox 'revealed.txt'
+        $r = Invoke-Cred -CliArgs @('get', 'cliproj/revealme', '--reveal', 'partial', '--out', $out)
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match '--reveal cannot be combined with --out'
+        Test-Path -LiteralPath $out | Should -BeFalse
+    }
+
+    It 'refuses --reveal partial on a file credential' {
+        $file = Join-Path $script:Sandbox 'reveal-cert.pem'
+        Set-Content -LiteralPath $file -Value 'not a real cert' -NoNewline
+        $null = Invoke-Cred -CliArgs @('add', 'cliproj/revealfile', '--file', $file)
+        $r = Invoke-Cred -CliArgs @('get', 'cliproj/revealfile', '--reveal', 'partial')
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match 'is a file credential'
+    }
+
+    It 'gives back the cleartext value with --reveal full' {
+        $null = Invoke-Cred -CliArgs @('add', 'cliproj/revealfull', '--stdin') -StdIn 'demo-key-abcdefghijklmno'
+        $r = Invoke-Cred -CliArgs @('get', 'cliproj/revealfull', '--reveal', 'full')
+        $r.ExitCode      | Should -Be 0
+        $r.StdOut.Trim() | Should -BeExactly 'demo-key-abcdefghijklmno'
+    }
+
+    It '--reveal full is not refused on a file credential, unlike partial' {
+        $file = Join-Path $script:Sandbox 'reveal-full-cert.pem'
+        Set-Content -LiteralPath $file -Value 'not a real cert' -NoNewline
+        $null = Invoke-Cred -CliArgs @('add', 'cliproj/revealfullfile', '--file', $file)
+        $r = Invoke-Cred -CliArgs @('get', 'cliproj/revealfullfile', '--reveal', 'full')
+        $r.ExitCode | Should -Be 0
+        $r.StdOut   | Should -BeExactly 'not a real cert'
+    }
+
+    It 'reports the length and character classes with --stat, and no characters' {
+        $null = Invoke-Cred -CliArgs @('add', 'cliproj/statme', '--stdin') -StdIn 'Tr0ub4dor&3'
+        $r = Invoke-Cred -CliArgs @('get', 'cliproj/statme', '--stat')
+        $r.ExitCode      | Should -Be 0
+        $r.StdOut.Trim() | Should -BeExactly '11 characters — upper, lower, digit, symbol'
+        $r.StdOut        | Should -Not -Match 'Tr0ub4dor'
+    }
+
+    It 'reports 0 characters for an empty value with --stat' {
+        $null = Invoke-Cred -CliArgs @('add', 'cliproj/statempty', '--stdin', '--allow-empty') -StdIn ''
+        $r = Invoke-Cred -CliArgs @('get', 'cliproj/statempty', '--stat')
+        $r.StdOut.Trim() | Should -BeExactly '0 characters'
+    }
+
+    It 'confirms a matching candidate with --check, printing no value' {
+        $null = Invoke-Cred -CliArgs @('add', 'cliproj/checkme', '--stdin') -StdIn 'correct horse battery staple'
+        $r = Invoke-Cred -CliArgs @('get', 'cliproj/checkme', '--check') -StdIn 'correct horse battery staple'
+        $r.ExitCode      | Should -Be 0
+        $r.StdOut.Trim() | Should -BeExactly 'match'
+    }
+
+    It 'rejects a non-matching candidate with --check, exit 1, no value' {
+        $null = Invoke-Cred -CliArgs @('add', 'cliproj/checkme2', '--stdin') -StdIn 'correct horse battery staple'
+        $r = Invoke-Cred -CliArgs @('get', 'cliproj/checkme2', '--check') -StdIn 'wrong guess'
+        $r.ExitCode      | Should -Be 1
+        $r.StdOut.Trim() | Should -BeExactly 'no match'
+        $r.StdErr        | Should -BeExactly ''
+    }
+
+    It 'is case-sensitive with --check' {
+        $null = Invoke-Cred -CliArgs @('add', 'cliproj/checkcase', '--stdin') -StdIn 'CaseSensitive'
+        $r = Invoke-Cred -CliArgs @('get', 'cliproj/checkcase', '--check') -StdIn 'casesensitive'
+        $r.ExitCode      | Should -Be 1
+        $r.StdOut.Trim() | Should -BeExactly 'no match'
+    }
+
+    It 'rejects combining --reveal, --check and --stat' {
+        $r = Invoke-Cred -CliArgs @('get', 'cliproj/checkme', '--reveal', 'partial', '--stat')
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match '--reveal cannot be combined with --stat'
+    }
+
+    It 'rejects an unrecognised flag rather than falling through to the full value' {
+        # --partial is not a real flag -- the real one is --reveal partial.
+        # A typo here must not silently print the whole secret.
+        $r = Invoke-Cred -CliArgs @('get', 'cliproj/revealme', '--partial')
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match "Unknown option '--partial'"
+        $r.StdOut   | Should -Not -Match 'demo-key-abcdefghijklmno'
+    }
+
     It 'lists names without printing any value' {
         $null = Invoke-Cred -CliArgs @('add', 'cliproj/listed', '--stdin', '--desc', 'a description') -StdIn 'TOPSECRETVALUE'
         $r = Invoke-Cred -CliArgs @('list', 'cliproj')

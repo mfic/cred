@@ -69,13 +69,20 @@ function Read-CredOptions {
         .EXAMPLE
         $p = Read-CredOptions @('-n', 'acme-api/db') -Switches @('no-newline') -Short @{ n = 'no-newline' }
         $p.Options['no-newline']
+
+        .EXAMPLE
+        # -Known makes an unrecognised flag an error instead of a silent
+        # no-op -- without it, a typo'd --partial on `cred get` would fall
+        # through to printing the whole secret rather than refusing.
+        Read-CredOptions @('x', '--bogus') -Known @('field')   # throws
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
         [Parameter(Position = 0)][AllowEmptyCollection()][string[]]$Argv = @(),
         [string[]]$Switches = @(),
-        [hashtable]$Short = @{}
+        [hashtable]$Short = @{},
+        [string[]]$Known
     )
 
     $opts = @{}
@@ -111,6 +118,14 @@ function Read-CredOptions {
             $positional.Add($a)
         }
         $i++
+    }
+    if ($PSBoundParameters.ContainsKey('Known')) {
+        $unknown = @($opts.Keys | Where-Object { $_ -notin $Known } | Sort-Object)
+        if ($unknown.Count -gt 0) {
+            throw (New-CredErrorRecord -Code 'Usage' -Category InvalidArgument -Target $unknown[0] `
+                -Message "Unknown option '--$($unknown[0])'." `
+                -Next "Run 'cred help' to see what there is.")
+        }
     }
     return [pscustomobject]@{ Options = $opts; Positional = @($positional) }
 }
