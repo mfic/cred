@@ -139,7 +139,12 @@ function ConvertFrom-CredFileContent {
 
     $value = [string]$Entry['secret']
     if ($Entry.Contains('encoding') -and $Entry['encoding'] -eq 'base64') {
-        try { return [Convert]::FromBase64String($value) }
+        # The leading comma is not decorative: `return` enumerates an array
+        # onto the pipeline like Write-Output does, so a 0- or 1-byte array
+        # would come out as $null or a bare [byte] instead of a [byte[]]. The
+        # comma wraps it as the sole element of another array, so enumerating
+        # that outer array yields exactly the inner array, unflattened.
+        try { return ,([Convert]::FromBase64String($value)) }
         catch {
             throw (New-CredErrorRecord -Code 'StoreCorrupt' -Category InvalidData `
                 -Message "This credential's stored content is not valid base64." `
@@ -147,7 +152,7 @@ function ConvertFrom-CredFileContent {
                         'Restore it from git: git checkout HEAD -- .creds/'))
         }
     }
-    return [System.Text.UTF8Encoding]::new($false).GetBytes($value)
+    return ,([System.Text.UTF8Encoding]::new($false).GetBytes($value))
 }
 
 function Resolve-CredEntry {
@@ -234,8 +239,13 @@ function Get-CredEntryBytes {
         [string]$ProjectName
     )
 
+    # The leading comma on every return here is not decorative -- see the
+    # comment in ConvertFrom-CredFileContent. Without it, an empty or
+    # one-byte secret comes back as $null or a bare [byte] instead of a
+    # [byte[]], and every caller downstream (Read-CredValue, Get-Cred
+    # -AsBytes) inherits the corruption silently.
     if ($Projection.Kind -eq 'file') {
-        return (ConvertFrom-CredFileContent -Entry $Projection.Entry)
+        return ,(ConvertFrom-CredFileContent -Entry $Projection.Entry)
     }
 
     if (-not $Projection.Fields.Contains($Field)) {
@@ -244,7 +254,7 @@ function Get-CredEntryBytes {
             -Message "'$label' has no '$Field' field." `
             -Next "It has: $(@($Projection.Fields.Keys) -join ', ')")
     }
-    return [System.Text.UTF8Encoding]::new($false).GetBytes([string]$Projection.Fields[$Field])
+    return ,([System.Text.UTF8Encoding]::new($false).GetBytes([string]$Projection.Fields[$Field]))
 }
 
 function Read-CredImportFile {

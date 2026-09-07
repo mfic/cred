@@ -426,4 +426,57 @@ Describe 'Command-line parsing' {
         $p = InModule { Read-CredOptions @('-', 'x') }
         $p.Positional | Should -Be @('-', 'x')
     }
+
+    It 'rejects an unknown option when -Known is given, rather than ignoring it' {
+        { InModule { Read-CredOptions @('x', '--partial') -Known @('field') } } |
+            Should -Throw "*Unknown option '--partial'*"
+    }
+
+    It 'still parses a recognised option normally when -Known is given' {
+        $p = InModule { Read-CredOptions @('x', '--field', 'user') -Known @('field') }
+        $p.Options['field'] | Should -BeExactly 'user'
+    }
+}
+
+Describe 'Partial reveal and value stat' {
+    # Mirrored in tests/pyunit.py against mask_value / value_stat -- the two
+    # editions must agree on exactly what a "safe to look at" value contains.
+
+    It 'reveals only the trailing boundary, plus the length' {
+        ConvertTo-CredMaskedValue -Text 'demo-key-abcdefghijklmno' |
+            Should -BeExactly '********mno (24 characters)'
+    }
+
+    It 'reveals nothing at or under twice the boundary width' {
+        ConvertTo-CredMaskedValue -Text 'abcdef' | Should -BeExactly '******** (6 characters)'
+    }
+
+    It 'reveals one character over the boundary' {
+        ConvertTo-CredMaskedValue -Text 'abcdefg' | Should -BeExactly '********efg (7 characters)'
+    }
+
+    It 'uses singular "character" for a one-character value' {
+        ConvertTo-CredMaskedValue -Text 'a' | Should -BeExactly '******** (1 character)'
+    }
+
+    It 'reports every character class present, no characters' {
+        ConvertTo-CredValueStat -Text 'Tr0ub4dor&3' |
+            Should -BeExactly '11 characters — upper, lower, digit, symbol'
+    }
+
+    It 'names only the classes actually present' {
+        ConvertTo-CredValueStat -Text 'abcdef' | Should -BeExactly '6 characters — lower'
+    }
+
+    It 'counts whitespace as its own class' {
+        ConvertTo-CredValueStat -Text 'a b' | Should -BeExactly '3 characters — lower, whitespace'
+    }
+
+    It 'reports the empty string as its own case' {
+        ConvertTo-CredValueStat -Text '' | Should -BeExactly '0 characters'
+    }
+
+    It 'never echoes the input' {
+        (ConvertTo-CredValueStat -Text 'Tr0ub4dor&3') | Should -Not -Match 'Tr0ub4dor'
+    }
 }

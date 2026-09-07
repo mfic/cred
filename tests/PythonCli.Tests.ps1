@@ -107,6 +107,111 @@ Describe 'Python CLI basics' -Skip:(-not $script:HasPython) {
     }
 }
 
+Describe 'Python CLI reveal' -Skip:(-not ($script:HasAge -and $script:HasPython)) {
+    It 'reveals only a masked shape with --reveal partial' {
+        $null = Invoke-Cred -CliArgs @('add', 'pyproj/revealme', '--stdin') -StdIn 'demo-key-abcdefghijklmno' -WorkingDirectory $script:Proj
+        $r = Invoke-Cred -CliArgs @('get', 'pyproj/revealme', '--reveal', 'partial') -WorkingDirectory $script:Proj
+        $r.ExitCode      | Should -Be 0
+        $r.StdOut.Trim() | Should -BeExactly '********mno (24 characters)'
+    }
+
+    It 'reveals nothing at all for a value at or under twice the boundary width' {
+        $null = Invoke-Cred -CliArgs @('add', 'pyproj/revealshort', '--stdin') -StdIn 'ab' -WorkingDirectory $script:Proj
+        $r = Invoke-Cred -CliArgs @('get', 'pyproj/revealshort', '--reveal', 'partial') -WorkingDirectory $script:Proj
+        $r.StdOut.Trim() | Should -BeExactly '******** (2 characters)'
+    }
+
+    It 'rejects an unknown --reveal mode' {
+        $r = Invoke-Cred -CliArgs @('get', 'pyproj/revealme', '--reveal', 'bogus') -WorkingDirectory $script:Proj
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match "Unknown --reveal mode 'bogus'"
+    }
+
+    It 'refuses to combine --reveal with --out' {
+        $out = Join-Path $script:Sandbox 'revealed.txt'
+        $r = Invoke-Cred -CliArgs @('get', 'pyproj/revealme', '--reveal', 'partial', '--out', $out) -WorkingDirectory $script:Proj
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match '--reveal cannot be combined with --out'
+        Test-Path -LiteralPath $out | Should -BeFalse
+    }
+
+    It 'refuses --reveal partial on a file credential' {
+        $file = Join-Path $script:Sandbox 'reveal-cert.pem'
+        Set-Content -LiteralPath $file -Value 'not a real cert' -NoNewline
+        $null = Invoke-Cred -CliArgs @('add', 'pyproj/revealfile', '--file', $file) -WorkingDirectory $script:Proj
+        $r = Invoke-Cred -CliArgs @('get', 'pyproj/revealfile', '--reveal', 'partial') -WorkingDirectory $script:Proj
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match 'is a file credential'
+    }
+
+    It 'gives back the cleartext value with --reveal full' {
+        $null = Invoke-Cred -CliArgs @('add', 'pyproj/revealfull', '--stdin') -StdIn 'demo-key-abcdefghijklmno' -WorkingDirectory $script:Proj
+        $r = Invoke-Cred -CliArgs @('get', 'pyproj/revealfull', '--reveal', 'full') -WorkingDirectory $script:Proj
+        $r.ExitCode      | Should -Be 0
+        $r.StdOut.Trim() | Should -BeExactly 'demo-key-abcdefghijklmno'
+    }
+
+    It '--reveal full is not refused on a file credential, unlike partial' {
+        $file = Join-Path $script:Sandbox 'reveal-full-cert.pem'
+        Set-Content -LiteralPath $file -Value 'not a real cert' -NoNewline
+        $null = Invoke-Cred -CliArgs @('add', 'pyproj/revealfullfile', '--file', $file) -WorkingDirectory $script:Proj
+        $r = Invoke-Cred -CliArgs @('get', 'pyproj/revealfullfile', '--reveal', 'full') -WorkingDirectory $script:Proj
+        $r.ExitCode | Should -Be 0
+        $r.StdOut   | Should -BeExactly 'not a real cert'
+    }
+
+    It 'reports the length and character classes with --stat, and no characters' {
+        $null = Invoke-Cred -CliArgs @('add', 'pyproj/statme', '--stdin') -StdIn 'Tr0ub4dor&3' -WorkingDirectory $script:Proj
+        $r = Invoke-Cred -CliArgs @('get', 'pyproj/statme', '--stat') -WorkingDirectory $script:Proj
+        $r.ExitCode      | Should -Be 0
+        $r.StdOut.Trim() | Should -BeExactly '11 characters — upper, lower, digit, symbol'
+        $r.StdOut        | Should -Not -Match 'Tr0ub4dor'
+    }
+
+    It 'reports 0 characters for an empty value with --stat' {
+        $null = Invoke-Cred -CliArgs @('add', 'pyproj/statempty', '--stdin', '--allow-empty') -StdIn '' -WorkingDirectory $script:Proj
+        $r = Invoke-Cred -CliArgs @('get', 'pyproj/statempty', '--stat') -WorkingDirectory $script:Proj
+        $r.StdOut.Trim() | Should -BeExactly '0 characters'
+    }
+
+    It 'confirms a matching candidate with --check, printing no value' {
+        $null = Invoke-Cred -CliArgs @('add', 'pyproj/checkme', '--stdin') -StdIn 'correct horse battery staple' -WorkingDirectory $script:Proj
+        $r = Invoke-Cred -CliArgs @('get', 'pyproj/checkme', '--check') -StdIn 'correct horse battery staple' -WorkingDirectory $script:Proj
+        $r.ExitCode      | Should -Be 0
+        $r.StdOut.Trim() | Should -BeExactly 'match'
+    }
+
+    It 'rejects a non-matching candidate with --check, exit 1, no value' {
+        $null = Invoke-Cred -CliArgs @('add', 'pyproj/checkme2', '--stdin') -StdIn 'correct horse battery staple' -WorkingDirectory $script:Proj
+        $r = Invoke-Cred -CliArgs @('get', 'pyproj/checkme2', '--check') -StdIn 'wrong guess' -WorkingDirectory $script:Proj
+        $r.ExitCode      | Should -Be 1
+        $r.StdOut.Trim() | Should -BeExactly 'no match'
+        $r.StdErr        | Should -BeExactly ''
+    }
+
+    It 'is case-sensitive with --check' {
+        $null = Invoke-Cred -CliArgs @('add', 'pyproj/checkcase', '--stdin') -StdIn 'CaseSensitive' -WorkingDirectory $script:Proj
+        $r = Invoke-Cred -CliArgs @('get', 'pyproj/checkcase', '--check') -StdIn 'casesensitive' -WorkingDirectory $script:Proj
+        $r.ExitCode      | Should -Be 1
+        $r.StdOut.Trim() | Should -BeExactly 'no match'
+    }
+
+    It 'rejects combining --reveal, --check and --stat' {
+        $r = Invoke-Cred -CliArgs @('get', 'pyproj/checkme', '--reveal', 'partial', '--stat') -WorkingDirectory $script:Proj
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match '--reveal cannot be combined with --stat'
+    }
+
+    It 'rejects an unrecognised flag rather than falling through to the full value' {
+        # --partial is not a real flag -- the real one is --reveal partial.
+        # A typo here must not silently print the whole secret.
+        $r = Invoke-Cred -CliArgs @('get', 'pyproj/revealme', '--partial') -WorkingDirectory $script:Proj
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match "Unknown option '--partial'"
+        $r.StdOut   | Should -Not -Match 'demo-key-abcdefghijklmno'
+    }
+}
+
 Describe 'Python CLI providers' -Skip:(-not ($script:HasAge -and $script:HasPython)) {
     It 'lists the registered backends' {
         $r = Invoke-Cred -CliArgs @('providers')

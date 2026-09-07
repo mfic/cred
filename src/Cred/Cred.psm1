@@ -34,6 +34,8 @@ foreach ($file in $public) { . $file.FullName }
 
 $exported = @(
     'Add-CredRecipient'
+    'ConvertTo-CredMaskedValue'
+    'ConvertTo-CredValueStat'
     'Export-Cred'
     'Export-CredFile'
     'Get-Cred'
@@ -55,6 +57,7 @@ $exported = @(
     'Open-CredStore'
     'Protect-CredIdentity'
     'Read-CredOptions'
+    'Read-CredStdinSecret'
     'Read-CredValue'
     'Register-CredProject'
     'Register-CredProvider'

@@ -160,6 +160,11 @@ COMMANDS
 
   get <project>/<key>              Print a secret
       --field <secret|user>        Which half of a userpass pair
+      --reveal full                 The value in the clear (default; explicit name for it)
+      --reveal partial             A few trailing characters and the length
+      --stat                       Length and character composition, no characters
+      --check                      Compare to a candidate read from stdin; prints
+                                   match/no match, exits 0/1 -- no value either way
       -n, --no-newline             Omit the trailing newline
       --out <path>                 Write to a file instead of stdout
       --force                      Allow --out to overwrite
@@ -332,9 +337,38 @@ function Invoke-CredCli {
         }
 
         'get' {
-            $p = Read-CredOptions -Argv $rest -Switches @('no-newline', 'force') -Short @{ 'n' = 'no-newline' }
+            $p = Read-CredOptions -Argv $rest -Switches @('no-newline', 'force', 'check', 'stat') -Short @{ 'n' = 'no-newline' } `
+                -Known @('no-newline', 'force', 'check', 'stat', 'field', 'out', 'reveal', 'project', 'path')
             $o = $p.Options
             if ($p.Positional.Count -lt 1) { throw (UsageError 'cred get <project>/<key>') }
+
+            $reveal = Get-Opt $o 'reveal'
+            $check  = [bool](Get-Opt $o 'check')
+            $stat   = [bool](Get-Opt $o 'stat')
+
+            $revealMode = $null
+            if ($reveal) {
+                $revealMode = if ($reveal -is [string]) { $reveal.ToLowerInvariant() } else { '' }
+                if ($revealMode -notin @('partial', 'full')) {
+                    throw (UsageError "Unknown --reveal mode '$revealMode'." 'The only modes are: --reveal partial, --reveal full')
+                }
+            }
+
+            # --reveal, --check and --stat are four different ways to read a
+            # value -- full cleartext, a masked shape, an equality test, or
+            # metadata -- and only one at a time makes sense. None of them
+            # makes sense alongside --out, which hands back the exact bytes
+            # on purpose.
+            $modes = @()
+            if ($null -ne $revealMode) { $modes += 'reveal' }
+            if ($check)  { $modes += 'check' }
+            if ($stat)   { $modes += 'stat' }
+            if ($modes.Count -gt 1) {
+                throw (UsageError "--$($modes[0]) cannot be combined with --$($modes[1]).")
+            }
+            if ($modes.Count -gt 0 -and (Get-Opt $o 'out')) {
+                throw (UsageError "--$($modes[0]) cannot be combined with --out." '--out writes the exact bytes on purpose; none of these give back the working credential.')
+            }
 
             $call = @{ Name = $p.Positional[0] }
             if (Get-Opt $o 'path')    { $call.Path = Get-Opt $o 'path' }
@@ -355,6 +389,43 @@ function Invoke-CredCli {
             # One call, one decryption: the bytes and what they are.
             $v = Read-CredValue @call
 
+            # --reveal full is just an explicit name for the plain, no-flag
+            # behaviour below, so it shares that path's file-kind handling
+            # (including --out) rather than this refusal -- masking, stat and
+            # equality-checking a binary blob don't mean anything, but
+            # reading it whole does.
+            $restrictive = if ($modes.Count -gt 0 -and -not ($modes[0] -eq 'reveal' -and $revealMode -eq 'full')) { $modes[0] } else { $null }
+            if ($restrictive -and $v.Kind -eq 'file') {
+                $next = "See what it is: cred list $($v.Project)"
+                if ($restrictive -eq 'reveal') { $next += "`nRead it: cred get $($v.Project)/$($v.Key) --out <path>" }
+                throw (UsageError "'$($v.Project)/$($v.Key)' is a file credential; --$restrictive does not apply to file content." $next)
+            }
+
+            if ($check) {
+                # Read from stdin only -- never argv, which would land the
+                # candidate in shell history and process listings and defeat
+                # the entire point.
+                $candidate = Read-CredStdinSecret
+                $text    = [System.Text.UTF8Encoding]::new($false).GetString($v.Bytes)
+                $matched = [string]::Equals($candidate, $text, [System.StringComparison]::Ordinal)
+                Write-CredSecret -Value $(if ($matched) { 'match' } else { 'no match' }) -NoNewline:([bool](Get-Opt $o 'no-newline'))
+                return $(if ($matched) { 0 } else { 1 })
+            }
+
+            if ($stat) {
+                $text = [System.Text.UTF8Encoding]::new($false).GetString($v.Bytes)
+                Write-CredSecret -Value (ConvertTo-CredValueStat -Text $text) -NoNewline:([bool](Get-Opt $o 'no-newline'))
+                return 0
+            }
+
+            if ($revealMode -eq 'partial') {
+                $text = [System.Text.UTF8Encoding]::new($false).GetString($v.Bytes)
+                $masked = ConvertTo-CredMaskedValue -Text $text
+                Write-CredSecret -Value $masked -NoNewline:([bool](Get-Opt $o 'no-newline'))
+                return 0
+            }
+
+            # $revealMode -eq 'full', or no mode was given at all: the ordinary path.
             if ($v.Kind -eq 'file') {
                 # Exact bytes, and no trailing newline of ours: piping this to a
                 # file must produce the file that went in, byte for byte.

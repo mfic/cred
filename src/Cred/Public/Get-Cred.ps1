@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 
 function Get-Cred {
     <#
@@ -39,7 +39,11 @@ function Get-Cred {
     $view  = $entry.View
 
     # Exact bytes are the same question for every kind, so they are one call.
-    if ($AsBytes) { return (Get-CredEntryBytes -Projection $view -Field $Field -ProjectName $ctx.Name) }
+    # The comma matters here too: `return` enumerates arrays like Write-Output
+    # does, so without it an empty or one-byte secret would cross this second
+    # pipeline boundary and come back flattened again even though
+    # Get-CredEntryBytes already protected its own return.
+    if ($AsBytes) { return ,(Get-CredEntryBytes -Projection $view -Field $Field -ProjectName $ctx.Name) }
 
     if ($view.Kind -eq 'file') {
         # Binary has no faithful [string] form; handing back a mangled one
@@ -105,4 +109,103 @@ function Read-CredValue {
         IsBinary = [bool]$view.IsBinary
         Bytes    = (Get-CredEntryBytes -Projection $view -Field $Field -ProjectName $entry.Context.Name)
     }
+}
+
+function Read-CredStdinSecret {
+    <#
+        .SYNOPSIS
+        Read stdin as a secret: raw UTF-8 bytes, minus one trailing newline.
+
+        .DESCRIPTION
+        `cred get --check` needs to read its candidate from stdin the same way
+        `cred add --stdin` does, but bin/cred-ps.ps1 is a script outside the
+        module and cannot reach the private Resolve-CredSecretInput that
+        Set-Cred uses -- this is the public door to the same logic. Peer of
+        read_stdin_secret in cred.py.
+
+        .EXAMPLE
+        $candidate = Read-CredStdinSecret
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    return (Resolve-CredSecretInput -FromStdin -AllowEmpty)
+}
+
+# A partial reveal shows this many characters at the end. Anything at or
+# under twice that many characters reveals nothing at all, so a short secret
+# cannot have most of itself exposed through the "boundary" it supposedly
+# keeps hidden.
+$script:CredMaskBoundary = 3
+$script:CredMaskFill     = '*' * 8
+
+function ConvertTo-CredMaskedValue {
+    <#
+        .SYNOPSIS
+        A partial reveal: a few trailing characters and the length, nothing
+        else.
+
+        .DESCRIPTION
+        Suffix rather than prefix: many secrets carry a format prefix
+        (`sk_live_`, `ghp_`) that is already public knowledge, so a prefix
+        reveal would give away less than it looks like while a suffix reveal
+        is the credit-card-UX convention a reader actually recognises. Enough
+        for a caller -- human or agent -- to eyeball which credential this is
+        (the prod key vs. the test key, the new rotation vs. the old one)
+        without ever holding a value that would work as the credential
+        itself. Peer of mask_value in cred_store.py.
+
+        .EXAMPLE
+        ConvertTo-CredMaskedValue -Text 'demo-key-abcdefghijklmno'
+        # ********mno (24 characters)
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+
+    $n      = $Text.Length
+    $plural = if ($n -eq 1) { '' } else { 's' }
+    if ($n -le ($script:CredMaskBoundary * 2)) {
+        return "$($script:CredMaskFill) ($n character$plural)"
+    }
+    $tail = $Text.Substring($n - $script:CredMaskBoundary)
+    return "$($script:CredMaskFill)$tail ($n character$plural)"
+}
+
+function ConvertTo-CredValueStat {
+    <#
+        .SYNOPSIS
+        Length and character composition, no characters at all.
+
+        .DESCRIPTION
+        Enough to catch an empty paste, a stray trailing newline, or a value
+        that is obviously not what it should be -- without exposing a single
+        character of it. Peer of value_stat in cred_store.py.
+
+        .EXAMPLE
+        ConvertTo-CredValueStat -Text 'Tr0ub4dor&3'
+        # 11 characters -- upper, lower, digit, symbol
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+
+    $n = $Text.Length
+    if ($n -eq 0) { return '0 characters' }
+    $plural  = if ($n -eq 1) { '' } else { 's' }
+
+    # Per-character .NET classification, not an ASCII regex, so this agrees
+    # with Python's str.isupper()/islower()/isdigit()/isspace() on Unicode
+    # input too -- see the interop test for 'pässwörd☃日本語end'.
+    $chars   = $Text.ToCharArray()
+    $classes = [System.Collections.Generic.List[string]]::new()
+    if ($chars | Where-Object { [char]::IsUpper($_) } | Select-Object -First 1) { $classes.Add('upper') }
+    if ($chars | Where-Object { [char]::IsLower($_) } | Select-Object -First 1) { $classes.Add('lower') }
+    if ($chars | Where-Object { [char]::IsDigit($_) } | Select-Object -First 1) { $classes.Add('digit') }
+    if ($chars | Where-Object { [char]::IsWhiteSpace($_) } | Select-Object -First 1) { $classes.Add('whitespace') }
+    if ($chars | Where-Object { -not [char]::IsLetterOrDigit($_) -and -not [char]::IsWhiteSpace($_) } | Select-Object -First 1) { $classes.Add('symbol') }
+
+    if ($classes.Count -eq 0) { return "$n character$plural" }
+    return "$n character$plural — $($classes -join ', ')"
 }

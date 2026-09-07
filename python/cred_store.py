@@ -1849,6 +1849,61 @@ def read_value(name: str, project_name: Optional[str] = None,
             "bytes": entry_bytes(view, field, resolved["project"].name)}
 
 
+# A partial reveal shows this many characters at the end. Anything at or
+# under twice that many characters reveals nothing at all, so a short secret
+# cannot have most of itself exposed through the "boundary" it supposedly
+# keeps hidden.
+MASK_BOUNDARY = 3
+MASK_FILL = "*" * 8
+
+
+def mask_value(text: str) -> str:
+    """A partial reveal: a few trailing characters and the length, nothing
+    else.
+
+    Suffix rather than prefix: many secrets carry a format prefix (`sk_live_`,
+    `ghp_`) that is already public knowledge, so a prefix reveal would give
+    away less than it looks like while a suffix reveal is the credit-card-UX
+    convention a reader actually recognises. Enough for a caller to eyeball
+    which credential this is -- prod key vs. test key, the right rotation vs.
+    the old one -- without ever holding a value that would work as the
+    credential. Peer of ConvertTo-CredMaskedValue in
+    src/Cred/Public/Get-Cred.ps1.
+    """
+    n = len(text)
+    plural = "" if n == 1 else "s"
+    if n <= MASK_BOUNDARY * 2:
+        return f"{MASK_FILL} ({n} character{plural})"
+    return f"{MASK_FILL}{text[-MASK_BOUNDARY:]} ({n} character{plural})"
+
+
+def value_stat(text: str) -> str:
+    """Length and character composition, no characters at all.
+
+    Enough to catch an empty paste, a stray trailing newline, or a value that
+    is obviously not what it should be -- without exposing a single character
+    of it. Peer of ConvertTo-CredValueStat in src/Cred/Public/Get-Cred.ps1.
+    """
+    n = len(text)
+    plural = "" if n == 1 else "s"
+    if n == 0:
+        return "0 characters"
+    classes = []
+    if any(c.isupper() for c in text):
+        classes.append("upper")
+    if any(c.islower() for c in text):
+        classes.append("lower")
+    if any(c.isdigit() for c in text):
+        classes.append("digit")
+    if any(c.isspace() for c in text):
+        classes.append("whitespace")
+    if any(not c.isalnum() and not c.isspace() for c in text):
+        classes.append("symbol")
+    if not classes:
+        return f"{n} character{plural}"
+    return f"{n} character{plural} — {', '.join(classes)}"
+
+
 def read_import_file(spec: str, force: bool = False) -> bytes:
     """The exact bytes of a file being imported as a credential.
 

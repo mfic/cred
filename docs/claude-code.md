@@ -63,10 +63,30 @@ this conversation:
 
     cred exec acme-api -- <command> [args]
 
+**To verify a value you already have a candidate for, with zero characters of
+the real one crossing in either direction:**
+
+    echo "$candidate" | cred get acme-api/<key> --check
+
+Prints `match` or `no match` and exits 0/1. The candidate must come via stdin,
+never as an argument — an argument lands in shell history.
+
+**To sanity-check a value without holding it** — catch an empty paste or an
+obviously wrong one:
+
+    cred get acme-api/<key> --stat      # length and character classes, no characters
+    cred get acme-api/<key> --reveal partial   # a few trailing characters and the length
+
 **Only when a value must actually be read** (and then treat the output as poison
-— do not echo it back):
+— do not echo it back). `--reveal full` is an explicit name for this; the bare
+command does the same thing:
 
     cred get acme-api/<key>
+    cred get acme-api/<key> --reveal full
+
+A `file`-kind credential (a cert, a key, a keytab) has no meaningful masked or
+partial form, so `--check`, `--stat` and `--reveal partial` all refuse it — use
+`--reveal full` or `--out <path>` instead.
 
 **To see what exists without decrypting anything:**
 
@@ -113,6 +133,48 @@ curl -H "Authorization: Bearer $(cred get acme-api/gh -n)" https://api.github.co
 
 Here the token *does* pass through the session. That is why the brief tells the
 agent to prefer `cred exec`, and why `cred get` is described as the exception.
+
+Or, when the task is "is this the right value", not "run something with it" —
+say a deploy just failed and you want Claude to rule out a stale secret without
+ever holding the real one:
+
+```
+cred get acme-api/stripe --stat
+```
+
+```
+32 characters — lower, digit
+```
+
+That alone might be enough ("it's 32 characters, that's the right shape").
+If Claude already has a candidate value from somewhere else in the
+conversation — a value the user pasted, or one read from a `.env.example` —
+and the question is whether it's the *same* one, `--check` answers that
+without exposing either value:
+
+```
+echo "$candidate" | cred get acme-api/stripe --check
+```
+
+```
+no match
+```
+
+And if a human eyeballing it is what's needed — "does this look like the key
+in the dashboard" — `--reveal partial` shows a masked shape instead of the
+value:
+
+```
+cred get acme-api/stripe --reveal partial
+```
+
+```
+********wxyz (32 characters)
+```
+
+None of these three ever put the full secret in Claude's context. `cred get`
+without a flag is the one command in this table that does, which is why it is
+last on the list, not first.
 
 ## Why this shape
 

@@ -85,6 +85,13 @@ check("read_options: --opt= is an empty string, not a flag", opts, {"prefix": ""
 opts, pos = cred.read_options(["-", "x"])
 check("read_options: a lone dash stays positional", (opts, pos), ({}, ["-", "x"]))
 
+check("read_options: an unknown option is rejected, not silently ignored",
+      _error_code(lambda: cred.read_options(["x", "--partial"], known=("field",))),
+      cs.EXIT_USAGE)
+opts, pos = cred.read_options(["x", "--field", "user"], known=("field",))
+check("read_options: a known option still parses normally with `known` set",
+      (opts, pos), ({"field": "user"}, ["x"]))
+
 
 # ----------------------------------------------------------------- entry ---
 # The rules in cred_store.resolve_entry, checked directly rather than only
@@ -135,6 +142,34 @@ check("resolve_entry: the encoding marker never becomes a variable",
       (view["kind"], view["env_vars"]), ("file", {}))
 check("resolve_entry: a present-but-null encoding is still the file marker",
       cs.entry_kind({"secret": "x", "encoding": None}, None), "file")
+
+
+# ---------------------------------------------------------------- reveal ---
+# mask_value and value_stat: two ways to answer "what does this look like"
+# without handing back a value that would work as the credential. Mirrored in
+# tests/Unit.Tests.ps1 against ConvertTo-CredMaskedValue / ConvertTo-CredValueStat.
+
+check("mask_value: reveals only the trailing boundary, plus the length",
+      cs.mask_value("demo-key-abcdefghijklmno"), "********mno (24 characters)")
+check("mask_value: at or under twice the boundary reveals nothing",
+      cs.mask_value("abcdef"), "******** (6 characters)")
+check("mask_value: one character over the boundary still reveals it",
+      cs.mask_value("abcdefg"), "********efg (7 characters)")
+check("mask_value: the empty string is 0 characters, not an error",
+      cs.mask_value(""), "******** (0 characters)")
+check("mask_value: singular character count",
+      cs.mask_value("a"), "******** (1 character)")
+
+check("value_stat: reports every class present, no characters",
+      cs.value_stat("Tr0ub4dor&3"), "11 characters — upper, lower, digit, symbol")
+check("value_stat: an all-lowercase value names only lower",
+      cs.value_stat("abcdef"), "6 characters — lower")
+check("value_stat: whitespace counts as its own class",
+      cs.value_stat("a b"), "3 characters — lower, whitespace")
+check("value_stat: the empty string is its own case, not '0 characters -- '",
+      cs.value_stat(""), "0 characters")
+check("value_stat: never echoes the input",
+      "Tr0ub4dor&3" in cs.value_stat("Tr0ub4dor&3"), False)
 
 
 # -------------------------------------------------------------- keystore ---

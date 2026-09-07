@@ -53,6 +53,11 @@ COMMANDS
 
   get <project>/<key>              Print a secret
       --field <secret|user>        Which half of a userpass pair
+      --reveal full                 The value in the clear (default; explicit name for it)
+      --reveal partial             A few trailing characters and the length
+      --stat                       Length and character composition, no characters
+      --check                      Compare to a candidate read from stdin; prints
+                                   match/no match, exits 0/1 -- no value either way
       -n, --no-newline             Omit the trailing newline
       --out <path>                 Write to a file instead of stdout
       --force                      Allow --out to overwrite
@@ -126,8 +131,15 @@ def split_argv(argv: List[str]):
     return argv[:i], argv[i + 1:]
 
 
-def read_options(argv: List[str], switches=(), short=None):
-    """Parse --flag, --opt value, --opt=value and -x short forms."""
+def read_options(argv: List[str], switches=(), short=None, known=None):
+    """Parse --flag, --opt value, --opt=value and -x short forms.
+
+    `known`, when given, is every option name a command accepts -- value
+    options and switches together. Anything else raises rather than being
+    silently ignored: a typo'd flag (`--partial` for `--reveal partial`) must
+    not fall through to the command's default behaviour, which for `cred get`
+    is printing the whole secret.
+    """
     short = short or {}
     opts: Dict[str, Any] = {}
     positional: List[str] = []
@@ -161,6 +173,11 @@ def read_options(argv: List[str], switches=(), short=None):
         else:
             positional.append(a)
         i += 1
+    if known is not None:
+        unknown = sorted(set(opts) - set(known))
+        if unknown:
+            raise cs.CredError(f"Unknown option '--{unknown[0]}'.",
+                               ["Run 'cred help' to see what there is."], cs.EXIT_USAGE)
     return opts, positional
 
 
@@ -447,13 +464,42 @@ def cmd_add(rest: List[str]) -> int:
 
 
 def cmd_get(rest: List[str]) -> int:
-    opts, pos = read_options(rest, switches=("no-newline", "force"),
-                             short={"n": "no-newline"})
+    opts, pos = read_options(
+        rest, switches=("no-newline", "force", "check", "stat"),
+        short={"n": "no-newline"},
+        known=("no-newline", "force", "check", "stat", "field", "out", "reveal",
+               "project", "path"))
     if not pos:
         raise cs.CredError("cred get <project>/<key>", [], cs.EXIT_USAGE)
 
     field = str(opts.get("field") or "secret")
     out_spec = opts.get("out")
+    reveal = opts.get("reveal")
+    check = bool(opts.get("check"))
+    stat = bool(opts.get("stat"))
+
+    reveal_mode = None
+    if reveal is not None:
+        reveal_mode = "" if reveal is True else str(reveal).lower()
+        if reveal_mode not in ("partial", "full"):
+            raise cs.CredError(f"Unknown --reveal mode '{reveal_mode}'.",
+                               ["The only modes are: --reveal partial, --reveal full"],
+                               cs.EXIT_USAGE)
+
+    # --reveal, --check and --stat are four different ways to read a value --
+    # full cleartext, a masked shape, an equality test, or metadata -- and
+    # only one at a time makes sense. None of them makes sense alongside
+    # --out, which hands back the exact bytes on purpose.
+    modes = [name for name, on in
+             (("reveal", reveal_mode is not None), ("check", check), ("stat", stat)) if on]
+    if len(modes) > 1:
+        raise cs.CredError(f"--{modes[0]} cannot be combined with --{modes[1]}.",
+                           [], cs.EXIT_USAGE)
+    if modes and out_spec is not None:
+        raise cs.CredError(f"--{modes[0]} cannot be combined with --out.",
+                           ["--out writes the exact bytes on purpose; none of "
+                            "these give back the working credential."],
+                           cs.EXIT_USAGE)
 
     if out_spec is not None and out_spec is not True:
         resolved = cs.entry_view(pos[0], opts.get("project"), opts.get("path"))
@@ -468,6 +514,40 @@ def cmd_get(rest: List[str]) -> int:
     # One call, one decryption: the bytes and what they are.
     value = cs.read_value(pos[0], opts.get("project"), opts.get("path"), field)
 
+    # --reveal full is just an explicit name for the plain, no-flag behaviour
+    # below, so it shares that path's file-kind handling (including --out)
+    # rather than this refusal -- masking, stat and equality-checking a
+    # binary blob don't mean anything, but reading it whole does.
+    restrictive = modes[0] if modes and not (modes[0] == "reveal" and reveal_mode == "full") else None
+    if restrictive and value["kind"] == "file":
+        steps = [f"See what it is: cred list {value['project']}"]
+        if restrictive == "reveal":
+            steps.append(f"Read it: cred get {value['project']}/{value['key']} --out <path>")
+        raise cs.CredError(
+            f"'{value['project']}/{value['key']}' is a file credential; "
+            f"--{restrictive} does not apply to file content.",
+            steps, cs.EXIT_USAGE)
+
+    if check:
+        # Read from stdin only -- never argv, which would land the candidate
+        # in shell history and process listings and defeat the entire point.
+        candidate = read_stdin_secret()
+        matched = candidate == value["bytes"].decode("utf-8")
+        write_secret("match" if matched else "no match",
+                     newline=not opts.get("no-newline"))
+        return cs.EXIT_OK if matched else 1
+
+    if stat:
+        write_secret(cs.value_stat(value["bytes"].decode("utf-8")),
+                     newline=not opts.get("no-newline"))
+        return cs.EXIT_OK
+
+    if reveal_mode == "partial":
+        write_secret(cs.mask_value(value["bytes"].decode("utf-8")),
+                     newline=not opts.get("no-newline"))
+        return cs.EXIT_OK
+
+    # reveal_mode == "full", or no mode was given at all: the ordinary path.
     if value["kind"] == "file":
         # Exact bytes, and no trailing newline of ours: `cred get x > k.pem`
         # must produce the file that went in.
