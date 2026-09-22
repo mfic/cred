@@ -446,3 +446,46 @@ function Update-CredStoreValues {
         $lock.Dispose()
     }
 }
+
+function Update-CredProjectConfig {
+    <#
+        .SYNOPSIS
+        Read-modify-write the declarations alone, under the same lock.
+
+        .DESCRIPTION
+        The peer of Update-CredStoreValues for what lives in config.json and
+        nowhere else. It takes the same lock, because a declaration and a
+        value are one credential split across two files and a writer of either
+        half racing a writer of the other is how they come apart. What it does
+        not do is decrypt: no provider runs, no recipient list is consulted,
+        the store file is not read and not rewritten.
+
+        That is the point rather than an optimisation. Editing what a
+        credential is *for* is not privileged the way reading it is, so it
+        works with no key on the machine, and from someone who is not a
+        recipient. It also cannot lose a secret by failing partway: the only
+        file it can damage is the one git has a copy of.
+
+        The scriptblock receives the config and the project.
+
+        Peer of update_config in python/cred_store.py.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][pscustomobject]$Project,
+        [Parameter(Mandatory)][scriptblock]$Mutate
+    )
+
+    $lock = Lock-CredStore -CredsDir $Project.CredsDir
+    try {
+        if (Test-Path -LiteralPath $Project.ConfigPath -PathType Leaf) {
+            $Project.Config = Read-CredConfig -Path $Project.ConfigPath
+            $Project.StorePath = Join-Path $Project.CredsDir $Project.Config.store
+        }
+        $null = & $Mutate $Project.Config $Project
+        Write-CredConfig -Path $Project.ConfigPath -Config $Project.Config
+    }
+    finally {
+        $lock.Dispose()
+    }
+}

@@ -155,6 +155,8 @@ $script:CredCommandSpecs = @{
     get        = @{ Switch = @('no-newline', 'force', 'check', 'stat')
                     Short  = @{ 'n' = 'no-newline' }
                     Value  = @('field', 'out', 'reveal') }
+    meta       = @{ Switch = @('clear-desc')
+                    Value  = @('desc', 'description', 'env', 'env-user') }
     list       = @{ Switch = @('json', 'verify') }
     exec       = @{ Value  = @('only', 'except', 'prefix') }
     rm         = @{ Switch = @('yes', 'keep-definition'); Short = @{ 'y' = 'yes' } }
@@ -178,7 +180,7 @@ $script:CredCommandSpecs = @{
 $script:CredCommandAliases = @{
     'set' = 'add'; 'remove' = 'rm'; 'delete' = 'rm'; 'check' = 'doctor'
     'agent' = 'claude'; 'brief' = 'claude'; 'provider' = 'providers'
-    'newkey' = 'keygen'
+    'newkey' = 'keygen'; 'describe' = 'meta'
 }
 
 function Get-CredCommandSpec {
@@ -284,6 +286,7 @@ $script:CredOptionParameters = @{
     'prefix'          = 'Prefix'
     'recipient'       = 'Recipient'
     'keep-definition' = 'KeepDefinition'
+    'clear-desc'      = 'ClearDescription'
     'field'           = 'Field'
     'show'            = 'Show'
     'backup'          = 'Backup'

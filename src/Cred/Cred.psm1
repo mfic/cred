@@ -81,6 +81,7 @@ $exported = @(
     'Repair-CredHealth'
     'Resolve-CredReadMode'
     'Set-Cred'
+    'Set-CredMetadata'
     'Split-CredArgv'
     'Split-CredReference'
     'Test-CredHealth'
