@@ -1,0 +1,164 @@
+
+========================================================================
+0  Anchor: what this Vault actually is
+========================================================================
+  sys/health
+    GET sys/health
+    200 {"initialized":true,"sealed":false,"standby":false,"performance_standby":false,"replication_performance_mode":"disabled","replication_dr_mode":"disabled","server_time_utc":1790119454,"version":"2.1.1","enterprise":false,"cluster_name":"vault-cluster-55e5acbc","cluster_id":"095ce2ca-3ff5-f73f-44d4-1f7cf691e0eb","echo_duration_ms":0,"clock_skew_ms":0,"replication_primary_canary_age_ms":0,"removed_from_cluster":false}
+
+  sys/seal-status
+    GET sys/seal-status
+    200 {"type":"shamir","initialized":true,"sealed":false,"t":3,"n":5,"progress":0,"nonce":"","version":"2.1.1","build_date":"2026-09-15T21:21:56Z","migration":false,"cluster_name":"vault-cluster-55e5acbc","cluster_id":"095ce2ca-3ff5-f73f-44d4-1f7cf691e0eb","recovery_seal":false,"storage_type":"raft","removed_from_cluster":false}
+
+
+========================================================================
+1  AppRole login (no credential on any command line)
+========================================================================
+  role_id   36 chars, from localhost store via pipe
+  secret_id 36 chars, from localhost store via pipe
+  token     95 chars, orphan=True, ttl=300s, policies=['cred-test', 'default']
+
+========================================================================
+2  The mount reports its own KV version
+========================================================================
+  sys/mounts/cred/test/tune
+    GET sys/mounts/cred/test/tune
+    200 {"max_lease_ttl":2764800,"force_no_cache":false,"options":{"version":"2"},"description":"","default_lease_ttl":604800,"request_id":"644f7e76-c8ce-8023-4f51-6f75e4a5c5f8","lease_id":"","renewable":false,"lease_duration":0,"data":{"default_lease_ttl":604800,"description":"","force_no_cache":false,"max_lease_ttl":2764800,"options":{"version":"2"}},"wrap_info":null,"warnings":null,"auth":null,"mount_type":"system"}
+
+  type=kv options={'version': '2'}
+
+========================================================================
+3  cas=0 twice: create-only semantics
+========================================================================
+  write cas=0 (first)                    -> 1
+  write cas=0 (again)                    -> 400 {"errors":["check-and-set parameter did not match the current version"]}
+
+
+========================================================================
+4  One GET returns value and version together
+========================================================================
+  read                                   -> ({'secret': 'one'}, 1)
+
+========================================================================
+5  Stale cas -- the load-bearing error string
+========================================================================
+  write cas=0 against version 1          -> 400 {"errors":["check-and-set parameter did not match the current version"]}
+
+  write cas=99 against version 1         -> 400 {"errors":["check-and-set parameter did not match the current version"]}
+
+
+========================================================================
+6  cas omitted entirely, under cas_required=true
+========================================================================
+  write with no cas                      -> 400 {"errors":["check-and-set parameter required for this call"]}
+
+
+========================================================================
+7  LIST a project prefix
+========================================================================
+  write second key                       -> 1
+  list probe-1790119453/                 -> ['api', 'db']
+  list mount root                        -> ['probe', 'probe-1790119453/']
+
+========================================================================
+8  What the cred-test policy can actually do
+========================================================================
+  the policy as provisioned
+    GET sys/policies/acl/cred-test
+    200 {"request_id":"beafbd17-fddf-1034-d984-d0c77f8d3f90","lease_id":"","renewable":false,"lease_duration":0,"data":{"name":"cred-test","policy":"path \"cred/test/data/*\"     { capabilities = [\"create\",\"read\",\"update\",\"delete\"] }\npath \"cred/test/metadata/*\" { capabilities = [\"list\",\"read\",\"delete\"] }\npath \"cred/test/config\"     { capabilities = [\"read\"] }"},"wrap_info":null,"warnings":null,"auth":null,"mount_type":"system"}
+
+
+========================================================================
+8b  The three absence states on the wire
+========================================================================
+  present
+    GET cred/test/data/probe-1790119453/db
+    200 {"request_id":"b2839b94-81d8-5654-3b60-cbc47c907d99","lease_id":"","renewable":false,"lease_duration":0,"data":{"data":{"secret":"one"},"metadata":{"created_time":"2026-09-22T23:24:15.486488599Z","custom_metadata":null,"deletion_time":"","destroyed":false,"version":1}},"wrap_info":null,"warnings":null,"auth":null,"mount_type":"kv"}
+
+  soft-delete latest (approle)           -> None
+  soft-deleted
+    GET cred/test/data/probe-1790119453/db
+    404 {"request_id":"beb691cf-5257-92eb-594d-0947f726dd37","lease_id":"","renewable":false,"lease_duration":0,"data":{"data":null,"metadata":{"created_time":"2026-09-22T23:24:15.486488599Z","custom_metadata":null,"deletion_time":"2026-09-22T23:24:16.219990084Z","destroyed":false,"version":1}},"wrap_info":null,"warnings":null,"auth":null,"mount_type":""}
+  undelete v1 (approle)                  -> 403 {"errors":["1 error occurred:\n\t* permission denied\n\n"]}
+
+  undelete v1 (admin)                    -> None
+  undeleted
+    GET cred/test/data/probe-1790119453/db
+    200 {"request_id":"b0d52c72-97a2-9b69-38c0-e3c5a50482c2","lease_id":"","renewable":false,"lease_duration":0,"data":{"data":{"secret":"one"},"metadata":{"created_time":"2026-09-22T23:24:15.486488599Z","custom_metadata":null,"deletion_time":"","destroyed":false,"version":1}},"wrap_info":null,"warnings":null,"auth":null,"mount_type":"kv"}
+
+  destroy v1 (approle)                   -> 403 {"errors":["1 error occurred:\n\t* permission denied\n\n"]}
+
+  destroy v1 (admin)                     -> None
+  destroyed
+    GET cred/test/data/probe-1790119453/db
+    404 {"request_id":"4d0b864b-ae47-c890-db72-3b66b8047d4f","lease_id":"","renewable":false,"lease_duration":0,"data":{"data":null,"metadata":{"created_time":"2026-09-22T23:24:15.486488599Z","custom_metadata":null,"deletion_time":"","destroyed":true,"version":1}},"wrap_info":null,"warnings":null,"auth":null,"mount_type":""}
+  never existed
+    GET cred/test/data/probe-1790119453/no-such-key
+    404 {"errors":[]}
+
+
+========================================================================
+9  cas=0 against a soft-deleted and a destroyed path
+========================================================================
+  write cas=0 onto destroyed path        -> 400 {"errors":["check-and-set parameter did not match the current version"]}
+
+  create soft                            -> 1
+  soft-delete it                         -> None
+  write cas=0 onto soft-deleted          -> 400 {"errors":["check-and-set parameter did not match the current version"]}
+
+
+========================================================================
+10  Version numbering after erasing the metadata
+========================================================================
+  erase probe-1790119453/db (approle)    -> None
+  erase probe-1790119453/db (admin)      -> None
+  write cas=0 after erase                -> 1
+
+========================================================================
+11  Non-ASCII and awkward values, byte-exact through urllib
+========================================================================
+  write                                  -> 1
+  read back v1
+    secret    IDENTICAL      sent='tok-äöü-🔑' back='tok-äöü-🔑'
+    user      IDENTICAL      sent='a/b c  d' back='a/b c  d'
+    encoding  IDENTICAL      sent='utf-8' back='utf-8'
+    utf-8 bytes  sent=b'tok-\xc3\xa4\xc3\xb6\xc3\xbc-\xf0\x9f\x94\x91'
+                 back=b'tok-\xc3\xa4\xc3\xb6\xc3\xbc-\xf0\x9f\x94\x91'
+
+========================================================================
+12  403 next to 404, from a deliberately insufficient policy
+========================================================================
+  existing secret, no capability
+    GET cred/test/data/probe-1790119453/awkward
+    403 {"errors":["1 error occurred:\n\t* permission denied\n\n"]}
+
+  nonexistent secret, no capability
+    GET cred/test/data/probe-1790119453/ghost
+    403 {"errors":["1 error occurred:\n\t* permission denied\n\n"]}
+
+  LIST, no capability
+    LIST cred/test/metadata/probe-1790119453
+    403 {"errors":["1 error occurred:\n\t* permission denied\n\n"]}
+
+  nonexistent secret, WITH capability
+    GET cred/test/data/probe-1790119453/ghost
+    404 {"errors":[]}
+
+
+========================================================================
+13  Does urllib re-send X-Vault-Token through a 302?
+========================================================================
+  public address, redirects disabled
+    GET sys/health
+    403 {"type":"https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1010/","title":"Error 1010: Access denied","status":403,"detail":"The site owner has blocked access based on your browser's signature.","instance":"a3f50ff62e2ae515","error_code":1010,"error_name":"browser_signature_banned","error_category":"access_denied","ray_id":"a3f50ff62e2ae515","timestamp":"2026-09-22T23:24:18Z","zone":"vault.questnet.eu","cloudflare_error":true,"retryable":false,"owner_action_required":true,"what_you_should_do":"**Do not retry.** Your user-agent has been banned by the site owner.","footer":"This error was generated by Cloudflare on behalf of the website owner."}
+
+
+========================================================================
+14  Cleanup
+========================================================================
+  erase probe-1790119453/db              -> None
+  erase probe-1790119453/soft            -> None
+  erase probe-1790119453/awkward         -> None
+  erase probe-1790119453/api             -> None
+
+prefix used: probe-1790119453
