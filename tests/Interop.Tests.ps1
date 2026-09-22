@@ -421,6 +421,48 @@ Describe 'File credentials cross the implementations byte for byte' -Skip:(-not 
     }
 }
 
+Describe 'Metadata edits cross the implementations' -Skip:(-not ($script:HasAge -and $script:HasPython)) {
+
+    It 'has PowerShell annotate what Python stored, without either touching the value' {
+        $p = New-TestProject
+        $null = Invoke-PyCred -CliArgs @('add', "$($p.Name)/db", '--user', 'svc', '--value', 'py-secret')
+
+        $r = Invoke-PsCred -CliArgs @('meta', "$($p.Name)/db", '--desc', 'WAT - Dongleserver (10.141.30.61)')
+        $r.ExitCode | Should -Be 0 -Because $r.StdErr
+
+        $rows = (Invoke-PyCred -CliArgs @('list', $p.Name, '--json')).StdOut | ConvertFrom-Json
+        ($rows | Where-Object Key -eq 'db').Description |
+            Should -BeExactly 'WAT - Dongleserver (10.141.30.61)'
+        (Invoke-PyCred -CliArgs @('get', "$($p.Name)/db", '-n')).StdOut | Should -BeExactly 'py-secret'
+    }
+
+    It 'has Python rename a variable PowerShell then injects' {
+        $p = New-TestProject
+        $null = Set-Cred -Name "$($p.Name)/api" -Secret 'token'
+        $null = Invoke-PyCred -CliArgs @('meta', "$($p.Name)/api", '--env', 'RENAMED_TOKEN')
+
+        (Get-CredEnvironment -Project $p.Name).Keys | Should -Contain 'RENAMED_TOKEN'
+    }
+
+    It 'refuses the same metadata edits with the same exit code' -ForEach @(
+        @{ case = 'an undeclared credential'; code = 3 }
+        @{ case = 'an unusable variable name'; code = 2 }
+        @{ case = 'nothing to change';        code = 2 }
+    ) {
+        $p = New-TestProject
+        $null = Invoke-PyCred -CliArgs @('add', "$($p.Name)/k", '--value', 'v')
+        $cliArgs = switch ($case) {
+            'an undeclared credential'  { @('meta', "$($p.Name)/absent", '--desc', 'x') }
+            'an unusable variable name' { @('meta', "$($p.Name)/k", '--env', '2BAD') }
+            'nothing to change'         { @('meta', "$($p.Name)/k") }
+        }
+        $py = Invoke-PyCred -CliArgs $cliArgs
+        $ps = Invoke-PsCred -CliArgs $cliArgs
+        $py.ExitCode | Should -Be $code
+        $ps.ExitCode | Should -Be $code -Because "both CLIs must refuse $case alike"
+    }
+}
+
 Describe 'Matching behaviour' -Skip:(-not ($script:HasAge -and $script:HasPython)) {
 
     It 'uses the same exit code for <case>' -ForEach @(

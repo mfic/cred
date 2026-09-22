@@ -567,3 +567,125 @@ Describe 'Python CLI doctor reconciles the project registry' -Skip:(-not ($scrip
             Should -Be (Resolve-Path -LiteralPath $first).ProviderPath
     }
 }
+
+Describe 'Python CLI meta' -Skip:(-not ($script:HasAge -and $script:HasPython)) {
+    BeforeAll {
+        $script:MetaProj = Join-Path $script:Sandbox 'metaproj'
+        $null = New-Item -ItemType Directory -Path $script:MetaProj -Force
+        $null = Invoke-Cred -CliArgs @('init', 'metaproj') -WorkingDirectory $script:MetaProj
+
+        function Invoke-Meta {
+            param([string[]]$CliArgs)
+            Invoke-Cred -CliArgs $CliArgs -WorkingDirectory $script:MetaProj
+        }
+        function Get-Definition {
+            param([string]$Key)
+            $cfg = Get-Content -LiteralPath (Join-Path $script:MetaProj '.creds\config.json') -Raw |
+                   ConvertFrom-Json
+            return $cfg.credentials.$Key
+        }
+
+        $null = Invoke-Meta @('add', 'metaproj/pair', '--user', 'admin', '--value', 'hunter2')
+        $null = Invoke-Meta @('add', 'metaproj/tok', '--value', 'plain-token')
+        $script:MetaPem = Join-Path $script:Sandbox 'meta-cert.pem'
+        Set-Content -LiteralPath $script:MetaPem -Value 'pem-bytes' -NoNewline
+        $null = Invoke-Meta @('add', 'metaproj/cert', '--file', $script:MetaPem)
+    }
+
+    It 'writes a description and leaves the secret exactly as it was' {
+        $r = Invoke-Meta @('meta', 'metaproj/pair', '--desc', 'WAT - Dongleserver (10.141.30.61)')
+        $r.ExitCode | Should -Be 0
+        $r.StdOut   | Should -Match 'Updated metaproj/pair \(userpass\)'
+
+        (Get-Definition 'pair').description | Should -BeExactly 'WAT - Dongleserver (10.141.30.61)'
+        # The whole point: neither half of the value moved.
+        (Invoke-Meta @('get', 'metaproj/pair', '-n')).StdOut | Should -BeExactly 'hunter2'
+        (Invoke-Meta @('get', 'metaproj/pair', '--field', 'user', '-n')).StdOut | Should -BeExactly 'admin'
+    }
+
+    It 'needs no key on the machine, because it never opens the store' {
+        $identity = Join-Path $script:CredHomeDir 'identity.txt'
+        $hidden   = "$identity.hidden"
+        Move-Item -LiteralPath $identity -Destination $hidden
+        try {
+            # Proof the key really is gone: reading the value fails.
+            (Invoke-Meta @('get', 'metaproj/tok')).ExitCode | Should -Be 4
+
+            $r = Invoke-Meta @('meta', 'metaproj/tok', '--desc', 'annotated with no key')
+            $r.ExitCode | Should -Be 0
+            (Get-Definition 'tok').description | Should -BeExactly 'annotated with no key'
+        }
+        finally { Move-Item -LiteralPath $hidden -Destination $identity }
+
+        # And the value is still readable once the key is back, so nothing in
+        # the store was disturbed while it was away.
+        (Invoke-Meta @('get', 'metaproj/tok', '-n')).StdOut | Should -BeExactly 'plain-token'
+    }
+
+    It 'renames the variables cred exec injects' {
+        $r = Invoke-Meta @('meta', 'metaproj/pair', '--env', 'DONGLE_PASSWORD', '--env-user', 'DONGLE_USER')
+        $r.ExitCode | Should -Be 0
+        $env = (Invoke-Meta @('env', 'metaproj', '--format', 'posix')).StdOut
+        $env | Should -Match 'DONGLE_PASSWORD='
+        $env | Should -Match 'DONGLE_USER='
+    }
+
+    It 'clears a description, and clearing twice is not an error' {
+        $null = Invoke-Meta @('meta', 'metaproj/tok', '--desc', 'temporary')
+        (Invoke-Meta @('meta', 'metaproj/tok', '--clear-desc')).ExitCode | Should -Be 0
+        (Get-Definition 'tok').description | Should -BeNullOrEmpty
+        (Invoke-Meta @('meta', 'metaproj/tok', '--clear-desc')).ExitCode | Should -Be 0
+    }
+
+    It 'accepts describe as a spelling of meta' {
+        (Invoke-Meta @('describe', 'metaproj/tok', '--desc', 'via the alias')).ExitCode | Should -Be 0
+        (Get-Definition 'tok').description | Should -BeExactly 'via the alias'
+    }
+
+    It 'refuses a bare --desc rather than silently blanking the description' {
+        $null = Invoke-Meta @('meta', 'metaproj/tok', '--desc', 'keep me')
+        $r = Invoke-Meta @('meta', 'metaproj/tok', '--desc', '--clear-desc')
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match '--desc needs a value'
+        (Get-Definition 'tok').description | Should -BeExactly 'keep me'
+    }
+
+    It 'refuses an environment variable name no shell could export' {
+        $r = Invoke-Meta @('meta', 'metaproj/tok', '--env', '2BAD')
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match "'2BAD' is not a usable environment variable name"
+    }
+
+    It 'refuses --env-user on a credential with no username half' {
+        $r = Invoke-Meta @('meta', 'metaproj/tok', '--env-user', 'X')
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match 'has no username half'
+    }
+
+    It 'refuses to name a variable for a file credential, but takes its description' {
+        $r = Invoke-Meta @('meta', 'metaproj/cert', '--env', 'CERT')
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match 'has no environment variable'
+
+        (Invoke-Meta @('meta', 'metaproj/cert', '--desc', 'TLS cert')).ExitCode | Should -Be 0
+        (Get-Definition 'cert').description | Should -BeExactly 'TLS cert'
+    }
+
+    It 'refuses when nothing was asked for' {
+        $r = Invoke-Meta @('meta', 'metaproj/tok')
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match 'Nothing to change'
+    }
+
+    It 'reports an undeclared credential as not found, not as a usage error' {
+        $r = Invoke-Meta @('meta', 'metaproj/nope', '--desc', 'x')
+        $r.ExitCode | Should -Be 3
+        $r.StdErr   | Should -Match 'is not declared in'
+    }
+
+    It 'refuses an option the verb does not take' {
+        $r = Invoke-Meta @('meta', 'metaproj/tok', '--dsec', 'typo')
+        $r.ExitCode | Should -Be 2
+        $r.StdErr   | Should -Match "Unknown option '--dsec'"
+    }
+}

@@ -187,6 +187,12 @@ COMMANDS
       --out <path>                 Write to a file instead of stdout
       --force                      Allow --out to overwrite
 
+  meta <project>/<key>             Edit the declaration, never the secret
+      --desc <text>                What it is for (--description too)
+      --clear-desc                 Remove the description
+      --env <NAME>                 Rename the secret's variable
+      --env-user <NAME>            Rename the username's variable
+
   list [project]                   Show credential names (never values)
       --verify                     Also decrypt and flag missing values
       --json                       Machine-readable
@@ -384,6 +390,44 @@ function Invoke-CredCli {
             Write-CredSecret -Value $readout.Bytes `
                              -NoNewline:(-not $readout.Newline -or [bool](Get-Opt $o 'no-newline'))
             return $readout.ExitCode
+        }
+
+        { $_ -in 'meta', 'describe' } {
+            $p = Read-CredCommandOptions -Verb 'meta' -Argv $rest
+            $o = $p.Options
+            if ($p.Positional.Count -lt 1) {
+                throw (UsageError 'cred meta <project>/<key> [--desc <text>]' `
+                    'Edits what a credential is for. It never reads or writes the secret, so it needs no key.')
+            }
+
+            # `--desc` with the next argument being another flag parses as
+            # $true, not as a value. Blanking a description on that is the
+            # silent-damage shape this command exists to avoid, so it is
+            # refused and pointed at the option that says so out loud.
+            $desc = Get-Opt $o 'desc'
+            if ($null -eq $desc) { $desc = Get-Opt $o 'description' }
+            if ($desc -is [bool]) {
+                throw (UsageError '--desc needs a value.' `
+                    @("Quote it: --desc 'WAT - Dongleserver (10.0.0.1)'",
+                      'To remove a description: --clear-desc'))
+            }
+
+            $call = ConvertTo-CredCallArguments -Spec (Get-CredCommandSpec 'meta') `
+                                                -Parsed $p -Positional 'Name' `
+                                                -Exclude @('desc', 'description')
+            if ($null -ne $desc) { $call.Description = [string]$desc }
+            # --env and --env-user are the same irregular pair as on `add`: two
+            # options that become one hashtable, which the table cannot express.
+            if (Get-Opt $o 'env')      { $call.Env = @{ secret = Get-Opt $o 'env' } }
+            if (Get-Opt $o 'env-user') { $call.Env = (Merge-Env $call 'user' (Get-Opt $o 'env-user')) }
+
+            $r = Set-CredMetadata @call
+            Write-Line "Updated $($r.Project)/$($r.Key) ($($r.Kind))"
+            foreach ($c in $r.Changed) {
+                $shown = if ($c[1]) { $c[1] } else { '(cleared)' }
+                Write-Line "  $($c[0])  $shown"
+            }
+            return 0
         }
 
         'list' {
@@ -678,9 +722,16 @@ function Invoke-CredCli {
 }
 
 function UsageError {
-    param([string]$Message, [string]$Extra)
+    # $Extra renders as the same 'Next:' block New-CredErrorRecord produces, so
+    # a refusal the CLI makes for itself reads exactly like one the module
+    # makes -- and like the peer refusal in python/cred.py, which has always
+    # passed its hints as a list.
+    param([string]$Message, [string[]]$Extra)
     $text = "$Message"
-    if ($Extra) { $text += [Environment]::NewLine + $Extra }
+    if ($Extra) {
+        $text += [Environment]::NewLine + [Environment]::NewLine + 'Next:'
+        foreach ($n in $Extra) { $text += [Environment]::NewLine + '  ' + $n }
+    }
     $ex = [System.InvalidOperationException]::new($text)
     $r  = [System.Management.Automation.ErrorRecord]::new(
               $ex, 'Cred.Usage', [System.Management.Automation.ErrorCategory]::InvalidArgument, $null)

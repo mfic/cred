@@ -229,6 +229,36 @@ Describe 'Reference parsing' {
     }
 }
 
+Describe 'Environment variable names' {
+    # Nothing used to ask whether a declared name was one a shell could set.
+    # Read-CredOptions turns an option with no value into $true, so
+    # `cred add x/y --env --stdin` wrote the string 'True' into a committed
+    # config as a variable name -- a declaration `cred exec` can never inject.
+
+    It 'accepts <name>' -ForEach @(
+        @{ name = 'PGPASSWORD' }, @{ name = '_leading' }, @{ name = 'A1' }
+        @{ name = 'DONGLESERVER_PASSWORD' }
+    ) {
+        InModule { param($n) Test-CredEnvName $n } -Argument $name | Should -BeTrue
+    }
+
+    It 'refuses <why>' -ForEach @(
+        @{ name = '2BAD';  why = 'a leading digit' }
+        @{ name = 'HAS-DASH'; why = 'a dash' }
+        @{ name = 'has space'; why = 'a space' }
+        @{ name = '';      why = 'an empty name' }
+        @{ name = $null;   why = 'no name at all' }
+        @{ name = $true;   why = 'the $true a valueless --env parses as' }
+    ) {
+        InModule { param($n) Test-CredEnvName $n } -Argument $name | Should -BeFalse
+    }
+
+    It 'names the offending option when it refuses' {
+        { InModule { Assert-CredEnvName -Name '2BAD' -Option '--env' } } |
+            Should -Throw -ExpectedMessage "*'2BAD' is not a usable environment variable name*"
+    }
+}
+
 Describe 'Error records' {
     It 'carries a code that maps to an exit code' {
         $code = InModule {
@@ -647,7 +677,7 @@ Describe 'Command specs' {
     # was silently ignored on the other sixteen.
 
     BeforeAll {
-        $script:Verbs = @('init', 'add', 'get', 'list', 'exec', 'rm', 'env',
+        $script:Verbs = @('init', 'add', 'get', 'meta', 'list', 'exec', 'rm', 'env',
                           'recipients', 'keygen', 'key', 'project', 'providers',
                           'doctor', 'claude', 'import', 'export')
         $script:UsageText = Get-Content -Raw -LiteralPath (
@@ -668,13 +698,14 @@ Describe 'Command specs' {
         foreach ($pair in @(@{a='set';c='add'}, @{a='remove';c='rm'},
                             @{a='delete';c='rm'}, @{a='check';c='doctor'},
                             @{a='agent';c='claude'}, @{a='brief';c='claude'},
-                            @{a='provider';c='providers'}, @{a='newkey';c='keygen'})) {
+                            @{a='provider';c='providers'}, @{a='newkey';c='keygen'},
+                            @{a='describe';c='meta'})) {
             (Get-CredCommandSpec -Verb $pair.a).Verb | Should -BeExactly $pair.c
         }
     }
 
     It 'gives every project-bearing verb --project and --path' {
-        foreach ($v in @('init', 'add', 'get', 'list', 'exec', 'rm', 'env',
+        foreach ($v in @('init', 'add', 'get', 'meta', 'list', 'exec', 'rm', 'env',
                          'recipients', 'doctor', 'claude', 'import', 'export')) {
             $known = (Get-CredCommandSpec -Verb $v).Known
             $known | Should -Contain 'project' -Because "$v works on a project"
@@ -685,6 +716,7 @@ Describe 'Command specs' {
     It 'refuses an unknown option on <verb>' -ForEach @(
         @{ verb = 'list' }, @{ verb = 'doctor' }, @{ verb = 'env' }
         @{ verb = 'add' },  @{ verb = 'import' }, @{ verb = 'export' }
+        @{ verb = 'meta' }
     ) {
         { Read-CredCommandOptions -Verb $verb -Argv @('--definitely-not-a-flag') } |
             Should -Throw -ExpectedMessage "*Unknown option '--definitely-not-a-flag'*"
@@ -696,6 +728,7 @@ Describe 'Command specs' {
         @{ verb = 'add';    argv = @('acme/k', '--user', 'svc', '--stdin') }
         @{ verb = 'doctor'; argv = @('--repair', '--path', 'C:\x') }
         @{ verb = 'export'; argv = @('out', '--only', 'a,b', '--yes') }
+        @{ verb = 'meta';   argv = @('acme/k', '--desc', 'x', '--clear-desc') }
     ) {
         { Read-CredCommandOptions -Verb $verb -Argv $argv } | Should -Not -Throw
     }

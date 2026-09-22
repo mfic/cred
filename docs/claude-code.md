@@ -17,6 +17,14 @@ cred add acme-api/gh --desc "GitHub PAT, repo scope" --env GITHUB_TOKEN
 
 Each `add` prompts without echoing. Nothing lands in your shell history.
 
+The description is what the agent reads to tell one credential from another, so
+it is worth getting right. To fix one later, use `cred meta` rather than another
+`cred add` — it edits the declaration alone and never asks for the secret again:
+
+```powershell
+cred meta acme-api/db --desc "Postgres, prod replica (10.141.30.61)"
+```
+
 ```powershell
 cred list acme-api
 ```

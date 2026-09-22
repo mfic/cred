@@ -196,6 +196,27 @@ readable config — the exact lie the `file` branch exists to prevent. The
 PowerShell side never had the bug, because `Import-Cred` has always called
 `Set-Cred`.
 
+A second writer touches the declaration *without* the value: `set_metadata` /
+`Set-CredMetadata`, behind `cred meta`. The split is the point of having two
+files at all. The entry `set_credential` builds is the whole entry and not a
+patch, so writing a description through it meant re-supplying the secret — a
+key required for a change that is not secret, and a mistyped re-entry that
+replaces the credential in a way nothing downstream can distinguish from a
+deliberate rotation.
+
+So metadata goes through `update_config` / `Update-CredProjectConfig`, the peer
+of `update_store` for what lives in `config.json` alone. It takes the *same*
+lock — a declaration and a value are one credential split across two files, and
+a writer of either half racing a writer of the other is how they come apart —
+but it runs no provider, reads no recipient list, and neither reads nor
+rewrites the store. That is why it works with no key on the machine and from
+someone who is not a recipient, and why it cannot lose a secret by failing
+partway: the only file it can damage is the one git has a copy of.
+
+It refuses to edit `type`, `filename`, or the key. Those describe what is in
+the store; changing one here would manufacture exactly the config-disagrees-
+with-store state `cred doctor` exists to find.
+
 - **`encoding` lives in the store, not the config.** It describes the stored
   bytes, so a store that has outlived its `config.json` still decodes
   correctly. `filename` lives in the config, because it is documentation — the

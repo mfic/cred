@@ -64,6 +64,12 @@ COMMANDS
       --out <path>                 Write to a file instead of stdout
       --force                      Allow --out to overwrite
 
+  meta <project>/<key>             Edit the declaration, never the secret
+      --desc <text>                What it is for (--description too)
+      --clear-desc                 Remove the description
+      --env <NAME>                 Rename the secret's variable
+      --env-user <NAME>            Rename the username's variable
+
   list [project]                   Show credential names (never values)
       --verify                     Also decrypt and flag missing values
       --json                       Machine-readable
@@ -215,6 +221,8 @@ COMMANDS: Dict[str, Dict[str, Any]] = {
     "get":        {"switches": ("no-newline", "force", "check", "stat"),
                    "short": {"n": "no-newline"},
                    "value": ("field", "out", "reveal") + _PROJECT},
+    "meta":       {"switches": ("clear-desc",),
+                   "value": ("desc", "description", "env", "env-user") + _PROJECT},
     "list":       {"switches": ("json", "verify"), "value": _PROJECT},
     "exec":       {"value": ("only", "except", "prefix") + _PROJECT},
     "rm":         {"switches": ("yes", "keep-definition"), "short": {"y": "yes"},
@@ -240,7 +248,7 @@ COMMANDS: Dict[str, Dict[str, Any]] = {
 # `cred add --bogus`.
 ALIASES = {"set": "add", "remove": "rm", "delete": "rm", "check": "doctor",
            "agent": "claude", "brief": "claude", "provider": "providers",
-           "newkey": "keygen"}
+           "newkey": "keygen", "describe": "meta"}
 
 
 def command_spec(verb: str) -> Dict[str, Any]:
@@ -508,6 +516,47 @@ def cmd_add(rest: List[str]) -> int:
         out(f"  {filename}, {len(data)} bytes, stored as {detail}")
         out(f"  Not injected by 'cred exec'. Read it back with: "
             f"cred get {project.name}/{key} --out <path>")
+    return cs.EXIT_OK
+
+
+def cmd_meta(rest: List[str]) -> int:
+    opts, pos = parse_command("meta", rest)
+    if not pos:
+        raise cs.CredError(
+            "cred meta <project>/<key> [--desc <text>]",
+            ["Edits what a credential is for. It never reads or writes the "
+             "secret, so it needs no key."], cs.EXIT_USAGE)
+
+    proj_ref, key = cs.split_reference(pos[0])
+    if not cs.valid_key_name(key):
+        raise cs.CredError(f"'{pos[0]}' does not name a credential.",
+                           ["Use: cred meta <project>/<key> --desc <text>"],
+                           cs.EXIT_USAGE)
+    project = cs.resolve_project(opts.get("project") or proj_ref, opts.get("path"))
+
+    # `--desc` with the next argument being another flag parses as True, not as
+    # a value. Blanking a description on that is the silent-damage shape this
+    # command exists to avoid, so it is refused and pointed at the option that
+    # says so out loud.
+    desc = opts.get("desc")
+    if desc is None:
+        desc = opts.get("description")
+    if desc is True:
+        raise cs.CredError("--desc needs a value.",
+                           ["Quote it: --desc 'WAT - Dongleserver (10.0.0.1)'",
+                            "To remove a description: --clear-desc"],
+                           cs.EXIT_USAGE)
+
+    r = cs.set_metadata(
+        project, key,
+        description=None if desc is None else str(desc),
+        clear_description=bool(opts.get("clear-desc")),
+        env_secret=opts.get("env"),
+        env_user=opts.get("env-user"))
+
+    out(f"Updated {project.name}/{key} ({r['kind']})")
+    for field, value in r["changed"]:
+        out(f"  {field}  {value if value else '(cleared)'}")
     return cs.EXIT_OK
 
 
@@ -1221,6 +1270,7 @@ def dispatch(argv: List[str]) -> int:
 
     handlers = {
         "init": cmd_init, "add": cmd_add, "set": cmd_add, "get": cmd_get,
+        "meta": cmd_meta, "describe": cmd_meta,
         "list": cmd_list, "rm": cmd_rm, "remove": cmd_rm, "delete": cmd_rm,
         "env": cmd_env, "recipients": cmd_recipients, "keygen": cmd_keygen,
         "key": cmd_key, "project": cmd_project, "doctor": cmd_doctor,

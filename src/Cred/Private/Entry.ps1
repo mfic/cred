@@ -69,6 +69,53 @@ function Get-CredEnvNames {
     return $names
 }
 
+function Test-CredEnvName {
+    <#
+        .SYNOPSIS
+        Is this a name a shell can actually export?
+
+        .DESCRIPTION
+        Asked by both writers of a declaration. Nothing used to ask it at all,
+        which Read-CredOptions made visible: an option that wants a value but
+        is followed by another flag becomes $true rather than eating it, so
+        `cred add x/y --env --stdin` stored the *string* 'True' as the
+        variable name -- a declaration no shell can set and no `cred exec` can
+        inject, written into a committed file without complaint.
+
+        Peer of valid_env_name in python/cred_store.py.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([AllowNull()][object]$Name)
+
+    if ($Name -isnot [string]) { return $false }
+    return [bool]([string]$Name -match '^[A-Za-z_][A-Za-z0-9_]*$')
+}
+
+function Assert-CredEnvName {
+    <#
+        .SYNOPSIS
+        Test-CredEnvName, with the refusal both writers should give.
+
+        Peer of assert_env_name in python/cred_store.py, word for word: the
+        two CLIs must fail the same way on the same input.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()][object]$Name,
+        [Parameter(Mandatory)][string]$Option
+    )
+
+    if (-not (Test-CredEnvName $Name)) {
+        throw (New-CredErrorRecord -Code 'Usage' -Category InvalidArgument -Target $Name `
+            -Message "'$Name' is not a usable environment variable name." `
+            -Next @('Use letters, digits and underscore, not starting with a digit -- e.g. DONGLESERVER_PASSWORD.',
+                    "$Option needs a value; it does not take the next option as one."))
+    }
+    return [string]$Name
+}
+
 function Get-CredEntryKind {
     <#
         .SYNOPSIS

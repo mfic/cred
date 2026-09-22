@@ -1388,6 +1388,35 @@ def valid_key_name(name: Optional[str]) -> bool:
     return bool(name) and bool(re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name))
 
 
+def valid_env_name(name: Optional[str]) -> bool:
+    """Is this a name a shell can actually export?
+
+    Asked by both writers of a declaration. Nothing used to ask it at all,
+    which `read_options` made visible: an option that wants a value but is
+    followed by another flag becomes True rather than eating it, so
+    `cred add x/y --env --stdin` stored the *string* "True" as the variable
+    name -- a declaration no shell can set and no `cred exec` can inject,
+    written into a committed file without complaint.
+
+    Peer of Test-CredEnvName.
+    """
+    import re
+    return bool(name) and isinstance(name, str) and \
+        bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name))
+
+
+def assert_env_name(name: Any, option: str) -> str:
+    """valid_env_name, with the refusal both writers should give."""
+    if not valid_env_name(name):
+        raise CredError(
+            f"'{name}' is not a usable environment variable name.",
+            ["Use letters, digits and underscore, not starting with a digit "
+             "-- e.g. DONGLESERVER_PASSWORD.",
+             f"{option} needs a value; it does not take the next option as one."],
+            EXIT_USAGE)
+    return str(name)
+
+
 class Project:
     def __init__(self, root: Path):
         self.root = root
@@ -1615,6 +1644,31 @@ def update_store(project: Project, mutate) -> None:
         write_config(project)
 
 
+def update_config(project: Project, mutate) -> None:
+    """Read-modify-write the declarations alone, under the same lock.
+
+    The peer of update_store for what lives in config.json and nowhere else.
+    It takes the same lock, because a declaration and a value are one
+    credential split across two files and a writer of either half racing a
+    writer of the other is how they come apart. What it does *not* do is
+    decrypt: no provider runs, no recipient list is consulted, the store file
+    is not read and not rewritten.
+
+    That is the point rather than an optimisation. Editing what a credential
+    is *for* is not privileged the way reading it is, so it works with no key
+    on the machine, and from someone who is not a recipient. It also cannot
+    lose a secret by failing partway: the only file it can damage is the one
+    git has a copy of.
+
+    Peer of Update-CredProjectConfig.
+    """
+    with StoreLock(project.creds_dir):
+        project.config = read_config(project.config_path)
+        project.store_path = project.creds_dir / project.config["store"]
+        mutate(project.config, project)
+        write_config(project)
+
+
 def set_credential(project: Project, key: str, secret: str,
                    user: Optional[str] = None, is_file: bool = False,
                    filename: str = "", encoding: Optional[str] = None,
@@ -1669,13 +1723,108 @@ def set_credential(project: Project, key: str, secret: str,
             if kind == "userpass" and "user" not in d["env"]:
                 d["env"]["user"] = env_names(key, kind)["user"]
             if env_secret:
-                d["env"]["secret"] = str(env_secret)
+                d["env"]["secret"] = assert_env_name(env_secret, "--env")
             if env_user:
-                d["env"]["user"] = str(env_user)
+                d["env"]["user"] = assert_env_name(env_user, "--env-user")
         if description:
             d["description"] = str(description)
 
     update_store(project, mutate)
+    return result
+
+
+def set_metadata(project: Project, key: str,
+                 description: Optional[str] = None,
+                 clear_description: bool = False,
+                 env_secret: Optional[str] = None,
+                 env_user: Optional[str] = None) -> Dict[str, Any]:
+    """Edit one credential's declaration without touching its value.
+
+    `--desc` could always write a description, but only by writing a secret
+    along with it: the entry set_credential builds is the whole entry and not
+    a patch, so fixing a typo in a description meant re-supplying the
+    password. That is a bad trade twice over -- it needs the key for a change
+    that is not secret, and a mistyped re-entry silently replaces the
+    credential with whatever was typed, which nothing afterwards can tell from
+    a deliberate rotation.
+
+    So this is the writer for the half of a credential that is not secret,
+    and it goes through update_config: the store is never opened.
+
+    What it will not do is edit `type`, `filename`, or the key itself. Those
+    describe what is in the store, and changing one here would make the
+    declaration disagree with the value it declares -- `cred doctor`'s job is
+    to find that, not this function's to create it.
+
+    Returns {"kind": str, "changed": [(field, value), ...]}. The list is
+    ordered as applied and empty only if nothing was asked for, which the
+    caller has already refused. Peer of Set-CredMetadata.
+    """
+    if description is not None and clear_description:
+        raise CredError(
+            "--desc and --clear-desc ask for opposite things.",
+            ["Pass one or the other."], EXIT_USAGE)
+    if description is None and not clear_description \
+            and env_secret is None and env_user is None:
+        raise CredError(
+            f"Nothing to change on '{project.name}/{key}'.",
+            ["Say what to set: --desc <text>, --clear-desc, --env <NAME> "
+             "or --env-user <NAME>.",
+             f"See what it holds now: cred list {project.name}"],
+            EXIT_USAGE)
+
+    result: Dict[str, Any] = {"kind": "", "changed": []}
+
+    def mutate(config, proj):
+        defs = config.setdefault("credentials", {})
+        d = defs.get(key)
+        if d is None:
+            raise CredError(
+                f"'{proj.name}/{key}' is not declared in {CREDS_DIR}/{CONFIG_NAME}.",
+                [f"See what is: cred list {proj.name}",
+                 f"Create it: cred add {proj.name}/{key}"],
+                EXIT_NOT_FOUND)
+
+        kind = str(d.get("type") or "secret")
+        result["kind"] = kind
+        changed = result["changed"]
+
+        # A file credential has no environment representation at all -- see
+        # set_credential, which empties the map for exactly that reason. Naming
+        # a variable for one would be a declaration `cred exec` then ignores.
+        if kind == "file" and (env_secret is not None or env_user is not None):
+            raise CredError(
+                f"'{proj.name}/{key}' is a file credential, "
+                "so it has no environment variable.",
+                ["A file is read back with: "
+                 f"cred get {proj.name}/{key} --out <path>",
+                 "Only --desc and --clear-desc apply to it."],
+                EXIT_USAGE)
+        if kind != "userpass" and env_user is not None:
+            raise CredError(
+                f"'{proj.name}/{key}' is a {kind}, so it has no username half.",
+                ["--env-user applies to a userpass credential.",
+                 f"Make it one: cred add {proj.name}/{key} --user <name>"],
+                EXIT_USAGE)
+
+        if env_secret is not None:
+            env = d.setdefault("env", {})
+            env["secret"] = assert_env_name(env_secret, "--env")
+            changed.append(("env.secret", env["secret"]))
+        if env_user is not None:
+            env = d.setdefault("env", {})
+            env["user"] = assert_env_name(env_user, "--env-user")
+            changed.append(("env.user", env["user"]))
+        if description is not None:
+            d["description"] = str(description)
+            changed.append(("description", d["description"]))
+        if clear_description:
+            # Idempotent: clearing what is already absent is not an error, it
+            # is the state being asked for.
+            d.pop("description", None)
+            changed.append(("description", ""))
+
+    update_config(project, mutate)
     return result
 
 

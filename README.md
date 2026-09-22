@@ -189,6 +189,7 @@ $v = Read-CredValue acme-api/ssl-key            # .Bytes with .Kind and .IsBinar
 | `cred add <p>/<k> --file <path>` | Store a file's exact bytes (key, certificate) |
 | `cred get <p>/<k>` | Print one secret |
 | `cred get <p>/<k> --out <path>` | Write it back out as a file |
+| `cred meta <p>/<k> --desc <text>` | Edit the declaration — never the secret, no key needed |
 | `cred list [p]` | Credential names and descriptions, no decryption |
 | `cred exec <p> -- …` | Run a command with the secrets injected |
 | `cred rm <p>/<k>` | Delete a credential |
@@ -211,6 +212,37 @@ Exit codes: `0` ok · `2` usage · `3` not found · `4` key or decrypt problem �
 `5` backend missing · `6` corrupt store · `7` locked · `8` child command failed.
 
 Environment: `CRED_HOME`, `CRED_IDENTITY_FILE`, `CRED_PROJECT`, `CRED_AGE_PATH`.
+
+---
+
+## Describing a credential
+
+A credential is two things in two files: the value, encrypted in `store.age`,
+and the declaration — its type, the variables it maps to, and what it is for —
+in plaintext `config.json`. `cred meta` edits the second one on its own.
+
+```bash
+cred meta wat/dongleserver --desc 'WAT - Dongleserver (10.141.30.61)'
+cred meta acme-api/db --env PGPASSWORD --env-user PGUSER
+cred meta acme-api/old --clear-desc
+```
+
+`cred add --desc` can also write a description, but only by writing a secret
+along with it: the entry it builds is the whole entry, not a patch, so fixing a
+typo in a description used to mean re-supplying the password — and a mistyped
+re-entry replaces the credential silently, which nothing afterwards can tell
+from a deliberate rotation.
+
+So `cred meta` never opens the store. It works on a machine with no key at all,
+and for someone who is not one of the project's recipients: annotating what a
+credential is for is not privileged the way reading it is. It also cannot lose
+a secret by failing partway — the only file it can touch is the one git has a
+copy of.
+
+What it will not edit is the type, the recorded filename of a file credential,
+or the key itself. Those describe what is *in* the store, and changing one here
+would make the declaration disagree with the value it declares. That is
+`cred doctor`'s job to find, not this command's to create.
 
 ---
 
