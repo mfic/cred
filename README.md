@@ -178,6 +178,15 @@ $r = Get-CredEnvironmentReport acme-api         # .Variables and .Skipped togeth
 $v = Read-CredValue acme-api/ssl-key            # .Bytes with .Kind and .IsBinary
 ```
 
+**Passing one to `New-PSSession` through an SSH tunnel has a trap.** A forwarded
+port is addressed as `localhost`, which has no SPN, so `Negotiate` falls back to
+NTLM — and that breaks the day the account joins `Protected Users` or NTLM is
+otherwise restricted, with an error that names neither. Getting Kerberos to work
+through the tunnel instead needs four things, one of which is a **UDP→TCP
+bridge**, because the Windows Kerberos client emits AS-REQ over UDP and `ssh -L`
+carries only TCP, so the datagrams vanish without a trace in any log. See
+[docs/winrm-over-ssh-tunnel.md](docs/winrm-over-ssh-tunnel.md).
+
 ---
 
 ## Command reference
